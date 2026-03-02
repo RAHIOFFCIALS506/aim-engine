@@ -4,22 +4,22 @@ Design notes for an `aim` CLI built into aim-engine.
 
 ## Design principles
 
-- **Follow kubectl conventions** where they exist (verb ordering, `-n`, `-o`, `-l`, `-f`, `--all-namespaces`). Users shouldn't have to learn a new muscle memory.
-- **Bulk operations are first-class.** Most commands accept multiple names, label selectors, and file/stdin input. This matches `kubectl delete pod foo bar`, `kubectl delete -l app=x`, and `kubectl apply -f dir/`.
-- **Structured output everywhere.** Every command supports `-o json|yaml|wide|name`. JSON schemas are stable and versioned — they're the integration contract for scripts, CI/CD, and future MCP exposure.
+- **Don't duplicate kubectl.** AIM CLI adds value where kubectl can't — debug views, derived name resolution, env merge inspection, diagnostic rules. CRUD and declarative apply are kubectl's job.
+- **Follow kubectl conventions** where they overlap (flag names like `-n`, `-o`, `-l`, `--all-namespaces`). Users shouldn't have to learn a new muscle memory.
+- **Structured output where it adds value.** Commands with machine-consumable results (e.g. `analyze`, `validate`, `model add`) support `-o json|yaml`. Commands that produce composite human-readable output (e.g. `debug`) don't force it — structured subsections are available via the standalone building-block commands.
 - **Logic separated from CLI wiring.** Every command is a callable Go function with typed I/O, not code embedded in Cobra handlers. This makes the same logic available to tests, SDK consumers, and a future MCP server without refactoring. See [Architecture guidance](#architecture-guidance) and [MCP readiness](#mcp-readiness).
 
 ## Command structure
 
 ```
-aim <resource> <verb> [name...] [flags]    # resource CRUD (multi-name)
-aim analyze [resource] [name] [flags]      # diagnostics
+aim debug <resource> <name> [flags]        # single-resource deep-dive (tree + analyze + env)
+aim analyze [resource] [name] [flags]      # rule-based diagnostic scanner
 aim tree <resource> <name> [flags]         # dependency graph
 aim env <resource> <name> [flags]          # env var inspector
+aim model add <image...> [flags]           # quick model onboarding
 aim validate -f <file|dir|-> [flags]       # offline/online validation
 aim wait <resource> <name...> [flags]      # poll until condition
 aim test [subcommand] [flags]              # chainsaw wrapper
-aim apply -f <file|dir|-> [flags]          # declarative apply
 aim config [subcommand] [flags]            # user preferences
 aim completion <shell>                     # shell completions
 ```
@@ -28,38 +28,86 @@ aim completion <shell>                     # shell completions
 
 ## Bulk operations
 
-Every destructive or read command should accept multiple targets, matching `kubectl` conventions:
+Where applicable, commands accept multiple targets following `kubectl` conventions:
 
-| Pattern | Example | Precedent |
-|---------|---------|-----------|
-| Multiple names | `aim service delete svc1 svc2 -n default` | `kubectl delete pod foo bar` |
-| Label selector | `aim service list -l aim.eai.amd.com/model=my-model` | `kubectl get pods -l app=web` |
-| All in namespace | `aim model list -n default` | `kubectl get pods -n default` |
-| All namespaces | `aim service list -A` | `kubectl get pods -A` |
-| File/dir input | `aim apply -f dir/` or `aim validate -f -` | `kubectl apply -f dir/` |
-| Stdin list | `crane ls rocm/vllm-openai \| aim model add -` | `kubectl delete pods -` (not standard, but common in tooling) |
+| Pattern | Example |
+|---------|---------|
+| Multiple images | `aim model add rocm/vllm-openai:latest rocm/vllm-mistral:latest` |
+| Stdin list | `crane ls rocm/vllm-openai \| aim model add --cluster-scoped -` |
+| File/dir input | `aim validate -f dir/` |
+| Multiple names | `aim wait service svc1 svc2 -n default --for=running` |
 
-For `aim model add` specifically — multiple positional args with shared flags:
-
-```bash
-aim model add rocm/vllm-openai:latest rocm/vllm-mistral:latest rocm/vllm-llama:latest
-```
-
-All share the same `--cluster-scoped`, `--extract-metadata`, etc. Per-model customization uses `aim apply -f` with individual resource manifests.
-
-For `aim wait` — multiple names, exit when all satisfy the condition:
-
-```bash
-aim wait service svc1 svc2 svc3 -n default --for=running --timeout=10m
-```
+`aim model add` accepts multiple positional args with shared flags. Per-model customization uses `kubectl apply -f` with individual resource manifests.
 
 ---
 
 ## Tier 1 — Primary features
 
-### 1. Quick model onboarding — `aim model add`
+### 1. Resource deep-dive — `aim debug`
 
-The most-requested workflow. Collapse AIMClusterModel creation into a single command with smart defaults.
+The primary command. Answers "why isn't this working?" by combining dependency tree, diagnostic rules, env var inspection, conditions, events, and pod status into a single human-readable output.
+
+```bash
+aim debug service my-svc -n default
+aim debug model my-model
+aim debug template my-tpl -n default
+aim debug artifact my-art -n default
+```
+
+Example output for a service:
+
+```
+$ aim debug service my-svc -n default
+
+━━ DEPENDENCY TREE ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+AIMService/my-svc (Starting)
+├── AIMModel/vllm-openai (Ready) [cluster]
+│   └── AIMClusterModelSource/registry-amd
+├── AIMServiceTemplate/vllm-openai-mi300x-4gpu (Ready, optimized)
+│   └── AIMTemplateCache/vllm-openai-mi300x-4gpu-1080a608 (Ready)
+│       ├── AIMArtifact/weights-a3f2b1 (Ready, 140Gi)
+│       └── AIMArtifact/config-b7c3d2 (Ready, 2Gi)
+├── AIMRuntimeConfig/prod-config (Ready)
+├── InferenceService/my-svc-1080a608 (Not Ready)
+│   └── Pod/my-svc-1080a608-predictor-00001-abc (CrashLoopBackOff)
+└── HTTPRoute/my-svc-1080a608
+
+━━ DIAGNOSTICS ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+ERROR [AIM001] AIMService not Running: condition Ready=False, reason: PodFailure
+ERROR [AIM003] Pod CrashLoopBackOff — last log: "RuntimeError: CUDA out of memory"
+
+━━ CONDITIONS ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  Ready              False   PodFailure           InferenceService predictor pod failing
+  DependenciesReachable True  Resolved             All dependencies resolved
+  ConfigValid        True    Valid                Configuration is valid
+  Model              Ready   ModelResolved        AIMClusterModel vllm-openai is ready
+  Template           Ready   Resolved             AIMServiceTemplate vllm-openai-mi300x-4gpu is ready
+  Cache              Ready   CacheReady           Template cache is ready
+
+━━ EFFECTIVE ENV ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  AIM_CACHE_PATH=/aim/cache                  ← system default
+  VLLM_ENABLE_METRICS=true                   ← system default
+  VLLM_WORKER_MULTIPROC_METHOD=spawn         ← AIMRuntimeConfig/prod-config
+  HIP_FORCE_DEV_KERNARG=1                    ← AIMServiceTemplate/vllm-tpl
+  MAX_MODEL_LEN=4096                         ← AIMService/my-svc (overrides 8192)
+
+━━ RECENT EVENTS ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  2m ago  Warning  BackOff  Pod/my-svc-1080a608-predictor-00001-abc  Back-off restarting failed container
+  5m ago  Normal   Created  Pod/my-svc-1080a608-predictor-00001-abc  Created container kserve-container
+```
+
+`debug` is composite — its sections correspond to standalone building-block commands (`aim tree`, `aim analyze`, `aim env`) that each support `-o json` individually. `debug` itself produces human-readable output only.
+
+Resolves derived names (via `GenerateDerivedName` from `internal/utils/naming.go`) to trace the full resource graph, including hash-suffixed InferenceService and HTTPRoute names that aren't guessable.
+
+### 2. Quick model onboarding — `aim model add`
+
+Collapse AIMClusterModel creation into a single command with smart defaults.
 
 ```bash
 # Single image
@@ -84,26 +132,46 @@ Defaults: cluster-scoped, `--extract-metadata`, `--create-templates` on, name de
 
 - `--extract-metadata` — the CLI reads OCI image labels client-side and pre-fills `spec.imageMetadata`, so the operator skips remote extraction and can create templates immediately. Without this flag, `imageMetadata` is left empty and the operator extracts it asynchronously.
 - `--create-templates` — implied by metadata presence. When metadata contains `RecommendedDeployments`, the model controller creates matching AIMServiceTemplates automatically. Disabling this flag would set `spec.discovery.enabled=false` to suppress template creation.
-- `--custom` — maps to `spec.custom` + `spec.customTemplates`. `--source-uri` populates `customTemplates[0].modelSources[0].sourceUri`, and `--gpu-count`/`--gpu-model` populate `customTemplates[0].hardware.gpu`. For multi-template custom models, use `aim apply -f` with a full manifest.
+- `--custom` — maps to `spec.custom` + `spec.customTemplates`. `--source-uri` populates `customTemplates[0].modelSources[0].sourceUri`, and `--gpu-count`/`--gpu-model` populate `customTemplates[0].hardware.gpu`. For multi-template custom models, use `kubectl apply -f` with a full manifest.
 
-### 2. Cluster/namespace diagnostics — `aim analyze`
+### 3. Validation — `aim validate`
 
-Modeled on `istioctl analyze`. Targets "something is wrong but I don't know where to start." Runs a suite of checks and reports structured diagnostics.
+Offline and online manifest validation. Useful standalone and as a CI gate: `aim validate -f deploy/aim/`.
+
+```bash
+aim validate -f service.yaml                    # offline checks
+aim validate -f ./aim-resources/                # validate a directory
+aim validate -f - < manifest.yaml               # stdin (piping from generators)
+aim validate -f service.yaml --server-dry-run   # full admission check
+aim validate -f service.yaml -o json            # structured output
+```
+
+Returns field-level errors, warnings, and the defaults that admission would apply.
+
+---
+
+## Tier 2 — Building-block commands
+
+These are the standalone versions of `debug` subsections. Each supports `-o json` for scripting and MCP integration.
+
+### 4. Diagnostic scanner — `aim analyze`
+
+Rule-based diagnostic scanner. Unlike `debug` (single-resource deep-dive), `analyze` scans across namespaces/clusters and supports offline mode.
 
 ```bash
 aim analyze                                  # full cluster
 aim analyze -n my-namespace                  # namespace-scoped
-aim analyze service my-svc -n default        # single resource deep-dive
+aim analyze service my-svc -n default        # single resource
 aim analyze -f resources.yaml --use-kube=false  # offline validation
 aim analyze -o json                          # machine-parseable
 ```
 
-**Diagnostic rules** (examples, non-exhaustive, should be a pluggable registry):
+**Diagnostic rules** (non-exhaustive, pluggable registry):
 
 | Code | Severity | Offline | Check |
 |------|----------|---------|-------|
 | AIM001 | ERROR | | AIMService not Running — show condition causing failure |
-| AIM002 | ERROR | | InferenceService missing for Running/Starting service (label-selector lookup) |
+| AIM002 | ERROR | | InferenceService missing for Running/Starting service |
 | AIM003 | ERROR | | Pod CrashLoopBackOff / ImagePullBackOff — include last log line |
 | AIM004 | WARN | | Template using unoptimized profile — discovery may not have completed |
 | AIM005 | WARN | | Artifact download stalled (progress unchanged >30m) |
@@ -122,113 +190,29 @@ aim analyze -o json                          # machine-parseable
 | AIM108 | WARN | yes | AIMServiceTemplate `modelName` not found in file set |
 | AIM109 | WARN | yes | AIMService/AIMModel/AIMServiceTemplate `runtimeConfigName` not found in file set |
 
-Offline rules (AIM100+) run without cluster access via `--use-kube=false`. AIM100–AIM105 mirror CRD CEL/pattern validations. AIM106–AIM109 are cross-reference checks — WARN not ERROR because the referenced resource may already exist in the cluster. Use `--server-dry-run` via `aim validate` for authoritative admission checks.
+Offline rules (AIM100+) run without cluster access via `--use-kube=false`. AIM100–AIM105 mirror CRD CEL/pattern validations. AIM106–AIM109 are cross-reference checks — WARN not ERROR because the referenced resource may already exist in the cluster.
 
-Output format follows istioctl convention:
-```
-ERROR [AIM001] (AIMService/my-svc.default) Not running: condition Ready=False, reason: PodFailure
-WARN  [AIM004] (AIMServiceTemplate/llama-tpl.default) Unoptimized profile — discovery attempts: 3
-```
-
-Making rules a registry (`[]Analyzer` with `func Check(ctx, state) []Diagnostic`) keeps them independently testable and easy to extend.
-
-### 3. Service lifecycle — `aim service`
-
-Full CRUD for the most common resource type:
-
-```bash
-aim service create my-svc --model my-model -n default
-aim service create my-svc --image rocm/vllm-openai:latest -n default
-aim service list [-n ns] [--status pending|starting|running|degraded|failed] [-l key=val]
-aim service list -A                        # all namespaces
-aim service get my-svc -n default
-aim service describe my-svc -n default     # conditions + pods + events + ISVC
-aim service edit my-svc -n default --replicas 3
-aim service delete svc1 svc2 -n default    # multiple names
-aim service delete -l aim.eai.amd.com/model=my-model -n default
-aim service logs my-svc -n default [-f] [--container name]
-aim service events my-svc -n default
-aim service pods my-svc -n default
-```
-
-`logs`, `events`, and `pods` resolve the derived InferenceService name (via `GenerateDerivedName`) to find the correct child resources — this is the key value-add over raw `kubectl`, since the hash-suffixed names aren't guessable.
-
-`create` supports two of the three `AIMServiceModel` modes: `--model <name>` (reference by name) and `--image <uri>` (by container image). The third mode (`custom`, with inline model sources) requires more fields than flags can ergonomically express — use `aim apply -f` with a YAML manifest for that path.
-
-`describe` is the power subcommand — gathers everything a user needs to debug a service in one call: status, conditions, resolved model/template/runtimeconfig, InferenceService health, pod status, recent events. Note: resolved references (`ResolvedModel`, `ResolvedTemplate`, `ResolvedRuntimeConfig`) are only populated when the upstream resource is Ready. `describe` should handle nil references gracefully (e.g. "Model: pending resolution").
-
-### 4. Full resource CRUD
-
-Every CRD type gets the standard verb set:
-
-```
-aim {service|model|template|artifact|cache|runtimeconfig|modelsource} \
-    {create|get|list|describe|edit|delete|clone} [name...] [flags]
-```
-
-Bulk-capable verbs: `get`, `delete`, `describe` accept multiple names. `list` accepts `-l` selectors and `-A`. `clone` is single-resource only (needs a `--name` for the copy).
-
-Cluster-scoped resources (`model`, `template`, `runtimeconfig`, `modelsource`) accept `--cluster-scoped` or have dedicated aliases (`aim clustermodel`).
-
-**Resource alias mapping:**
-
-| CLI alias | CRD(s) |
-|-----------|--------|
-| `service` | AIMService |
-| `model` | AIMModel / AIMClusterModel |
-| `template` | AIMServiceTemplate / AIMClusterServiceTemplate |
-| `artifact` | AIMArtifact |
-| `cache` | AIMTemplateCache (shorthand — no `AIMCache` CRD exists) |
-| `runtimeconfig` | AIMRuntimeConfig / AIMClusterRuntimeConfig |
-| `modelsource` | AIMClusterModelSource (cluster-scoped only) |
-
----
-
-## Tier 2 — High-value features
+Rules are a registry (`[]Analyzer` with `func Check(ctx, state) []Diagnostic`) — independently testable and extensible.
 
 ### 5. Dependency tree — `aim tree`
 
-AIM's derived naming (SHA-256 hash suffixes via `GenerateDerivedName`) makes it hard to manually trace resource relationships. This command resolves the full graph.
+Standalone version of the debug tree section. Supports `-o json` for programmatic consumption.
 
+```bash
+aim tree service my-svc -n default
+aim tree service my-svc -n default -o json
 ```
-$ aim tree service my-svc -n default
-
-AIMService/my-svc (Running)
-├── AIMModel/vllm-openai (Ready) [cluster]
-│   └── AIMClusterModelSource/registry-amd
-├── AIMServiceTemplate/vllm-openai-mi300x-4gpu (Ready, optimized)
-│   └── AIMTemplateCache/vllm-openai-mi300x-4gpu-1080a608 (Ready)
-│       ├── AIMArtifact/weights-a3f2b1 (Ready, 140Gi)
-│       └── AIMArtifact/config-b7c3d2 (Ready, 2Gi)
-├── AIMRuntimeConfig/prod-config (Ready)
-├── InferenceService/my-svc-1080a608 (Ready)
-│   └── Pod/my-svc-1080a608-predictor-00001-abc (Running, 4×MI300X)
-└── HTTPRoute/my-svc-1080a608
-```
-
-Key advantage: this code lives in aim-engine and can import `GenerateDerivedName` directly for exact derived-name computation rather than heuristic matching.
 
 ### 6. Env var inspector — `aim env`
 
-The four-layer env merge and the spec-vs-profile distinction confuse users. A dedicated command shows exactly what ends up on the container and where each value comes from.
+Standalone version of the debug env section. Shows the four-layer merge with source attribution.
 
-```
-$ aim env service my-svc -n default
-
-EFFECTIVE ENV (lowest → highest precedence: system defaults → RuntimeConfig → Template → Service)
-  AIM_CACHE_PATH=/aim/cache                  ← system default
-  VLLM_ENABLE_METRICS=true                   ← system default
-  VLLM_WORKER_MULTIPROC_METHOD=spawn         ← AIMRuntimeConfig/prod-config
-  HIP_FORCE_DEV_KERNARG=1                    ← AIMServiceTemplate/vllm-tpl
-  NCCL_MIN_NCHANNELS=112                     ← AIMServiceTemplate/vllm-tpl
-  MAX_MODEL_LEN=4096                         ← AIMService/my-svc (overrides 8192)
-
-PROFILE ENV (informational — raw discovery output, may differ from effective):
-  VLLM_USE_TRITON_FLASH_ATTN=0
-  NCCL_NET_GDR_LEVEL=3
+```bash
+aim env service my-svc -n default
+aim env service my-svc -n default -o json
 ```
 
-This reuses the `buildMergedEnvVars` logic from `internal/aimservice/kserve.go`. The four precedence layers are: system defaults (immutable, e.g. `AIM_CACHE_PATH`), RuntimeConfig env, Template env, and Service env (highest wins). `AIM_ENGINE_ARGS` is deep-merged as JSON across layers rather than overwritten.
+Reuses the `buildMergedEnvVars` logic from `internal/aimservice/kserve.go`. The four precedence layers are: system defaults (immutable, e.g. `AIM_CACHE_PATH`), RuntimeConfig env, Template env, and Service env (highest wins). `AIM_ENGINE_ARGS` is deep-merged as JSON across layers rather than overwritten.
 
 ### 7. Wait / poll — `aim wait`
 
@@ -242,18 +226,11 @@ aim wait artifact -l aim.eai.amd.com/cache.name=my-cache -n default --for=ready 
 
 Multiple names and label selectors supported — exits when all targets satisfy the condition (or first failure with `--fail-fast`). `--progress` shows artifact download percentage. Exit code reflects success/failure/timeout.
 
-### 8. Declarative apply — `aim apply`
+---
 
-```bash
-aim apply -f service.yaml
-aim apply -f ./aim-resources/          # all YAML in directory
-aim apply -f - < manifest.yaml         # stdin
-aim apply -f svc.yaml -f model.yaml    # multiple files
-```
+## Tier 3 — Power user features
 
-Follows `kubectl apply` conventions: directory recursion, multi-doc YAML, stdin. Combined with `aim validate`, enables a safe pipeline: `aim validate -f dir/ && aim apply -f dir/`.
-
-### 9. Chainsaw wrapper — `aim test`
+### 8. Chainsaw wrapper — `aim test`
 
 Speculative — scope and UX to be expanded once the core CLI (v0.1–v0.2) is stable.
 
@@ -263,29 +240,11 @@ aim test run path/to/test/ [-n ns] [--timeout 10m]
 aim test results <session-id>
 ```
 
----
-
-## Tier 3 — Power user features
-
-### 10. Validation — `aim validate`
-
-Exposes the operator's actual admission validation logic. Useful standalone and as a library for other tools.
-
-```bash
-aim validate -f service.yaml                    # offline checks
-aim validate -f ./aim-resources/                # validate a directory
-aim validate -f - < manifest.yaml               # stdin (piping from generators)
-aim validate -f service.yaml --server-dry-run   # full admission check
-aim validate -f service.yaml -o json            # structured output
-```
-
-Returns field-level errors, warnings, and the defaults that admission would apply. Multi-file/dir support makes this a CI gate: `aim validate -f deploy/aim/`.
-
-### 11. Interactive TUI — `aim dashboard`
+### 9. Interactive TUI — `aim dashboard`
 
 Optional `bubbletea`-based terminal UI showing live resource status. Think `k9s` but AIM-aware.
 
-### 12. Config profiles — `aim config`
+### 10. Config profiles — `aim config`
 
 ```bash
 aim config set-context prod --kubeconfig ~/.kube/prod --namespace aim-prod
@@ -295,9 +254,21 @@ aim config set defaults.gpu-model MI300X
 
 Stores per-user defaults so `--gpu-model` and `--runtime-config` don't need repeating.
 
-### 13. kubectl plugin compatibility
+### 11. kubectl plugin compatibility
 
-Name the binary `kubectl-aim` so it works as both `aim analyze` and `kubectl aim analyze`. Just a naming convention — no code changes required.
+Name the binary `kubectl-aim` so it works as both `aim debug` and `kubectl aim debug`. Just a naming convention — no code changes required.
+
+**Resource alias mapping** (used across all commands):
+
+| CLI alias | CRD(s) |
+|-----------|--------|
+| `service` | AIMService |
+| `model` | AIMModel / AIMClusterModel |
+| `template` | AIMServiceTemplate / AIMClusterServiceTemplate |
+| `artifact` | AIMArtifact |
+| `cache` | AIMTemplateCache (shorthand — no `AIMCache` CRD exists) |
+| `runtimeconfig` | AIMRuntimeConfig / AIMClusterRuntimeConfig |
+| `modelsource` | AIMClusterModelSource (cluster-scoped only) |
 
 ---
 
@@ -308,11 +279,14 @@ Name the binary `kubectl-aim` so it works as both `aim analyze` and `kubectl aim
 Every command should be a callable function, not embedded in Cobra handlers. This keeps the logic testable, reusable, and callable from other contexts (MCP server, SDK, tests).
 
 ```go
-// pkg/analyze — pure logic
+// pkg/debug — composite logic, calls tree/analyze/env internally
+func Run(ctx context.Context, conn ConnectionProvider, opts Options) (*DebugReport, error)
+
+// pkg/analyze — rule engine, also called by debug
 func Run(ctx context.Context, conn ConnectionProvider, opts Options) ([]Diagnostic, error)
 
-// cmd/analyze.go — thin Cobra wrapper
-func newAnalyzeCmd() *cobra.Command { /* parse flags → call analyze.Run → format output */ }
+// cmd/debug.go — thin Cobra wrapper
+func newDebugCmd() *cobra.Command { /* parse flags → call debug.Run → render sections */ }
 ```
 
 ### Typed input/output structs
@@ -328,6 +302,8 @@ type ConnectionProvider interface {
 ```
 
 CLI mode creates a fresh connection per invocation. A future daemon mode could maintain a pool. Business logic is agnostic to which mode it's in.
+
+The connection should expose a server-side apply (SSA) capable client. The operator already uses SSA for all resource management — the same `client.Client` with `client.Apply` field manager can be reused. This keeps the door open for `aim apply -f` / `aim delete -f` if CRUD commands become needed later, since SSA-based apply/delete is trivial once the connection layer supports it.
 
 ### Analyzer rule registry
 
@@ -354,10 +330,10 @@ The key architecture decisions that enable this:
 
 | Architecture decision | How it enables MCP |
 |---|---|
-| Logic in `pkg/`, not in Cobra handlers | MCP handler calls `analyze.Run()` directly — same function, different transport |
+| Logic in `pkg/`, not in Cobra handlers | MCP handler calls `debug.Run()`, `analyze.Run()` etc. directly — same functions, different transport |
 | Typed `Options` + result structs | Auto-generate MCP tool JSON schemas from Go struct tags |
 | `ConnectionProvider` interface | CLI mode: fresh connection per call. MCP mode: pooled connections. Business logic unchanged |
-| `-o json` on every command | JSON output schemas = MCP tool response schemas. Already tested and stable |
+| `-o json` on building-block commands | JSON output schemas = MCP tool response schemas. Already tested and stable |
 | Analyzer rule registry | MCP can expose `analyze` as a single tool or individual rules as separate tools |
 
 No premature abstraction needed — these are just good Go patterns. If MCP never ships, nothing is wasted.
@@ -404,7 +380,7 @@ Existing documentation:
 
 | Phase | Features | Rationale |
 |-------|----------|-----------|
-| **v0.1** | `model add`, `service` CRUD, `analyze`, `validate`, output formats | Core onboarding and debugging workflows |
-| **v0.2** | `tree`, `env`, `wait`, `apply`, remaining resource CRUD | Fills out the operational toolkit |
-| **v0.3** | `test`, `config`, `dashboard` TUI, kubectl plugin | Power-user and CI/CD features |
+| **v0.1** | `debug`, `model add`, `validate` | Core debugging and onboarding — the two most requested workflows |
+| **v0.2** | `analyze`, `tree`, `env`, `wait` (standalone) | Building blocks for scripting, CI/CD, and MCP |
+| **v0.3** | `test`, `config`, `dashboard` TUI, kubectl plugin | Power-user features |
 | **future** | MCP server mode | When IDE agent adoption warrants it |
