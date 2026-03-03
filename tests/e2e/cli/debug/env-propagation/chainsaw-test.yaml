@@ -1,0 +1,73 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/kyverno/chainsaw/main/.schemas/json/test-chainsaw-v1alpha1.json
+#
+# CLI Debug Test: Env Propagation
+#
+# Validates that `aim debug service` shows env vars with correct source
+# attribution. Service env overrides template env; template-only vars
+# are attributed to Template; system defaults to System.
+#
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: cli-debug-env-propagation
+spec:
+  steps:
+    - name: Create frozen model with Ready status
+      try:
+        - apply:
+            file: model.yaml
+        - script:
+            env:
+              - name: NAMESPACE
+                value: ($namespace)
+            content: |
+              apply-with-status.sh model.yaml --status-only -n $NAMESPACE
+
+    - name: Create frozen template with Ready status and env vars
+      try:
+        - apply:
+            file: template.yaml
+        - script:
+            env:
+              - name: NAMESPACE
+                value: ($namespace)
+            content: |
+              apply-with-status.sh template.yaml --status-only -n $NAMESPACE
+
+    - name: Create service with env overrides
+      try:
+        - apply:
+            file: service.yaml
+
+    - name: Wait for service to resolve template
+      try:
+        - assert:
+            timeout: 60s
+            resource:
+              apiVersion: aim.eai.amd.com/v1alpha1
+              kind: AIMService
+              metadata:
+                name: test-service
+              status:
+                resolvedTemplate:
+                  name: test-template
+                  scope: Namespace
+
+    - name: Verify aim debug output shows env source attribution
+      try:
+        - script:
+            env:
+              - name: NAMESPACE
+                value: ($namespace)
+            content: |
+              set -eu
+              OUTPUT=$(aim debug service test-service -n "$NAMESPACE")
+              echo "$OUTPUT"
+              # HF_TOKEN should be from Service (overrides Template)
+              echo "$OUTPUT" | grep "HF_TOKEN" | grep -q "Service"
+              # HTTP_PROXY should be from Template
+              echo "$OUTPUT" | grep "HTTP_PROXY" | grep -q "Template"
+              # HTTPS_PROXY should be from Service (new var)
+              echo "$OUTPUT" | grep "HTTPS_PROXY" | grep -q "Service"
+              # AIM_CACHE_PATH should be from System
+              echo "$OUTPUT" | grep "AIM_CACHE_PATH" | grep -q "System"

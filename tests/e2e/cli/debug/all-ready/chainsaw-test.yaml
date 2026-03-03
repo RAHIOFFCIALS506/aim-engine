@@ -1,0 +1,73 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/kyverno/chainsaw/main/.schemas/json/test-chainsaw-v1alpha1.json
+#
+# CLI Debug Test: All Ready
+#
+# Validates that `aim debug service` renders the full dependency tree
+# when model and template are both Ready.
+#
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: cli-debug-all-ready
+spec:
+  steps:
+    - name: Create frozen model with Ready status
+      try:
+        - apply:
+            file: model.yaml
+        - script:
+            env:
+              - name: NAMESPACE
+                value: ($namespace)
+            content: |
+              apply-with-status.sh model.yaml --status-only -n $NAMESPACE
+
+    - name: Create frozen template with Ready status
+      try:
+        - apply:
+            file: template.yaml
+        - script:
+            env:
+              - name: NAMESPACE
+                value: ($namespace)
+            content: |
+              apply-with-status.sh template.yaml --status-only -n $NAMESPACE
+
+    - name: Create service
+      try:
+        - apply:
+            file: service.yaml
+
+    - name: Wait for service to resolve dependencies
+      try:
+        - assert:
+            resource:
+              apiVersion: aim.eai.amd.com/v1alpha1
+              kind: AIMService
+              metadata:
+                name: test-service
+              status:
+                status: Starting
+                (conditions[?type == 'ModelReady']):
+                  - status: "True"
+                    reason: ModelResolved
+                (conditions[?type == 'TemplateReady']):
+                  - status: "True"
+                    reason: Resolved
+
+    - name: Verify aim debug output shows full tree
+      try:
+        - script:
+            env:
+              - name: NAMESPACE
+                value: ($namespace)
+            content: |
+              set -eu
+              OUTPUT=$(aim debug service test-service -n "$NAMESPACE")
+              echo "$OUTPUT"
+              echo "$OUTPUT" | grep -q "AIMModel"
+              echo "$OUTPUT" | grep -q "AIMServiceTemplate"
+              echo "$OUTPUT" | grep -q "InferenceService"
+              echo "$OUTPUT" | grep -q "Starting"
+              echo "$OUTPUT" | grep -q "ModelResolved"
+              echo "$OUTPUT" | grep -q "Resolved"

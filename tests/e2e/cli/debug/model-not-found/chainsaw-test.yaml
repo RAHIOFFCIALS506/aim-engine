@@ -1,0 +1,45 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/kyverno/chainsaw/main/.schemas/json/test-chainsaw-v1alpha1.json
+#
+# CLI Debug Test: Model Not Found
+#
+# Validates that `aim debug service` correctly surfaces ModelNotFound
+# when the referenced model does not exist.
+#
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: cli-debug-model-not-found
+spec:
+  steps:
+    - name: Create service referencing non-existent model
+      try:
+        - apply:
+            file: service.yaml
+
+    - name: Wait for service to report ModelNotFound
+      try:
+        - assert:
+            resource:
+              apiVersion: aim.eai.amd.com/v1alpha1
+              kind: AIMService
+              metadata:
+                name: test-service
+              status:
+                status: Failed
+                (conditions[?type == 'ModelReady']):
+                  - status: "False"
+                    reason: ModelNotFound
+
+    - name: Verify aim debug output shows ModelNotFound
+      try:
+        - script:
+            env:
+              - name: NAMESPACE
+                value: ($namespace)
+            content: |
+              set -eu
+              OUTPUT=$(aim debug service test-service -n "$NAMESPACE")
+              echo "$OUTPUT"
+              echo "$OUTPUT" | grep -q "Failed"
+              echo "$OUTPUT" | grep -q "ModelNotFound"
+              echo "$OUTPUT" | grep -q "not resolved"

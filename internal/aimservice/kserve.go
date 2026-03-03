@@ -220,7 +220,7 @@ func buildInferenceService(
 	}
 
 	// Build environment variables
-	envVars := buildMergedEnvVars(service, templateSpec, obs)
+	envVars := BuildMergedEnvVars(service, templateSpec, obs.mergedRuntimeConfig.Value)
 
 	// Determine image from the resolved model
 	image := ""
@@ -350,16 +350,16 @@ func buildInferenceService(
 	return inferenceService
 }
 
-// buildMergedEnvVars builds environment variables with hierarchical merging.
+// BuildMergedEnvVars builds environment variables with hierarchical merging.
 // Precedence order (highest to lowest):
 // 1. Service.Spec.Env (user-specified on service)
 // 2. Template.Spec.Env
 // 3. Runtime config env vars
 // 4. System defaults
-func buildMergedEnvVars(
+func BuildMergedEnvVars(
 	service *aimv1alpha1.AIMService,
 	templateSpec *aimv1alpha1.AIMServiceTemplateSpecCommon,
-	obs ServiceObservation,
+	runtimeConfig *aimv1alpha1.AIMRuntimeConfigCommon,
 ) []corev1.EnvVar {
 	// Start with system defaults
 	envVars := []corev1.EnvVar{
@@ -369,8 +369,8 @@ func buildMergedEnvVars(
 
 	// Merge runtime config env vars
 	// AIM_ENGINE_ARGS is deep-merged as JSON to preserve contributions from all sources
-	if obs.mergedRuntimeConfig.Value != nil && len(obs.mergedRuntimeConfig.Value.Env) > 0 {
-		envVars = utils.MergeEnvVars(envVars, obs.mergedRuntimeConfig.Value.Env, utils.EnvVarAIMEngineArgs)
+	if runtimeConfig != nil && len(runtimeConfig.Env) > 0 {
+		envVars = utils.MergeEnvVars(envVars, runtimeConfig.Env, utils.EnvVarAIMEngineArgs)
 	}
 
 	// Add profile ID if set on template

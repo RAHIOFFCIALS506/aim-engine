@@ -185,6 +185,14 @@ test-chainsaw: ## Run chainsaw e2e tests (selector based on ENV). Pass CHAINSAW_
 		--report-format JSON --report-name chainsaw-report --report-path $(CHAINSAW_REPORT_DIR) \
 		$(CHAINSAW_ARGS)
 
+.PHONY: test-chainsaw-cli
+test-chainsaw-cli: build-cli ## Run CLI e2e tests via chainsaw.
+	@mkdir -p $(CHAINSAW_REPORT_DIR)
+	@PATH="$(CURDIR)/bin:$(CURDIR)/hack:$(PATH)" chainsaw test --full-name --test-dir tests/e2e/cli \
+		--config $(CHAINSAW_ENV_CONFIG) \
+		--report-format JSON --report-name chainsaw-cli-report --report-path $(CHAINSAW_REPORT_DIR) \
+		$(CHAINSAW_ARGS)
+
 .PHONY: test-chainsaw-kind
 test-chainsaw-kind: ## Run chainsaw e2e tests for KIND environment
 	$(MAKE) test-chainsaw ENV=kind
@@ -284,6 +292,10 @@ env-info: ## Show current environment configuration (derived from kubectl contex
 .PHONY: build
 build: manifests generate fmt vet ## Build manager binary.
 	go build -ldflags "$(LDFLAGS)" -o bin/manager cmd/main.go
+
+.PHONY: build-cli
+build-cli: fmt vet ## Build CLI binary.
+	go build -o bin/aim ./cmd/cli/
 
 .PHONY: run
 run: manifests generate fmt vet ## Run a controller from your host.

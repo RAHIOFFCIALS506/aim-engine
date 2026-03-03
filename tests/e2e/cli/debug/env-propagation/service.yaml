@@ -1,0 +1,15 @@
+apiVersion: aim.eai.amd.com/v1alpha1
+kind: AIMService
+metadata:
+  name: test-service
+spec:
+  model:
+    name: test-model
+  template:
+    name: test-template
+  replicas: 1
+  env:
+    - name: HF_TOKEN
+      value: service-token-value
+    - name: HTTPS_PROXY
+      value: https://proxy.example.com:8080

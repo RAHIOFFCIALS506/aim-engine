@@ -6,6 +6,7 @@ Design notes for an `aim` CLI built into aim-engine.
 
 - **Don't duplicate kubectl.** AIM CLI adds value where kubectl can't — debug views, derived name resolution, env merge inspection, diagnostic rules. CRUD and declarative apply are kubectl's job.
 - **Follow kubectl conventions** where they overlap (flag names like `-n`, `-o`, `-l`, `--all-namespaces`). Users shouldn't have to learn a new muscle memory.
+- **Observe, then explain.** Like `istioctl proxy-config` or `kubectl describe`, diagnostic commands show the *actual* state of the running system as ground truth — never a re-derived prediction when the real data is available. Internal knowledge of operator algorithms (env merge precedence, template selection, derived naming) is used to *annotate* and *explain* the observed state (e.g. which layer an env var originated from), not to replace it. When a resource doesn't exist yet and only inferred state is available, the output must clearly indicate this (e.g. `(not yet deployed)`) so users never mistake a prediction for an observation.
 - **Structured output where it adds value.** Commands with machine-consumable results (e.g. `analyze`, `validate`, `model add`) support `-o json|yaml`. Commands that produce composite human-readable output (e.g. `debug`) don't force it — structured subsections are available via the standalone building-block commands.
 - **Logic separated from CLI wiring.** Every command is a callable Go function with typed I/O, not code embedded in Cobra handlers. This makes the same logic available to tests, SDK consumers, and a future MCP server without refactoring. See [Architecture guidance](#architecture-guidance) and [MCP readiness](#mcp-readiness).
 
@@ -212,7 +213,7 @@ aim env service my-svc -n default
 aim env service my-svc -n default -o json
 ```
 
-Reuses the `buildMergedEnvVars` logic from `internal/aimservice/kserve.go`. The four precedence layers are: system defaults (immutable, e.g. `AIM_CACHE_PATH`), RuntimeConfig env, Template env, and Service env (highest wins). `AIM_ENGINE_ARGS` is deep-merged as JSON across layers rather than overwritten.
+Reads actual env vars from the InferenceService container (ground truth), then annotates each with its originating AIM resource layer by checking name-membership against the four precedence layers: system defaults (e.g. `AIM_CACHE_PATH`), RuntimeConfig env, Template env, and Service env (highest wins). When the InferenceService has not been created yet, the env section is omitted.
 
 ### 7. Wait / poll — `aim wait`
 
@@ -351,7 +352,8 @@ Key source locations for CLI implementation:
 | Common types and enums | `api/v1alpha1/common_types.go`, `runtime.go`, `discovery.go` |
 | Constants (status values, env var names) | `internal/constants/constants.go` |
 | Derived name generation | `internal/utils/naming.go` — `GenerateDerivedName()` |
-| Env var merge logic | `internal/aimservice/kserve.go` — `buildMergedEnvVars()` |
+| Env var merge logic (operator) | `internal/aimservice/kserve.go` — `BuildMergedEnvVars()` |
+| Env var display (CLI) | `internal/diagnose/service.go` — reads from InferenceService, annotates source layer |
 | Template auto-selection | `internal/aimservice/selection.go` |
 | Runtime config merge | `internal/aimruntimeconfig/observe.go` — `FetchMergedRuntimeConfig()` |
 | Domain reconcilers | `internal/aim{service,model,artifact,servicetemplate,templatecache,clustermodelsource}/` |
