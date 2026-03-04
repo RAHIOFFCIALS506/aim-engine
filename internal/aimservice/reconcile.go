@@ -1029,6 +1029,7 @@ func (r *ServiceReconciler) DecorateStatus(
 			Scope: scope,
 		}
 		if obs.modelResult.Model.Value != nil {
+			status.ResolvedModel.Namespace = obs.modelResult.Model.Value.Namespace
 			status.ResolvedModel.UID = obs.modelResult.Model.Value.UID
 		} else if obs.modelResult.ClusterModel.Value != nil {
 			status.ResolvedModel.UID = obs.modelResult.ClusterModel.Value.UID

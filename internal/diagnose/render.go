@@ -23,51 +23,138 @@
 package diagnose
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"strings"
 	"text/tabwriter"
+	"unicode/utf8"
 )
 
 const sectionWidth = 60
 
+// truncateRunes truncates s to maxRunes runes, appending "..." if truncated.
+func truncateRunes(s string, maxRunes int) string {
+	if utf8.RuneCountInString(s) <= maxRunes {
+		return s
+	}
+	return string([]rune(s)[:maxRunes-3]) + "..."
+}
+
+// RenderJSON writes v as indented JSON to w.
+func RenderJSON(w io.Writer, v any) error {
+	enc := json.NewEncoder(w)
+	enc.SetIndent("", "  ")
+	return enc.Encode(v)
+}
+
+// RenderScanResult writes scan results in istioctl analyze style:
+// one line per diagnostic, plus a summary footer.
+func RenderScanResult(w io.Writer, result *ScanResult, scope string) {
+	color := ColorEnabled(w)
+	if len(result.Diagnostics) == 0 {
+		fmt.Fprintf(w, "✔ No issues found when analyzing %d AIMService(s) (%s)\n",
+			result.ServicesScanned, scope)
+		return
+	}
+	for _, d := range result.Diagnostics {
+		fmt.Fprintf(w, "%s [%s] (%s) %s\n",
+			colorizeSeverity(d.Severity, color), d.Code, d.Resource, d.Message)
+	}
+	fmt.Fprintf(w, "\n%d AIMService(s) scanned (%s), %d with issues\n",
+		result.ServicesScanned, scope, result.ServicesWithIssues)
+}
+
+// RenderDiagnostics writes diagnostics in a tabular format matching istioctl analyze style.
+func RenderDiagnostics(w io.Writer, diagnostics []Diagnostic) {
+	color := ColorEnabled(w)
+	if len(diagnostics) == 0 {
+		fmt.Fprintln(w, "No issues found.")
+		return
+	}
+	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
+	fmt.Fprintf(tw, "CODE\tSEVERITY\tRESOURCE\tMESSAGE\n")
+	for _, d := range diagnostics {
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\n", d.Code, colorizeSeverity(d.Severity, color), d.Resource, truncateRunes(d.Message, 60))
+	}
+	tw.Flush()
+}
+
+// RenderTreeText writes a human-readable tree to w.
+func RenderTreeText(w io.Writer, tree *TreeNode) error {
+	color := ColorEnabled(w)
+	ew := &errWriter{w: w}
+	printTreeNode(ew, tree, "", true, true, color)
+	return ew.err
+}
+
 // Render writes a human-readable diagnostic report to w.
 func Render(w io.Writer, r *Report) error {
-	fmt.Fprintf(w, "%s/%s  [%s]\n\n", r.Resource.Kind, r.Resource.Name, r.Resource.Status)
+	color := ColorEnabled(w)
 
-	renderTree(w, r.Tree, "", true)
+	fmt.Fprintf(w, "%s  [%s]\n\n",
+		colorizeBold(r.Resource.Kind+"/"+r.Resource.Name, color),
+		colorizeStatus(r.Resource.Status, color))
+
+	printTreeNode(w, r.Tree, "", true, true, color)
 	fmt.Fprintln(w)
 
+	if len(r.Diagnostics) > 0 {
+		renderSection(w, "DIAGNOSTICS", color)
+		for _, d := range r.Diagnostics {
+			fmt.Fprintf(w, "%s [%s] %s\n", colorizeSeverity(d.Severity, color), d.Code, d.Message)
+		}
+		fmt.Fprintln(w)
+	}
+
 	if len(r.Conditions) > 0 {
-		renderSection(w, "CONDITIONS")
-		renderConditions(w, r.Conditions)
+		renderSection(w, "CONDITIONS", color)
+		renderConditions(w, r.Conditions, color)
 		fmt.Fprintln(w)
 	}
 
 	if len(r.EnvVars) > 0 {
-		renderSection(w, "EFFECTIVE ENV")
-		renderEnvVars(w, r.EnvVars)
+		renderSection(w, "EFFECTIVE ENV", color)
+		renderEnvVars(w, r.EnvVars, color)
 		fmt.Fprintln(w)
 	}
 
 	if len(r.Events) > 0 {
-		renderSection(w, "RECENT EVENTS")
-		renderEvents(w, r.Events)
+		renderSection(w, "RECENT EVENTS", color)
+		renderEvents(w, r.Events, color)
 		fmt.Fprintln(w)
 	}
 
 	return nil
 }
 
-func renderSection(w io.Writer, title string) {
+// errWriter wraps an io.Writer and captures the first write error.
+type errWriter struct {
+	w   io.Writer
+	err error
+}
+
+func (ew *errWriter) Write(p []byte) (int, error) {
+	if ew.err != nil {
+		return 0, ew.err
+	}
+	n, err := ew.w.Write(p)
+	if err != nil {
+		ew.err = err
+	}
+	return n, err
+}
+
+func renderSection(w io.Writer, title string, color bool) {
 	pad := sectionWidth - len(title) - 5
 	if pad < 3 {
 		pad = 3
 	}
-	fmt.Fprintf(w, "━━ %s %s\n", title, strings.Repeat("━", pad))
+	line := fmt.Sprintf("━━ %s %s", title, strings.Repeat("━", pad))
+	fmt.Fprintln(w, colorizeFaint(line, color))
 }
 
-func renderTree(w io.Writer, node *TreeNode, prefix string, isLast bool) {
+func printTreeNode(w io.Writer, node *TreeNode, prefix string, isLast bool, isRoot bool, color bool) {
 	if node == nil {
 		return
 	}
@@ -76,19 +163,19 @@ func renderTree(w io.Writer, node *TreeNode, prefix string, isLast bool) {
 	if isLast {
 		connector = "└── "
 	}
-	if prefix == "" {
+	if isRoot {
 		connector = ""
 	}
 
 	annotation := ""
 	if node.Annotation != "" {
-		annotation = "  " + node.Annotation
+		annotation = "  " + colorizeFaint(node.Annotation, color)
 	}
 
-	fmt.Fprintf(w, "%s%s%s/%s  [%s]%s\n", prefix, connector, node.Kind, node.Name, node.Status, annotation)
+	fmt.Fprintf(w, "%s%s%s/%s  [%s]%s\n", prefix, connector, node.Kind, node.Name, colorizeStatus(node.Status, color), annotation)
 
 	childPrefix := prefix
-	if prefix != "" {
+	if !isRoot {
 		if isLast {
 			childPrefix += "    "
 		} else {
@@ -97,44 +184,36 @@ func renderTree(w io.Writer, node *TreeNode, prefix string, isLast bool) {
 	}
 
 	for i, child := range node.Children {
-		renderTree(w, child, childPrefix, i == len(node.Children)-1)
+		printTreeNode(w, child, childPrefix, i == len(node.Children)-1, false, color)
 	}
 }
 
-func renderConditions(w io.Writer, conditions []ConditionRow) {
+func renderConditions(w io.Writer, conditions []ConditionRow, color bool) {
 	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
 	fmt.Fprintf(tw, "TYPE\tSTATUS\tREASON\tMESSAGE\n")
 	for _, c := range conditions {
-		msg := c.Message
-		if len(msg) > 60 {
-			msg = msg[:57] + "..."
-		}
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\n", c.Type, c.Status, c.Reason, msg)
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\n", c.Type, colorizeConditionStatus(c.Status, color), c.Reason, truncateRunes(c.Message, 60))
 	}
 	tw.Flush()
 }
 
-func renderEnvVars(w io.Writer, envVars []EnvEntry) {
+func renderEnvVars(w io.Writer, envVars []EnvEntry, color bool) {
 	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
 	for _, e := range envVars {
-		val := e.Value
-		if len(val) > 40 {
-			val = val[:37] + "..."
-		}
-		fmt.Fprintf(tw, "%s\t= %s\t← %s\n", e.Name, val, e.Source)
+		fmt.Fprintf(tw, "%s\t= %s\t%s\n", e.Name, truncateRunes(e.Value, 40), colorizeFaint("← "+e.Source, color))
 	}
 	tw.Flush()
 }
 
-func renderEvents(w io.Writer, events []EventRow) {
+func renderEvents(w io.Writer, events []EventRow, color bool) {
 	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
 	fmt.Fprintf(tw, "AGE\tTYPE\tREASON\tOBJECT\tMESSAGE\n")
 	for _, e := range events {
-		msg := e.Message
-		if len(msg) > 50 {
-			msg = msg[:47] + "..."
+		eventType := e.Type
+		if color && e.Type == "Warning" {
+			eventType = ansiYellow + e.Type + ansiReset
 		}
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\n", e.Age, e.Type, e.Reason, e.Object, msg)
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\n", e.Age, eventType, e.Reason, e.Object, truncateRunes(e.Message, 50))
 	}
 	tw.Flush()
 }

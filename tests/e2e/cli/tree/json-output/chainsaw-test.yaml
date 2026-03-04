@@ -1,0 +1,74 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/kyverno/chainsaw/main/.schemas/json/test-chainsaw-v1alpha1.json
+#
+# CLI Tree Test: JSON Output
+#
+# Validates that `aim tree service -o json` produces valid JSON
+# with the expected structure when model and template are Ready.
+#
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: cli-tree-json-output
+spec:
+  steps:
+    - name: Create frozen model with Ready status
+      try:
+        - apply:
+            file: model.yaml
+        - script:
+            env:
+              - name: NAMESPACE
+                value: ($namespace)
+            content: |
+              apply-with-status.sh model.yaml --status-only -n $NAMESPACE
+
+    - name: Create frozen template with Ready status
+      try:
+        - apply:
+            file: template.yaml
+        - script:
+            env:
+              - name: NAMESPACE
+                value: ($namespace)
+            content: |
+              apply-with-status.sh template.yaml --status-only -n $NAMESPACE
+
+    - name: Create service
+      try:
+        - apply:
+            file: service.yaml
+
+    - name: Wait for service to resolve dependencies
+      try:
+        - assert:
+            resource:
+              apiVersion: aim.eai.amd.com/v1alpha1
+              kind: AIMService
+              metadata:
+                name: test-service
+              status:
+                status: Starting
+                (conditions[?type == 'ModelReady']):
+                  - status: "True"
+                    reason: ModelResolved
+                (conditions[?type == 'TemplateReady']):
+                  - status: "True"
+                    reason: Resolved
+
+    - name: Verify aim tree JSON output structure
+      try:
+        - script:
+            env:
+              - name: NAMESPACE
+                value: ($namespace)
+            content: |
+              set -eu
+              OUTPUT=$(aim tree service test-service -n "$NAMESPACE" -o json)
+              echo "$OUTPUT"
+              echo "$OUTPUT" | jq -e '.kind == "AIMService"'
+              echo "$OUTPUT" | jq -e '.name == "test-service"'
+              echo "$OUTPUT" | jq -e '.status == "Starting"'
+              echo "$OUTPUT" | jq -e '.children | length > 0'
+              echo "$OUTPUT" | jq -e '[.children[] | select(.kind == "AIMModel")] | length == 1'
+              echo "$OUTPUT" | jq -e '[.children[] | select(.kind == "AIMServiceTemplate")] | length == 1'
+              echo "$OUTPUT" | jq -e '[.children[] | select(.kind == "InferenceService")] | length == 1'

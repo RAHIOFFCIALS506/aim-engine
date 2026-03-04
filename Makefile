@@ -295,7 +295,7 @@ build: manifests generate fmt vet ## Build manager binary.
 
 .PHONY: build-cli
 build-cli: fmt vet ## Build CLI binary.
-	go build -o bin/aim ./cmd/cli/
+	go build -ldflags "-X main.version=$(TAG)" -o bin/aim ./cmd/cli/
 
 .PHONY: run
 run: manifests generate fmt vet ## Run a controller from your host.

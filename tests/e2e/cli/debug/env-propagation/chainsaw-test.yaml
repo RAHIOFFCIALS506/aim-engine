@@ -53,15 +53,47 @@ spec:
                   name: test-template
                   scope: Namespace
 
-    - name: Verify aim debug output shows env source attribution
+    - name: Freeze TemplateCache as Ready so operator creates InferenceService
       try:
         - script:
+            timeout: 30s
             env:
               - name: NAMESPACE
                 value: ($namespace)
             content: |
               set -eu
-              OUTPUT=$(aim debug service test-service -n "$NAMESPACE")
+              for i in $(seq 1 15); do
+                CACHE=$(kubectl get aimtemplatecache -n "$NAMESPACE" \
+                  -l aim.eai.amd.com/service=test-service -o name 2>/dev/null || true)
+                if [ -n "$CACHE" ]; then break; fi
+                sleep 2
+              done
+              [ -n "$CACHE" ] || { echo "TemplateCache not created within timeout"; exit 1; }
+              CACHE_NAME=${CACHE#*/}
+              kubectl annotate "$CACHE" -n "$NAMESPACE" \
+                aim.eai.amd.com/reconciliation-paused=true --overwrite
+              kubectl patch "$CACHE" -n "$NAMESPACE" \
+                --type=merge --subresource=status \
+                -p '{"status":{"status":"Ready"}}'
+
+    - name: Verify aim debug output shows env source attribution
+      try:
+        - script:
+            timeout: 90s
+            env:
+              - name: NAMESPACE
+                value: ($namespace)
+            content: |
+              set -eu
+              # Env vars are read from the actual InferenceService, so we
+              # must wait for the operator to create it.
+              for i in $(seq 1 30); do
+                OUTPUT=$(aim debug service test-service -n "$NAMESPACE")
+                if echo "$OUTPUT" | grep -q "EFFECTIVE ENV"; then
+                  break
+                fi
+                sleep 2
+              done
               echo "$OUTPUT"
               # HF_TOKEN should be from Service (overrides Template)
               echo "$OUTPUT" | grep "HF_TOKEN" | grep -q "Service"

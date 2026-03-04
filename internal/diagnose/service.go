@@ -71,11 +71,26 @@ func debugService(ctx context.Context, c client.Client, name, namespace string) 
 	}
 
 	report.Tree = buildServiceTree(ctx, c, &svc)
+
+	var diagnostics []Diagnostic
+	for _, analyzer := range serviceAnalyzers {
+		diagnostics = append(diagnostics, analyzer(ctx, c, &svc)...)
+	}
+	report.Diagnostics = diagnostics
+
 	report.Conditions = extractConditions(svc.Status.Conditions)
 	report.EnvVars = buildEnvEntries(ctx, c, &svc, isvc)
 	report.Events = collectServiceEvents(ctx, c, &svc)
 
 	return report, nil
+}
+
+func treeService(ctx context.Context, c client.Client, name, namespace string) (*TreeNode, error) {
+	var svc aimv1alpha1.AIMService
+	if err := c.Get(ctx, client.ObjectKey{Name: name, Namespace: namespace}, &svc); err != nil {
+		return nil, fmt.Errorf("get AIMService %s/%s: %w", namespace, name, err)
+	}
+	return buildServiceTree(ctx, c, &svc), nil
 }
 
 // buildServiceTree walks the AIMService dependency graph and returns a tree.
@@ -200,11 +215,34 @@ func fetchPodNodes(ctx context.Context, c client.Client, isvcName, namespace str
 		nodes = append(nodes, &TreeNode{
 			Kind:       "Pod",
 			Name:       pod.Name,
-			Status:     string(pod.Status.Phase),
+			Status:     podEffectiveStatus(pod),
 			Annotation: pod.Spec.NodeName,
 		})
 	}
 	return nodes
+}
+
+// podEffectiveStatus returns the most relevant status string for a pod,
+// preferring container-level reasons (CrashLoopBackOff, ImagePullBackOff, etc.)
+// over the pod-level phase which can be misleadingly "Running".
+func podEffectiveStatus(pod *corev1.Pod) string {
+	for _, cs := range pod.Status.ContainerStatuses {
+		if cs.State.Waiting != nil && cs.State.Waiting.Reason != "" {
+			return cs.State.Waiting.Reason
+		}
+		if cs.State.Terminated != nil && cs.State.Terminated.Reason != "" {
+			return cs.State.Terminated.Reason
+		}
+	}
+	for _, cs := range pod.Status.InitContainerStatuses {
+		if cs.State.Waiting != nil && cs.State.Waiting.Reason != "" {
+			return fmt.Sprintf("Init:%s", cs.State.Waiting.Reason)
+		}
+		if cs.State.Terminated != nil && cs.State.Terminated.ExitCode != 0 {
+			return fmt.Sprintf("Init:%s", cs.State.Terminated.Reason)
+		}
+	}
+	return string(pod.Status.Phase)
 }
 
 // fetchNode is a generic helper that fetches a K8s object and returns a tree node.

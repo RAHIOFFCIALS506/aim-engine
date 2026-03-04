@@ -17,6 +17,13 @@ spec:
       value: http://template-proxy:8080
 status:
   status: Ready
+  modelSources:
+    - modelId: example/model
+      sourceUri: hf://example/model
+  resolvedHardware:
+    gpu:
+      requests: 1
+      model: MI300X
   profile:
     metadata:
       type: optimized
