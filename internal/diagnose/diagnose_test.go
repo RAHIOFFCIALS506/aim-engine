@@ -267,10 +267,10 @@ func TestRun_AllReady(t *testing.T) {
 	for _, child := range report.Tree.Children {
 		kinds[child.Kind] = child.Status
 	}
-	if kinds["AIMModel"] != "Ready" {
+	if kinds["AIMModel"] != conditionReady {
 		t.Errorf("expected AIMModel Ready, got %q", kinds["AIMModel"])
 	}
-	if kinds["AIMServiceTemplate"] != "Ready" {
+	if kinds["AIMServiceTemplate"] != conditionReady {
 		t.Errorf("expected AIMServiceTemplate Ready, got %q", kinds["AIMServiceTemplate"])
 	}
 	if _, ok := kinds["InferenceService"]; !ok {
@@ -280,7 +280,7 @@ func TestRun_AllReady(t *testing.T) {
 	// EnvVars should include system defaults read from the actual ISVC
 	foundCachePath := false
 	for _, e := range report.EnvVars {
-		if e.Name == "AIM_CACHE_PATH" && e.Source == "System" {
+		if e.Name == "AIM_CACHE_PATH" && e.Source == envSourceSystem {
 			foundCachePath = true
 		}
 	}
@@ -419,7 +419,7 @@ func TestRun_EnvSourceAttribution(t *testing.T) {
 	if e, ok := envByName["AIM_CACHE_PATH"]; !ok {
 		t.Error("expected AIM_CACHE_PATH env var")
 	} else {
-		if e.Source != "System" {
+		if e.Source != envSourceSystem {
 			t.Errorf("expected AIM_CACHE_PATH source 'System', got %q", e.Source)
 		}
 	}

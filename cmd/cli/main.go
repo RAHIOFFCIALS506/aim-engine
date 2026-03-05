@@ -47,6 +47,8 @@ import (
 	"github.com/amd-enterprise-ai/aim-engine/internal/diagnose"
 )
 
+const outputJSON = "json"
+
 var (
 	scheme  = runtime.NewScheme()
 	version = "dev"
@@ -128,47 +130,27 @@ func newDebugCmd() *cobra.Command {
 }
 
 func newDebugServiceCmd(cf *connFlags) *cobra.Command {
-	var output string
-	cmd := &cobra.Command{
-		Use:   "service [name]",
-		Short: "Debug an AIMService",
-		Long:  "Without a name, lists AIMServices in the namespace. With a name, shows the full diagnostic report.",
-		Example: `  aim debug service
+	return newServiceSubCmd(cf,
+		"Debug an AIMService",
+		"Without a name, lists AIMServices in the namespace. With a name, shows the full diagnostic report.",
+		`  aim debug service
   aim debug service my-llm
   aim debug service my-llm -o json`,
-		ValidArgsFunction: completeServiceNames(cf),
-		RunE: func(cmd *cobra.Command, args []string) error {
-			if err := cf.validateAllNamespaces(args); err != nil {
-				return err
-			}
-			c, ns, err := cf.client()
-			if err != nil {
-				return err
-			}
-			if len(args) == 0 {
-				return listServices(cmd.Context(), c, cf.listNamespace(ns), cf.allNamespaces)
-			}
-			report, err := diagnose.Run(cmd.Context(), c, diagnose.Options{
-				ResourceType: "service",
-				Name:         args[0],
-				Namespace:    ns,
-			})
+		func(ctx context.Context, c client.Client, opts diagnose.Options, output string) error {
+			report, err := diagnose.Run(ctx, c, opts)
 			if err != nil {
 				return err
 			}
 			switch output {
-			case "json":
+			case outputJSON:
 				return diagnose.RenderJSON(os.Stdout, report)
 			case "":
 				return diagnose.Render(os.Stdout, report)
 			default:
-				return fmt.Errorf("unsupported output format %q (supported: json)", output)
+				return fmtUnsupportedOutput(output)
 			}
 		},
-	}
-	cmd.Args = cobra.MaximumNArgs(1)
-	cmd.Flags().StringVarP(&output, "output", "o", "", "Output format (json)")
-	return cmd
+	)
 }
 
 // ---------------------------------------------------------------------------
@@ -188,47 +170,27 @@ func newTreeCmd() *cobra.Command {
 }
 
 func newTreeServiceCmd(cf *connFlags) *cobra.Command {
-	var output string
-	cmd := &cobra.Command{
-		Use:   "service [name]",
-		Short: "Show dependency tree for an AIMService",
-		Long:  "Without a name, lists AIMServices in the namespace. With a name, shows the dependency tree.",
-		Example: `  aim tree service
+	return newServiceSubCmd(cf,
+		"Show dependency tree for an AIMService",
+		"Without a name, lists AIMServices in the namespace. With a name, shows the dependency tree.",
+		`  aim tree service
   aim tree service my-llm
   aim tree service my-llm -o json`,
-		ValidArgsFunction: completeServiceNames(cf),
-		RunE: func(cmd *cobra.Command, args []string) error {
-			if err := cf.validateAllNamespaces(args); err != nil {
-				return err
-			}
-			c, ns, err := cf.client()
-			if err != nil {
-				return err
-			}
-			if len(args) == 0 {
-				return listServices(cmd.Context(), c, cf.listNamespace(ns), cf.allNamespaces)
-			}
-			tree, err := diagnose.Tree(cmd.Context(), c, diagnose.Options{
-				ResourceType: "service",
-				Name:         args[0],
-				Namespace:    ns,
-			})
+		func(ctx context.Context, c client.Client, opts diagnose.Options, output string) error {
+			tree, err := diagnose.Tree(ctx, c, opts)
 			if err != nil {
 				return err
 			}
 			switch output {
-			case "json":
+			case outputJSON:
 				return diagnose.RenderJSON(os.Stdout, tree)
 			case "":
 				return diagnose.RenderTreeText(os.Stdout, tree)
 			default:
-				return fmt.Errorf("unsupported output format %q (supported: json)", output)
+				return fmtUnsupportedOutput(output)
 			}
 		},
-	}
-	cmd.Args = cobra.MaximumNArgs(1)
-	cmd.Flags().StringVarP(&output, "output", "o", "", "Output format (json)")
-	return cmd
+	)
 }
 
 // ---------------------------------------------------------------------------
@@ -267,14 +229,16 @@ namespaces with -A) and prints a summary of findings — similar to istioctl ana
 			}
 
 			switch output {
-			case "json":
+			case outputJSON:
 				if err := diagnose.RenderJSON(os.Stdout, result); err != nil {
 					return err
 				}
 			case "":
-				diagnose.RenderScanResult(os.Stdout, result, scope)
+				if err := diagnose.RenderScanResult(os.Stdout, result, scope); err != nil {
+					return err
+				}
 			default:
-				return fmt.Errorf("unsupported output format %q (supported: json)", output)
+				return fmtUnsupportedOutput(output)
 			}
 
 			if diagnose.HasErrors(result.Diagnostics) {
@@ -320,14 +284,16 @@ func newAnalyzeServiceCmd(cf *connFlags) *cobra.Command {
 				return err
 			}
 			switch output {
-			case "json":
+			case outputJSON:
 				if err := diagnose.RenderJSON(os.Stdout, diagnostics); err != nil {
 					return err
 				}
 			case "":
-				diagnose.RenderDiagnostics(os.Stdout, diagnostics)
+				if err := diagnose.RenderDiagnostics(os.Stdout, diagnostics); err != nil {
+					return err
+				}
 			default:
-				return fmt.Errorf("unsupported output format %q (supported: json)", output)
+				return fmtUnsupportedOutput(output)
 			}
 			if diagnose.HasErrors(diagnostics) {
 				cmd.SilenceErrors = true
@@ -402,6 +368,47 @@ To load completions:
 }
 
 // ---------------------------------------------------------------------------
+// shared service subcommand builder
+// ---------------------------------------------------------------------------
+
+type serviceActionFunc func(ctx context.Context, c client.Client, opts diagnose.Options, output string) error
+
+func newServiceSubCmd(cf *connFlags, short, long, example string, action serviceActionFunc) *cobra.Command {
+	var output string
+	cmd := &cobra.Command{
+		Use:               "service [name]",
+		Short:             short,
+		Long:              long,
+		Example:           example,
+		ValidArgsFunction: completeServiceNames(cf),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if err := cf.validateAllNamespaces(args); err != nil {
+				return err
+			}
+			c, ns, err := cf.client()
+			if err != nil {
+				return err
+			}
+			if len(args) == 0 {
+				return listServices(cmd.Context(), c, cf.listNamespace(ns), cf.allNamespaces)
+			}
+			return action(cmd.Context(), c, diagnose.Options{
+				ResourceType: "service",
+				Name:         args[0],
+				Namespace:    ns,
+			}, output)
+		},
+	}
+	cmd.Args = cobra.MaximumNArgs(1)
+	cmd.Flags().StringVarP(&output, "output", "o", "", "Output format (json)")
+	return cmd
+}
+
+func fmtUnsupportedOutput(format string) error {
+	return fmt.Errorf("unsupported output format %q (supported: json)", format)
+}
+
+// ---------------------------------------------------------------------------
 // service listing & completion
 // ---------------------------------------------------------------------------
 
@@ -420,16 +427,16 @@ func listServices(ctx context.Context, c client.Client, namespace string, showNa
 	}
 	tw := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
 	if showNamespace {
-		fmt.Fprintf(tw, "NAMESPACE\tNAME\tSTATUS\tAGE\n")
+		_, _ = fmt.Fprintf(tw, "NAMESPACE\tNAME\tSTATUS\tAGE\n")
 		for i := range list.Items {
 			svc := &list.Items[i]
-			fmt.Fprintf(tw, "%s\t%s\t%s\t%s\n", svc.Namespace, svc.Name, svc.Status.Status, formatAge(svc.CreationTimestamp.Time))
+			_, _ = fmt.Fprintf(tw, "%s\t%s\t%s\t%s\n", svc.Namespace, svc.Name, svc.Status.Status, formatAge(svc.CreationTimestamp.Time))
 		}
 	} else {
-		fmt.Fprintf(tw, "NAME\tSTATUS\tAGE\n")
+		_, _ = fmt.Fprintf(tw, "NAME\tSTATUS\tAGE\n")
 		for i := range list.Items {
 			svc := &list.Items[i]
-			fmt.Fprintf(tw, "%s\t%s\t%s\n", svc.Name, svc.Status.Status, formatAge(svc.CreationTimestamp.Time))
+			_, _ = fmt.Fprintf(tw, "%s\t%s\t%s\n", svc.Name, svc.Status.Status, formatAge(svc.CreationTimestamp.Time))
 		}
 	}
 	return tw.Flush()

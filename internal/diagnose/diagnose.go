@@ -104,6 +104,11 @@ type DiagnosticCode struct {
 	Template string
 }
 
+const (
+	conditionReady  = "Ready"
+	envSourceSystem = "System"
+)
+
 var (
 	AIM001 = DiagnosticCode{Code: "AIM001", Severity: SeverityError, Template: "AIMService is in Failed state"}
 	AIM003 = DiagnosticCode{Code: "AIM003", Severity: SeverityError, Template: "Pod container not running"}

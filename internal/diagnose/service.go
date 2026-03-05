@@ -262,9 +262,9 @@ func fetchNode(ctx context.Context, c client.Client, key client.ObjectKey, obj c
 
 func inferenceServiceStatus(isvc *servingv1beta1.InferenceService) string {
 	for _, cond := range isvc.Status.Conditions {
-		if cond.Type == "Ready" {
+		if cond.Type == conditionReady {
 			if cond.Status == "True" {
-				return "Ready"
+				return conditionReady
 			}
 			return fmt.Sprintf("%s (%s)", cond.Reason, cond.Message)
 		}
@@ -302,7 +302,7 @@ func buildEnvEntries(ctx context.Context, c client.Client, svc *aimv1alpha1.AIMS
 	}
 
 	var runtimeConfig *aimv1alpha1.AIMRuntimeConfigCommon
-	rcName := svc.Spec.RuntimeConfigRef.Name
+	rcName := svc.Spec.Name
 	rcResult := aimruntimeconfig.FetchMergedRuntimeConfig(ctx, c, rcName, svc.Namespace)
 	if rcResult.Value != nil {
 		runtimeConfig = rcResult.Value
@@ -341,7 +341,7 @@ func annotateEnvSources(actual []corev1.EnvVar, svc *aimv1alpha1.AIMService, tem
 
 	entries := make([]EnvEntry, 0, len(actual))
 	for _, e := range actual {
-		source := "System"
+		source := envSourceSystem
 		if _, ok := runtimeEnv[e.Name]; ok {
 			source = "RuntimeConfig"
 		}

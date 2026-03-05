@@ -95,10 +95,10 @@ func TestTree_AllReady(t *testing.T) {
 	for _, child := range tree.Children {
 		kinds[child.Kind] = child.Status
 	}
-	if kinds["AIMModel"] != "Ready" {
+	if kinds["AIMModel"] != conditionReady {
 		t.Errorf("expected AIMModel Ready, got %q", kinds["AIMModel"])
 	}
-	if kinds["AIMServiceTemplate"] != "Ready" {
+	if kinds["AIMServiceTemplate"] != conditionReady {
 		t.Errorf("expected AIMServiceTemplate Ready, got %q", kinds["AIMServiceTemplate"])
 	}
 }
