@@ -146,6 +146,11 @@ jobs:
           echo "=== CRDs ==="
           kubectl get crds | grep aim || true
 
+      - name: Build CLI binary
+        run: |
+          make build-cli
+          echo "$GITHUB_WORKSPACE/bin" >> "$GITHUB_PATH"
+
       - name: Run Chainsaw tests
         run: make test-chainsaw-kind
 
