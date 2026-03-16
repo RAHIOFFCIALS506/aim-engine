@@ -150,6 +150,115 @@ func TestAnalyze_JSONRoundTrip(t *testing.T) {
 	}
 }
 
+func TestAnalyze_ImagePullError(t *testing.T) {
+	scheme := testScheme()
+	svc := &aimv1alpha1.AIMService{
+		ObjectMeta: metav1.ObjectMeta{Name: "bad-image-svc", Namespace: "default"},
+		Spec: aimv1alpha1.AIMServiceSpec{
+			Model: aimv1alpha1.AIMServiceModel{Image: ptr.To("ghcr.io/noexist/model:latest")},
+		},
+		Status: aimv1alpha1.AIMServiceStatus{
+			Status: constants.AIMStatusFailed,
+			Conditions: []metav1.Condition{
+				{
+					Type:    "ModelReady",
+					Status:  metav1.ConditionFalse,
+					Reason:  "ModelNotReady",
+					Message: "AIMModel bad-image-model: image registry error: manifest unknown",
+				},
+			},
+		},
+	}
+
+	c := testClient(scheme, svc)
+	diagnostics, err := Analyze(context.Background(), c, Options{
+		ResourceType: "service",
+		Name:         "bad-image-svc",
+		Namespace:    "default",
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if len(diagnostics) != 1 {
+		t.Fatalf("expected 1 diagnostic, got %d", len(diagnostics))
+	}
+
+	d := diagnostics[0]
+	if d.Code != "AIM001" {
+		t.Errorf("expected code AIM001, got %s", d.Code)
+	}
+	if !strings.Contains(d.Message, "image registry error") {
+		t.Errorf("expected message to surface image registry error, got %s", d.Message)
+	}
+	if !strings.Contains(d.Message, "manifest unknown") {
+		t.Errorf("expected message to contain specific error detail, got %s", d.Message)
+	}
+}
+
+func TestAnalyzeAll_ImagePullError(t *testing.T) {
+	scheme := testScheme()
+	healthy := &aimv1alpha1.AIMService{
+		ObjectMeta: metav1.ObjectMeta{Name: "healthy-svc", Namespace: "default"},
+		Spec: aimv1alpha1.AIMServiceSpec{
+			Model: aimv1alpha1.AIMServiceModel{Name: ptr.To("good-model")},
+		},
+		Status: aimv1alpha1.AIMServiceStatus{
+			Status: constants.AIMStatusReady,
+		},
+	}
+	failing := &aimv1alpha1.AIMService{
+		ObjectMeta: metav1.ObjectMeta{Name: "bad-image-svc", Namespace: "other-ns"},
+		Spec: aimv1alpha1.AIMServiceSpec{
+			Model: aimv1alpha1.AIMServiceModel{Image: ptr.To("ghcr.io/noexist/model:latest")},
+		},
+		Status: aimv1alpha1.AIMServiceStatus{
+			Status: constants.AIMStatusFailed,
+			Conditions: []metav1.Condition{
+				{
+					Type:    "ModelReady",
+					Status:  metav1.ConditionFalse,
+					Reason:  "ModelNotReady",
+					Message: "AIMModel bad-image-model: image not found",
+				},
+			},
+		},
+	}
+
+	c := testClient(scheme, healthy, failing)
+	result, err := AnalyzeAll(context.Background(), c, "")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if result.ServicesScanned != 2 {
+		t.Errorf("expected 2 services scanned, got %d", result.ServicesScanned)
+	}
+	if result.ServicesWithIssues != 1 {
+		t.Errorf("expected 1 service with issues, got %d", result.ServicesWithIssues)
+	}
+	if len(result.Diagnostics) != 1 {
+		t.Fatalf("expected 1 diagnostic, got %d", len(result.Diagnostics))
+	}
+
+	d := result.Diagnostics[0]
+	if !strings.Contains(d.Resource, "other-ns/") {
+		t.Errorf("expected cross-namespace resource qualifier, got %s", d.Resource)
+	}
+	if !strings.Contains(d.Message, "image not found") {
+		t.Errorf("expected message to surface image error, got %s", d.Message)
+	}
+
+	var buf bytes.Buffer
+	if err := RenderScanResult(&buf, result, "across all namespaces"); err != nil {
+		t.Fatalf("render error: %v", err)
+	}
+	output := buf.String()
+	if !strings.Contains(output, "image not found") {
+		t.Errorf("rendered output should contain image error, got:\n%s", output)
+	}
+}
+
 func TestAnalyze_UnsupportedResource(t *testing.T) {
 	c := testClient(testScheme())
 	_, err := Analyze(context.Background(), c, Options{

@@ -112,19 +112,19 @@ func Render(w io.Writer, r *Report) error {
 
 	if len(r.Conditions) > 0 {
 		renderSection(ew, "CONDITIONS", color)
-		renderConditions(ew, r.Conditions, color)
+		renderConditions(ew, r.Conditions, color, 0)
 		ew.println()
 	}
 
 	if len(r.EnvVars) > 0 {
 		renderSection(ew, "EFFECTIVE ENV", color)
-		renderEnvVars(ew, r.EnvVars, color)
+		renderEnvVars(ew, r.EnvVars, color, 0)
 		ew.println()
 	}
 
 	if len(r.Events) > 0 {
 		renderSection(ew, "RECENT EVENTS", color)
-		renderEvents(ew, r.Events, color)
+		renderEvents(ew, r.Events, color, 0)
 		ew.println()
 	}
 
@@ -205,28 +205,39 @@ func printTreeNode(w io.Writer, node *TreeNode, prefix string, isLast bool, isRo
 	}
 }
 
-func renderConditions(ew *errWriter, conditions []ConditionRow, color bool) {
+// renderConditions writes a conditions table. maxMsg <= 0 means no truncation.
+func renderConditions(ew *errWriter, conditions []ConditionRow, color bool, maxMsg int) {
 	tw := tabwriter.NewWriter(ew, 0, 0, 2, ' ', 0)
 	_, _ = fmt.Fprintf(tw, "TYPE\tSTATUS\tREASON\tMESSAGE\n")
 	for _, c := range conditions {
-		_, _ = fmt.Fprintf(tw, "%s\t%s\t%s\t%s\n", c.Type, colorizeConditionStatus(c.Status, color), c.Reason, truncateRunes(c.Message, 60))
+		msg := c.Message
+		if maxMsg > 0 {
+			msg = truncateRunes(msg, maxMsg)
+		}
+		_, _ = fmt.Fprintf(tw, "%s\t%s\t%s\t%s\n", c.Type, colorizeConditionStatus(c.Status, color), c.Reason, msg)
 	}
 	if err := tw.Flush(); ew.err == nil {
 		ew.err = err
 	}
 }
 
-func renderEnvVars(ew *errWriter, envVars []EnvEntry, color bool) {
+// renderEnvVars writes an env-var table. maxVal <= 0 means no truncation.
+func renderEnvVars(ew *errWriter, envVars []EnvEntry, color bool, maxVal int) {
 	tw := tabwriter.NewWriter(ew, 0, 0, 2, ' ', 0)
 	for _, e := range envVars {
-		_, _ = fmt.Fprintf(tw, "%s\t= %s\t%s\n", e.Name, truncateRunes(e.Value, 40), colorizeFaint("← "+e.Source, color))
+		val := e.Value
+		if maxVal > 0 {
+			val = truncateRunes(val, maxVal)
+		}
+		_, _ = fmt.Fprintf(tw, "%s\t= %s\t%s\n", e.Name, val, colorizeFaint("← "+e.Source, color))
 	}
 	if err := tw.Flush(); ew.err == nil {
 		ew.err = err
 	}
 }
 
-func renderEvents(ew *errWriter, events []EventRow, color bool) {
+// renderEvents writes an events table. maxMsg <= 0 means no truncation.
+func renderEvents(ew *errWriter, events []EventRow, color bool, maxMsg int) {
 	tw := tabwriter.NewWriter(ew, 0, 0, 2, ' ', 0)
 	_, _ = fmt.Fprintf(tw, "AGE\tTYPE\tREASON\tOBJECT\tMESSAGE\n")
 	for _, e := range events {
@@ -234,7 +245,11 @@ func renderEvents(ew *errWriter, events []EventRow, color bool) {
 		if color && e.Type == "Warning" {
 			eventType = ansiYellow + e.Type + ansiReset
 		}
-		_, _ = fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\n", e.Age, eventType, e.Reason, e.Object, truncateRunes(e.Message, 50))
+		msg := e.Message
+		if maxMsg > 0 {
+			msg = truncateRunes(msg, maxMsg)
+		}
+		_, _ = fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\n", e.Age, eventType, e.Reason, e.Object, msg)
 	}
 	if err := tw.Flush(); ew.err == nil {
 		ew.err = err

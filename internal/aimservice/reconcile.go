@@ -30,6 +30,7 @@ import (
 	servingv1beta1 "github.com/kserve/kserve/pkg/apis/serving/v1beta1"
 	autoscalingv2 "k8s.io/api/autoscaling/v2"
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -235,7 +236,7 @@ func (obs ServiceObservation) getModelHealth() controllerutils.ComponentHealth {
 	}
 	// Check OK() and that model was actually populated (Name != "" guards against empty Fetch result)
 	if mr.Model.OK() && mr.Model.Value != nil && mr.Model.Value.Name != "" {
-		return evaluateModelStatus(mr.Model.Value.Status.Status, "AIMModel", mr.Model.Value.Name)
+		return evaluateModelStatus(mr.Model.Value.Status.Status, mr.Model.Value.Status.Conditions, "AIMModel", mr.Model.Value.Name)
 	}
 
 	// Check cluster-scoped model
@@ -251,7 +252,7 @@ func (obs ServiceObservation) getModelHealth() controllerutils.ComponentHealth {
 	}
 	// Check OK() and that model was actually populated (Name != "" guards against empty Fetch result)
 	if mr.ClusterModel.OK() && mr.ClusterModel.Value != nil && mr.ClusterModel.Value.Name != "" {
-		return evaluateModelStatus(mr.ClusterModel.Value.Status.Status, "AIMClusterModel", mr.ClusterModel.Value.Name)
+		return evaluateModelStatus(mr.ClusterModel.Value.Status.Status, mr.ClusterModel.Value.Status.Conditions, "AIMClusterModel", mr.ClusterModel.Value.Name)
 	}
 
 	// If InferenceService exists and model was previously resolved, report as ready.
@@ -277,7 +278,7 @@ func (obs ServiceObservation) getModelHealth() controllerutils.ComponentHealth {
 	}
 }
 
-func evaluateModelStatus(status constants.AIMStatus, kind, name string) controllerutils.ComponentHealth {
+func evaluateModelStatus(status constants.AIMStatus, conditions []metav1.Condition, kind, name string) controllerutils.ComponentHealth {
 	health := controllerutils.ComponentHealth{
 		Component:      "Model",
 		DependencyType: controllerutils.DependencyTypeUpstream,
@@ -296,6 +297,9 @@ func evaluateModelStatus(status constants.AIMStatus, kind, name string) controll
 		health.State = constants.AIMStatusFailed
 		health.Reason = aimv1alpha1.AIMServiceReasonModelNotReady
 		health.Message = kind + " " + name + " is in failed state"
+		if detail := firstFailureDetail(conditions); detail != "" {
+			health.Message = kind + " " + name + ": " + detail
+		}
 	default:
 		health.State = constants.AIMStatusProgressing
 		health.Reason = aimv1alpha1.AIMServiceReasonModelNotReady
@@ -303,6 +307,25 @@ func evaluateModelStatus(status constants.AIMStatus, kind, name string) controll
 	}
 
 	return health
+}
+
+// firstFailureDetail returns the message from the most relevant False condition,
+// prioritizing ImageMetadataReady since image pull errors are the most common
+// root cause of model failures.
+func firstFailureDetail(conditions []metav1.Condition) string {
+	var fallback string
+	for _, c := range conditions {
+		if c.Status != metav1.ConditionFalse || c.Message == "" {
+			continue
+		}
+		if c.Type == "ImageMetadataReady" {
+			return c.Message
+		}
+		if fallback == "" {
+			fallback = c.Message
+		}
+	}
+	return fallback
 }
 
 func (obs ServiceObservation) getTemplateHealth() controllerutils.ComponentHealth {

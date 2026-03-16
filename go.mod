@@ -10,7 +10,9 @@ require (
 	github.com/google/go-containerregistry/pkg/authn/k8schain v0.0.0-20230209165335-3624968304fd
 	github.com/google/go-containerregistry/pkg/authn/kubernetes v0.0.0-20230209165335-3624968304fd
 	github.com/kserve/kserve v0.16.1-0.20251128170209-af1534b62f8c
+	github.com/spf13/cobra v1.10.2
 	go.uber.org/zap v1.27.0
+	golang.org/x/term v0.37.0
 	k8s.io/api v0.34.1
 	k8s.io/apiextensions-apiserver v0.34.1
 	k8s.io/apimachinery v0.34.1
@@ -129,7 +131,6 @@ require (
 	github.com/prometheus/common v0.65.0 // indirect
 	github.com/prometheus/procfs v0.17.0 // indirect
 	github.com/sirupsen/logrus v1.9.3 // indirect
-	github.com/spf13/cobra v1.10.2 // indirect
 	github.com/spf13/pflag v1.0.9 // indirect
 	github.com/spiffe/go-spiffe/v2 v2.5.0 // indirect
 	github.com/stoewer/go-strcase v1.3.0 // indirect
@@ -158,7 +159,6 @@ require (
 	golang.org/x/oauth2 v0.30.0 // indirect
 	golang.org/x/sync v0.18.0 // indirect
 	golang.org/x/sys v0.38.0 // indirect
-	golang.org/x/term v0.37.0 // indirect
 	golang.org/x/text v0.31.0 // indirect
 	golang.org/x/time v0.12.0 // indirect
 	gomodules.xyz/jsonpatch/v2 v2.5.0 // indirect

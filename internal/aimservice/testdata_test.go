@@ -185,6 +185,11 @@ func (b *ModelBuilder) WithStatus(status constants.AIMStatus) *ModelBuilder {
 	return b
 }
 
+func (b *ModelBuilder) WithConditions(conditions ...metav1.Condition) *ModelBuilder {
+	b.model.Status.Conditions = conditions
+	return b
+}
+
 func (b *ModelBuilder) Build() *aimv1alpha1.AIMModel {
 	return b.model.DeepCopy()
 }
@@ -225,6 +230,11 @@ func (b *ClusterModelBuilder) WithImage(image string) *ClusterModelBuilder {
 
 func (b *ClusterModelBuilder) WithStatus(status constants.AIMStatus) *ClusterModelBuilder {
 	b.model.Status.Status = status
+	return b
+}
+
+func (b *ClusterModelBuilder) WithConditions(conditions ...metav1.Condition) *ClusterModelBuilder {
+	b.model.Status.Conditions = conditions
 	return b
 }
 

@@ -25,6 +25,7 @@ package diagnose
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strings"
 
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -111,7 +112,9 @@ const (
 
 var (
 	AIM001 = DiagnosticCode{Code: "AIM001", Severity: SeverityError, Template: "AIMService is in Failed state"}
+	// AIM002 is reserved for "InferenceService missing for Running/Starting service" (not yet implemented).
 	AIM003 = DiagnosticCode{Code: "AIM003", Severity: SeverityError, Template: "Pod container not running"}
+	AIM004 = DiagnosticCode{Code: "AIM004", Severity: SeverityWarning, Template: "Could not derive InferenceService name"}
 )
 
 // Diagnostic represents a single diagnostic finding from the analyzer.
@@ -186,6 +189,7 @@ func dispatch[T any](opts Options, pick func(resourceHandler) func(context.Conte
 		for k := range handlers {
 			supported = append(supported, k)
 		}
+		sort.Strings(supported)
 		return nil, fmt.Errorf("unsupported resource type %q (supported: %s)", opts.ResourceType, strings.Join(supported, ", "))
 	}
 	return pick(h), nil

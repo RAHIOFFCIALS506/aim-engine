@@ -27,7 +27,6 @@ import (
 	"fmt"
 	"os"
 	"text/tabwriter"
-	"time"
 
 	"github.com/spf13/cobra"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -137,7 +136,9 @@ func newDebugServiceCmd(cf *connFlags) *cobra.Command {
   aim debug service my-llm
   aim debug service my-llm -o json`,
 		func(ctx context.Context, c client.Client, opts diagnose.Options, output string) error {
+			sp := diagnose.NewSpinner("Fetching diagnostics...")
 			report, err := diagnose.Run(ctx, c, opts)
+			sp.Stop()
 			if err != nil {
 				return err
 			}
@@ -177,7 +178,9 @@ func newTreeServiceCmd(cf *connFlags) *cobra.Command {
   aim tree service my-llm
   aim tree service my-llm -o json`,
 		func(ctx context.Context, c client.Client, opts diagnose.Options, output string) error {
+			sp := diagnose.NewSpinner("Fetching dependency tree...")
 			tree, err := diagnose.Tree(ctx, c, opts)
+			sp.Stop()
 			if err != nil {
 				return err
 			}
@@ -218,7 +221,9 @@ namespaces with -A) and prints a summary of findings — similar to istioctl ana
 				return err
 			}
 			listNS := cf.listNamespace(ns)
+			sp := diagnose.NewSpinner("Analyzing services...")
 			result, err := diagnose.AnalyzeAll(cmd.Context(), c, listNS)
+			sp.Stop()
 			if err != nil {
 				return err
 			}
@@ -275,11 +280,13 @@ func newAnalyzeServiceCmd(cf *connFlags) *cobra.Command {
 			if len(args) == 0 {
 				return listServices(cmd.Context(), c, cf.listNamespace(ns), cf.allNamespaces)
 			}
+			sp := diagnose.NewSpinner("Analyzing service...")
 			diagnostics, err := diagnose.Analyze(cmd.Context(), c, diagnose.Options{
 				ResourceType: "service",
 				Name:         args[0],
 				Namespace:    ns,
 			})
+			sp.Stop()
 			if err != nil {
 				return err
 			}
@@ -413,8 +420,11 @@ func fmtUnsupportedOutput(format string) error {
 // ---------------------------------------------------------------------------
 
 func listServices(ctx context.Context, c client.Client, namespace string, showNamespace bool) error {
+	sp := diagnose.NewSpinner("Listing services...")
 	var list aimv1alpha1.AIMServiceList
-	if err := c.List(ctx, &list, client.InNamespace(namespace)); err != nil {
+	err := c.List(ctx, &list, client.InNamespace(namespace))
+	sp.Stop()
+	if err != nil {
 		return fmt.Errorf("list AIMServices: %w", err)
 	}
 	if len(list.Items) == 0 {
@@ -430,33 +440,16 @@ func listServices(ctx context.Context, c client.Client, namespace string, showNa
 		_, _ = fmt.Fprintf(tw, "NAMESPACE\tNAME\tSTATUS\tAGE\n")
 		for i := range list.Items {
 			svc := &list.Items[i]
-			_, _ = fmt.Fprintf(tw, "%s\t%s\t%s\t%s\n", svc.Namespace, svc.Name, svc.Status.Status, formatAge(svc.CreationTimestamp.Time))
+			_, _ = fmt.Fprintf(tw, "%s\t%s\t%s\t%s\n", svc.Namespace, svc.Name, svc.Status.Status, diagnose.FormatAge(svc.CreationTimestamp.Time))
 		}
 	} else {
 		_, _ = fmt.Fprintf(tw, "NAME\tSTATUS\tAGE\n")
 		for i := range list.Items {
 			svc := &list.Items[i]
-			_, _ = fmt.Fprintf(tw, "%s\t%s\t%s\n", svc.Name, svc.Status.Status, formatAge(svc.CreationTimestamp.Time))
+			_, _ = fmt.Fprintf(tw, "%s\t%s\t%s\n", svc.Name, svc.Status.Status, diagnose.FormatAge(svc.CreationTimestamp.Time))
 		}
 	}
 	return tw.Flush()
-}
-
-func formatAge(t time.Time) string {
-	if t.IsZero() {
-		return "<unknown>"
-	}
-	d := time.Since(t)
-	switch {
-	case d < time.Minute:
-		return fmt.Sprintf("%ds", int(d.Seconds()))
-	case d < time.Hour:
-		return fmt.Sprintf("%dm", int(d.Minutes()))
-	case d < 24*time.Hour:
-		return fmt.Sprintf("%dh", int(d.Hours()))
-	default:
-		return fmt.Sprintf("%dd", int(d.Hours()/24))
-	}
 }
 
 func completeServiceNames(cf *connFlags) func(*cobra.Command, []string, string) ([]string, cobra.ShellCompDirective) {

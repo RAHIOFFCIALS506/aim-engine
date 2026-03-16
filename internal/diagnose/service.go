@@ -54,11 +54,14 @@ func debugService(ctx context.Context, c client.Client, name, namespace string) 
 
 	// Fetch the InferenceService for ground-truth env vars (may not exist yet)
 	var isvc *servingv1beta1.InferenceService
+	var isvcNameErr error
 	if isvcName, err := aimservice.GenerateInferenceServiceName(svc.Name, svc.Namespace); err == nil {
 		var obj servingv1beta1.InferenceService
 		if err := c.Get(ctx, client.ObjectKey{Name: isvcName, Namespace: svc.Namespace}, &obj); err == nil {
 			isvc = &obj
 		}
+	} else {
+		isvcNameErr = err
 	}
 
 	report := &Report{
@@ -73,6 +76,9 @@ func debugService(ctx context.Context, c client.Client, name, namespace string) 
 	report.Tree = buildServiceTree(ctx, c, &svc)
 
 	var diagnostics []Diagnostic
+	if isvcNameErr != nil {
+		diagnostics = append(diagnostics, NewDiagnostic(AIM004, fmt.Sprintf("AIMService/%s", svc.Name), isvcNameErr.Error()))
+	}
 	for _, analyzer := range serviceAnalyzers {
 		diagnostics = append(diagnostics, analyzer(ctx, c, &svc)...)
 	}
@@ -127,15 +133,21 @@ func buildServiceTree(ctx context.Context, c client.Client, svc *aimv1alpha1.AIM
 	}
 
 	// InferenceService (derived name)
-	isvcName, err := aimservice.GenerateInferenceServiceName(svc.Name, svc.Namespace)
-	if err == nil {
+	if isvcName, err := aimservice.GenerateInferenceServiceName(svc.Name, svc.Namespace); err == nil {
 		root.Children = append(root.Children, fetchInferenceServiceNode(ctx, c, isvcName, svc.Namespace))
+	} else {
+		root.Children = append(root.Children, &TreeNode{
+			Kind: "InferenceService", Name: svc.Name, Status: fmt.Sprintf("(name error: %v)", err),
+		})
 	}
 
 	// HTTPRoute (derived name)
-	routeName, err := aimservice.GenerateHTTPRouteName(svc.Name, svc.Namespace)
-	if err == nil {
+	if routeName, err := aimservice.GenerateHTTPRouteName(svc.Name, svc.Namespace); err == nil {
 		root.Children = append(root.Children, fetchHTTPRouteNode(ctx, c, routeName, svc.Namespace))
+	} else {
+		root.Children = append(root.Children, &TreeNode{
+			Kind: "HTTPRoute", Name: svc.Name, Status: fmt.Sprintf("(name error: %v)", err),
+		})
 	}
 
 	// TemplateCache
@@ -371,7 +383,8 @@ func collectServiceEvents(ctx context.Context, c client.Client, svc *aimv1alpha1
 	// Events for the AIMService itself
 	allEvents = append(allEvents, fetchEventsForObject(ctx, c, svc.Name, svc.Namespace, svc.UID)...)
 
-	// Events for the derived InferenceService
+	// Events for the derived InferenceService. Name-generation errors are
+	// already surfaced via the tree and diagnostics sections.
 	if isvcName, err := aimservice.GenerateInferenceServiceName(svc.Name, svc.Namespace); err == nil {
 		var isvc servingv1beta1.InferenceService
 		if err := c.Get(ctx, client.ObjectKey{Name: isvcName, Namespace: svc.Namespace}, &isvc); err == nil {
@@ -390,7 +403,7 @@ func collectServiceEvents(ctx context.Context, c client.Client, svc *aimv1alpha1
 	rows := make([]EventRow, 0, len(allEvents))
 	for _, e := range allEvents {
 		rows = append(rows, EventRow{
-			Age:     formatAge(e.LastTimestamp.Time),
+			Age:     FormatAge(e.LastTimestamp.Time),
 			Type:    e.Type,
 			Reason:  e.Reason,
 			Object:  fmt.Sprintf("%s/%s", e.InvolvedObject.Kind, e.InvolvedObject.Name),
@@ -418,7 +431,7 @@ func fetchEventsForObject(ctx context.Context, c client.Client, name, namespace 
 	return filtered
 }
 
-func formatAge(t time.Time) string {
+func FormatAge(t time.Time) string {
 	if t.IsZero() {
 		return "<unknown>"
 	}

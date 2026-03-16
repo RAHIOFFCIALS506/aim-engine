@@ -26,13 +26,13 @@ import (
 	"context"
 	"testing"
 
-	servingv1beta1 "github.com/kserve/kserve/pkg/apis/serving/v1beta1"
-	corev1 "k8s.io/api/core/v1"
-	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
-
 	aimv1alpha1 "github.com/amd-enterprise-ai/aim-engine/api/v1alpha1"
 	"github.com/amd-enterprise-ai/aim-engine/internal/constants"
 	controllerutils "github.com/amd-enterprise-ai/aim-engine/internal/controller/utils"
+	servingv1beta1 "github.com/kserve/kserve/pkg/apis/serving/v1beta1"
+	corev1 "k8s.io/api/core/v1"
+	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 // ============================================================================
@@ -215,8 +215,28 @@ func TestGetComponentHealth_ModelHealth(t *testing.T) {
 					},
 				},
 			},
-			expectState:  constants.AIMStatusFailed,
-			expectReason: aimv1alpha1.AIMServiceReasonModelNotReady,
+			expectState:   constants.AIMStatusFailed,
+			expectReason:  aimv1alpha1.AIMServiceReasonModelNotReady,
+			expectMessage: "AIMModel m is in failed state",
+		},
+		{
+			name: "model failed with image pull error propagates detail",
+			obs: ServiceObservation{
+				ServiceFetchResult: ServiceFetchResult{
+					service: NewService("svc").Build(),
+					modelResult: ModelFetchResult{
+						Model: controllerutils.FetchResult[*aimv1alpha1.AIMModel]{
+							Value: NewModel("m").WithStatus(constants.AIMStatusFailed).WithConditions(
+								metav1.Condition{Type: "ImageMetadataReady", Status: metav1.ConditionFalse, Reason: "MetadataExtractionFailed", Message: "image registry error: manifest unknown"},
+								metav1.Condition{Type: "Ready", Status: metav1.ConditionFalse, Reason: "NotReady", Message: "not all conditions met"},
+							).Build(),
+						},
+					},
+				},
+			},
+			expectState:   constants.AIMStatusFailed,
+			expectReason:  aimv1alpha1.AIMServiceReasonModelNotReady,
+			expectMessage: "AIMModel m: image registry error: manifest unknown",
 		},
 		{
 			name: "cluster model ready",
@@ -269,6 +289,10 @@ func TestGetComponentHealth_ModelHealth(t *testing.T) {
 
 			if modelHealth.Reason != tt.expectReason {
 				t.Errorf("expected reason %s, got %s", tt.expectReason, modelHealth.Reason)
+			}
+
+			if tt.expectMessage != "" && modelHealth.Message != tt.expectMessage {
+				t.Errorf("expected message %q, got %q", tt.expectMessage, modelHealth.Message)
 			}
 		})
 	}
