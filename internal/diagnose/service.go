@@ -314,7 +314,7 @@ func buildEnvEntries(ctx context.Context, c client.Client, svc *aimv1alpha1.AIMS
 	}
 
 	var runtimeConfig *aimv1alpha1.AIMRuntimeConfigCommon
-	rcName := svc.Spec.Name
+	rcName := svc.GetRuntimeConfigRef().Name
 	rcResult := aimruntimeconfig.FetchMergedRuntimeConfig(ctx, c, rcName, svc.Namespace)
 	if rcResult.Value != nil {
 		runtimeConfig = rcResult.Value

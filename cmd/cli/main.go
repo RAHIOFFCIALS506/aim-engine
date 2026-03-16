@@ -419,7 +419,7 @@ func fmtUnsupportedOutput(format string) error {
 // service listing & completion
 // ---------------------------------------------------------------------------
 
-func listServices(ctx context.Context, c client.Client, namespace string, showNamespace bool) error {
+func listServices(ctx context.Context, c client.Client, namespace string, allNamespaces bool) error {
 	sp := diagnose.NewSpinner("Listing services...")
 	var list aimv1alpha1.AIMServiceList
 	err := c.List(ctx, &list, client.InNamespace(namespace))
@@ -428,7 +428,7 @@ func listServices(ctx context.Context, c client.Client, namespace string, showNa
 		return fmt.Errorf("list AIMServices: %w", err)
 	}
 	if len(list.Items) == 0 {
-		if showNamespace {
+		if allNamespaces {
 			fmt.Fprintln(os.Stderr, "No AIMServices found")
 		} else {
 			fmt.Fprintf(os.Stderr, "No AIMServices found in namespace %q\n", namespace)
@@ -436,7 +436,7 @@ func listServices(ctx context.Context, c client.Client, namespace string, showNa
 		return nil
 	}
 	tw := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	if showNamespace {
+	if allNamespaces {
 		_, _ = fmt.Fprintf(tw, "NAMESPACE\tNAME\tSTATUS\tAGE\n")
 		for i := range list.Items {
 			svc := &list.Items[i]

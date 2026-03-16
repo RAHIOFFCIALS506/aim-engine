@@ -26,13 +26,14 @@ import (
 	"context"
 	"testing"
 
-	aimv1alpha1 "github.com/amd-enterprise-ai/aim-engine/api/v1alpha1"
-	"github.com/amd-enterprise-ai/aim-engine/internal/constants"
-	controllerutils "github.com/amd-enterprise-ai/aim-engine/internal/controller/utils"
 	servingv1beta1 "github.com/kserve/kserve/pkg/apis/serving/v1beta1"
 	corev1 "k8s.io/api/core/v1"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	aimv1alpha1 "github.com/amd-enterprise-ai/aim-engine/api/v1alpha1"
+	"github.com/amd-enterprise-ai/aim-engine/internal/constants"
+	controllerutils "github.com/amd-enterprise-ai/aim-engine/internal/controller/utils"
 )
 
 // ============================================================================
