@@ -66,8 +66,8 @@ func TestAnalyze_FailedService(t *testing.T) {
 	}
 
 	d := diagnostics[0]
-	if d.Code != "AIM001" {
-		t.Errorf("expected code AIM001, got %s", d.Code)
+	if d.Code != AIM001.Code {
+		t.Errorf("expected code %s, got %s", AIM001.Code, d.Code)
 	}
 	if d.Severity != SeverityError {
 		t.Errorf("expected severity %s, got %s", SeverityError, d.Severity)
@@ -145,8 +145,8 @@ func TestAnalyze_JSONRoundTrip(t *testing.T) {
 	if len(decoded) != 1 {
 		t.Fatalf("expected 1 diagnostic after round-trip, got %d", len(decoded))
 	}
-	if decoded[0].Code != "AIM001" {
-		t.Errorf("expected code AIM001 after round-trip, got %s", decoded[0].Code)
+	if decoded[0].Code != AIM001.Code {
+		t.Errorf("expected code %s after round-trip, got %s", AIM001.Code, decoded[0].Code)
 	}
 }
 
@@ -185,8 +185,8 @@ func TestAnalyze_ImagePullError(t *testing.T) {
 	}
 
 	d := diagnostics[0]
-	if d.Code != "AIM001" {
-		t.Errorf("expected code AIM001, got %s", d.Code)
+	if d.Code != AIM001.Code {
+		t.Errorf("expected code %s, got %s", AIM001.Code, d.Code)
 	}
 	if !strings.Contains(d.Message, "image registry error") {
 		t.Errorf("expected message to surface image registry error, got %s", d.Message)
