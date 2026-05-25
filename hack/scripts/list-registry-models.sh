@@ -16,16 +16,11 @@ usage() {
   cat <<USAGE
 List container images from a registry namespace by glob pattern.
 
-Intended to seed the explicit image list that AIMClusterModelSource requires.
-Note: AIMClusterModelSource itself does not support wildcards (it uses
-go-containerregistry's OCI v2 client) — this script uses the Docker Hub /
-GitHub Packages REST APIs to enumerate candidates that match a glob, so the
-resulting list can be pasted into a ModelSource filter list.
+Useful for finding images matching a pattern (e.g. "*qwen*", "*epyc*").
+Can also generate an AIMClusterModelSource manifest directly with -M.
 
-Output is one image reference per line on stdout. Status and counts are
-written to stderr.
-
-By default only repos matching "${DEFAULT_FILTER}" are listed. Use --all to list everything.
+Output: one image reference per line on stdout; status on stderr.
+By default only repos matching "${DEFAULT_FILTER}" are listed; use --all for everything.
 
 Usage:
   $(basename "$0") [OPTIONS] [REGISTRY/NAMESPACE]
@@ -33,10 +28,11 @@ Usage:
 
 Options:
   -c, --config FILE          Path to a .dockerconfigjson file for authentication
-  -f, --filter PATTERN       Filter repos and optionally tags (default: ${DEFAULT_FILTER})
+  -f, --filter PATTERN       Filter to apply (default: ${DEFAULT_FILTER}). May be repeated;
+                             a repo or tag is emitted if ANY filter accepts it.
                              PATTERN may be "repo-glob" or "repo-glob:tag-glob"
-                             e.g. "aim-*" "aim-*:0.9" "aim-base:0.*"
-  -a, --all                  Disable default filter, list all repos and tags
+                             e.g. "aim-*", "aim-*:0.9", "*qwen*"
+  -a, --all                  Match every repo and tag (resets any prior -f).
   -j, --jobs N               Max parallel tag fetches (default: ${DEFAULT_JOBS})
   -S, --create-secret [NAME] Write a Kubernetes docker-registry Secret YAML
                              (requires --config, default name: ${DEFAULT_SECRET_NAME})
@@ -69,18 +65,24 @@ Examples:
   # Filter by repo and tag glob
   $(basename "$0") -f "aim-*:0.9" docker.io/amdenterpriseai
 
+  # Combine multiple patterns (union)
+  $(basename "$0") -f "*qwen*" -f "*deepseek*"
+
   # Save an image list and a matching ImagePullSecret, then apply the secret
   $(basename "$0") -c creds.json -S ghcr-pull-secret -o secret.yaml ghcr.io/silogen > images.txt
   kubectl apply -f secret.yaml
 
   # One-shot: discover images, generate the AIMClusterModelSource + ImagePullSecret
-  $(basename "$0") -c creds.json -S ghcr-pull-secret -M ghcr-aim-models ghcr.io/silogen
+  # (the operator looks up the secret in its own namespace; use -n to match)
+  $(basename "$0") -c creds.json -S ghcr-pull-secret -n aim-system \
+    -M ghcr-aim-models ghcr.io/silogen
   kubectl apply -f secret.yaml -f aimclustermodelsource.yaml
 USAGE
 }
 
 config_file=""
-filter="$DEFAULT_FILTER"
+filters=()
+all_flag=false
 target=""
 create_secret=""
 secret_namespace="default"
@@ -92,8 +94,8 @@ modelsource_output="$DEFAULT_MODELSOURCE_OUTPUT"
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -c|--config)         config_file="$2"; shift 2 ;;
-    -f|--filter)         filter="$2"; shift 2 ;;
-    -a|--all)            filter=""; shift ;;
+    -f|--filter)         filters+=("$2"); shift 2 ;;
+    -a|--all)            all_flag=true; filters=(); shift ;;
     -j|--jobs)           max_parallel="$2"; shift 2 ;;
     -S|--create-secret)
       if [[ $# -ge 2 && "$2" != -* ]]; then
@@ -123,6 +125,24 @@ if ! [[ "$max_parallel" =~ ^[1-9][0-9]*$ ]]; then
   exit 1
 fi
 
+# An empty filters array means "match everything". Apply the default only when
+# the user supplied neither -f nor -a, so -a's "match all" intent is preserved.
+if [[ "$all_flag" != true && ${#filters[@]} -eq 0 ]]; then
+  filters=("$DEFAULT_FILTER")
+fi
+
+# AIMClusterModelSource is cluster-scoped but resolves imagePullSecrets from the
+# AIM operator's own namespace, so the Secret produced by -S must live there too.
+# Warn (don't auto-pick) when the user combines -S with -M but leaves -n at "default".
+if [[ -n "$create_secret" && -n "$create_modelsource" && "$secret_namespace" == "default" ]]; then
+  cat >&2 <<'EOF'
+Warning: -S will write the Secret in namespace 'default', but AIMClusterModelSource
+         resolves imagePullSecrets from the AIM operator's own namespace (typically
+         'aim-system'). Re-run with '-n <operator-namespace>' to align the two,
+         or move the Secret yourself after applying.
+EOF
+fi
+
 if [[ -z "$target" ]]; then
   target="${DEFAULT_REGISTRY}/${DEFAULT_NAMESPACE}"
 fi
@@ -134,6 +154,14 @@ namespace="${target#*/}"
 if [[ "$registry" == "$namespace" ]]; then
   namespace="$registry"
   registry="$DEFAULT_REGISTRY"
+fi
+
+# --config is only consumed by GHCR token extraction and by --create-secret.
+# Warn if the user supplied it against docker.io with no --create-secret, since
+# Docker Hub API authentication is not implemented yet and the file is unused.
+if [[ -n "$config_file" && "$registry" == "docker.io" && -z "$create_secret" ]]; then
+  echo "Warning: --config is unused for docker.io API calls (Hub auth not implemented);" >&2
+  echo "         the file is only consumed by --create-secret. Drop -c or add -S." >&2
 fi
 
 # ---- Create Secret YAML ----
@@ -162,23 +190,51 @@ EOF
   echo "# Secret YAML for '${create_secret}' written to ${secret_output}" >&2
 fi
 
-# ---- Split filter into repo and tag parts ----
-
-repo_filter=""
-tag_filter=""
-if [[ -n "$filter" ]]; then
-  if [[ "$filter" == *:* ]]; then
-    repo_filter="${filter%%:*}"
-    tag_filter="${filter#*:}"
-  else
-    repo_filter="$filter"
-  fi
-fi
+# ---- Filter matching ----
 
 matches_glob() {
   local pattern="$1" string="$2"
   # shellcheck disable=SC2053  # glob match requires unquoted RHS
   [[ "$string" == $pattern ]]
+}
+
+# A repo matches if any filter's repo-part matches.
+# Empty filters array means "match everything" (-a/--all).
+repo_matches() {
+  local repo="$1"
+  if [[ ${#filters[@]} -eq 0 ]]; then
+    return 0
+  fi
+  local f
+  for f in "${filters[@]}"; do
+    if matches_glob "${f%%:*}" "$repo"; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+# A (repo, tag) pair matches if any filter accepts both: its repo-part matches
+# the repo, AND it has no tag-part OR its tag-part matches the tag.
+tag_matches() {
+  local repo="$1" tag="$2"
+  if [[ ${#filters[@]} -eq 0 ]]; then
+    return 0
+  fi
+  local f repo_part tag_part
+  for f in "${filters[@]}"; do
+    repo_part="${f%%:*}"
+    if [[ "$f" == *:* ]]; then
+      tag_part="${f#*:}"
+    else
+      tag_part=""
+    fi
+    if matches_glob "$repo_part" "$repo" \
+        && { [[ -z "$tag_part" ]] || matches_glob "$tag_part" "$tag"; }; then
+      return 0
+    fi
+  done
+  return 1
 }
 
 # ---- Docker Hub ----
@@ -215,6 +271,10 @@ list_dockerhub_tags() {
 extract_ghcr_token() {
   if [[ -z "$config_file" ]]; then
     echo "Error: GHCR requires --config with ghcr.io credentials" >&2
+    exit 1
+  fi
+  if [[ ! -f "$config_file" ]]; then
+    echo "Error: config file not found: $config_file" >&2
     exit 1
   fi
   local entry
@@ -287,6 +347,10 @@ list_ghcr_tags() {
     local scope="" service=""
     [[ "$challenge" =~ scope=\"([^\"]+)\" ]] && scope="${BASH_REMATCH[1]}"
     [[ "$challenge" =~ service=\"([^\"]+)\" ]] && service="${BASH_REMATCH[1]}"
+    if [[ -z "$scope" || -z "$service" ]]; then
+      echo "Error: malformed WWW-Authenticate header for ${repo} (missing scope or service)" >&2
+      return 1
+    fi
     local bearer
     if ! bearer=$(curl -sf -u "USERNAME:${token}" "${realm}?scope=${scope}&service=${service}" | jq -r '.token'); then
       return 1
@@ -314,7 +378,7 @@ limit_jobs() {
 # Emit a single repo's filtered "ref:tag" lines on stdout.
 # Returns non-zero if the tags list could not be fetched.
 emit_dockerhub_image() {
-  local namespace="$1" repo="$2" tag_filter="$3"
+  local namespace="$1" repo="$2"
   local tags
   if ! tags=$(list_dockerhub_tags "${namespace}/${repo}"); then
     return 1
@@ -322,15 +386,13 @@ emit_dockerhub_image() {
   local tag
   while IFS= read -r tag; do
     [[ -z "$tag" ]] && continue
-    if [[ -n "$tag_filter" ]] && ! matches_glob "$tag_filter" "$tag"; then
-      continue
-    fi
+    tag_matches "$repo" "$tag" || continue
     echo "${namespace}/${repo}:${tag}"
   done <<<"$tags"
 }
 
 emit_ghcr_image() {
-  local namespace="$1" pkg="$2" token="$3" tag_filter="$4"
+  local namespace="$1" pkg="$2" token="$3"
   local tags
   if ! tags=$(list_ghcr_tags "${namespace}/${pkg}" "$token"); then
     return 1
@@ -338,9 +400,7 @@ emit_ghcr_image() {
   local tag
   while IFS= read -r tag; do
     [[ -z "$tag" ]] && continue
-    if [[ -n "$tag_filter" ]] && ! matches_glob "$tag_filter" "$tag"; then
-      continue
-    fi
+    tag_matches "$pkg" "$tag" || continue
     echo "ghcr.io/${namespace}/${pkg}:${tag}"
   done <<<"$tags"
 }
@@ -349,6 +409,8 @@ emit_ghcr_image() {
 
 write_modelsource() {
   local name="$1" file="$2" images_src="$3" reg="$4" secret_name="$5"
+  # All user-derived string scalars are double-quoted so weird input (colons,
+  # leading dashes, YAML reserved words) cannot break the generated manifest.
   {
     echo "---"
     echo "# Generated by $(basename "$0") on $(date -u '+%Y-%m-%dT%H:%M:%SZ')."
@@ -356,9 +418,9 @@ write_modelsource() {
     echo "apiVersion: aim.eai.amd.com/v1alpha1"
     echo "kind: AIMClusterModelSource"
     echo "metadata:"
-    echo "  name: ${name}"
+    echo "  name: \"${name}\""
     echo "spec:"
-    echo "  registry: ${reg}"
+    echo "  registry: \"${reg}\""
     echo "  # How often the operator re-syncs from the registry. Minimum recommended: 15m."
     echo "  syncInterval: 1h"
     echo "  # Maximum number of AIMClusterModel resources this source may create."
@@ -366,7 +428,7 @@ write_modelsource() {
     if [[ -n "$secret_name" ]]; then
       echo "  # Pull secret must exist in the operator namespace (typically aim-system)."
       echo "  imagePullSecrets:"
-      echo "    - name: ${secret_name}"
+      echo "    - name: \"${secret_name}\""
     else
       echo "  # Uncomment for private registries; secret must exist in operator namespace."
       echo "  # imagePullSecrets:"
@@ -382,7 +444,12 @@ write_modelsource() {
 
 # ---- Main ----
 
-echo "# Listing images from ${registry}/${namespace} (filter: ${filter:-none}) ..." >&2
+if [[ ${#filters[@]} -eq 0 ]]; then
+  filter_summary="all"
+else
+  filter_summary="${filters[*]}"
+fi
+echo "# Listing images from ${registry}/${namespace} (filters: ${filter_summary}) ..." >&2
 
 images_file=$(mktemp)
 failures_file=$(mktemp)
@@ -393,9 +460,7 @@ case "$registry" in
     matching_repos=()
     while IFS= read -r repo; do
       [[ -z "$repo" ]] && continue
-      if [[ -n "$repo_filter" ]] && ! matches_glob "$repo_filter" "$repo"; then
-        continue
-      fi
+      repo_matches "$repo" || continue
       matching_repos+=("$repo")
     done < <(list_dockerhub_repos "$namespace")
 
@@ -405,7 +470,7 @@ case "$registry" in
         (
           # Single open of the file per subshell preserves O_APPEND atomicity
           # for the per-tag echo writes that emit_dockerhub_image performs.
-          if ! emit_dockerhub_image "$namespace" "$repo" "$tag_filter" >> "$images_file"; then
+          if ! emit_dockerhub_image "$namespace" "$repo" >> "$images_file"; then
             echo "$repo" >> "$failures_file"
           fi
         ) &
@@ -420,9 +485,7 @@ case "$registry" in
     matching_pkgs=()
     while IFS= read -r pkg; do
       [[ -z "$pkg" ]] && continue
-      if [[ -n "$repo_filter" ]] && ! matches_glob "$repo_filter" "$pkg"; then
-        continue
-      fi
+      repo_matches "$pkg" || continue
       matching_pkgs+=("$pkg")
     done < <(list_ghcr_packages "$namespace" "$token")
 
@@ -430,7 +493,7 @@ case "$registry" in
       echo "# Fetching tags for ${#matching_pkgs[@]} packages ..." >&2
       for pkg in "${matching_pkgs[@]}"; do
         (
-          if ! emit_ghcr_image "$namespace" "$pkg" "$token" "$tag_filter" >> "$images_file"; then
+          if ! emit_ghcr_image "$namespace" "$pkg" "$token" >> "$images_file"; then
             echo "$pkg" >> "$failures_file"
           fi
         ) &
@@ -446,8 +509,8 @@ case "$registry" in
     ;;
 esac
 
-# Stream the discovered list to stdout regardless of any downstream errors,
-# so users still see what was found.
+# Emit the discovered list on stdout regardless of any downstream errors, so
+# the user still sees what was found before any limit/failure summary fires.
 cat "$images_file"
 
 count=$(wc -l < "$images_file" | tr -d ' ')
