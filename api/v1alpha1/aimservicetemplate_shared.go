@@ -120,10 +120,11 @@ type AIMServiceTemplateSpecCommon struct {
 	// Type indicates the optimization level of this template.
 	// - optimized: Template has been tuned for performance
 	// - preview: Template is experimental/pre-release
+	// - general: General-purpose tuning between optimized and preview
 	// - unoptimized: Default, no specific optimizations applied
 	// When nil, the type is determined by discovery. When set, overrides discovery.
 	// +optional
-	// +kubebuilder:validation:Enum=optimized;preview;unoptimized
+	// +kubebuilder:validation:Enum=optimized;general;preview;unoptimized
 	Type *AIMProfileType `json:"type,omitempty"`
 
 	// Env specifies environment variables for inference containers.
@@ -268,6 +269,22 @@ type DiscoveryState struct {
 	// When the spec changes, the circuit breaker resets to allow fresh attempts.
 	// +optional
 	SpecHash string `json:"specHash,omitempty"`
+
+	// IdentityCheckHash records the hash from the most recent identity
+	// rediscovery attempt for a Ready template. When the current hash matches
+	// this value, the controller will not invalidate a Ready template just to
+	// retry identity (aimId/modelId) extraction. Bumping the operator-internal
+	// hash version forces a one-shot revisit across all eligible templates
+	// without operator intervention.
+	// +optional
+	IdentityCheckHash string `json:"identityCheckHash,omitempty"`
+
+	// LastIdentityCheckTime is the timestamp of the most recent identity
+	// rediscovery attempt initiation. Acts as a hard floor against rediscovery
+	// thrashing in the presence of bugs that prevent IdentityCheckHash from
+	// being recorded.
+	// +optional
+	LastIdentityCheckTime *metav1.Time `json:"lastIdentityCheckTime,omitempty"`
 }
 
 func (s *AIMServiceTemplateStatus) GetConditions() []metav1.Condition {
@@ -322,16 +339,55 @@ type AIMDiscoveredProfile struct {
 }
 
 // AIMProfileType indicates the optimization level of a deployment profile.
-// +kubebuilder:validation:Enum=optimized;preview;unoptimized
+// Hierarchy: optimized > general > preview > unoptimized.
+// +kubebuilder:validation:Enum=optimized;general;preview;unoptimized
 type AIMProfileType string
 
 const (
 	// AIMProfileTypeOptimized indicates the profile has been fully optimized.
 	AIMProfileTypeOptimized AIMProfileType = "optimized"
+	// AIMProfileTypeGeneral indicates a general-purpose profile (between optimized and preview).
+	AIMProfileTypeGeneral AIMProfileType = "general"
 	// AIMProfileTypePreview indicates the profile is in preview/beta state.
 	AIMProfileTypePreview AIMProfileType = "preview"
 	// AIMProfileTypeUnoptimized indicates the profile has not been optimized.
 	AIMProfileTypeUnoptimized AIMProfileType = "unoptimized"
+	// AIMProfileTypeAny is a selector-only sentinel meaning "no optimization
+	// floor — accept every tier". It is never stamped on a profile's own
+	// spec.type; it is only valid as a ProfileSelector.minimumType value, where
+	// it disables the floor (equivalent to flooring at unoptimized, the lowest
+	// tier, but reads as intent rather than asking specifically for unoptimized).
+	AIMProfileTypeAny AIMProfileType = "any"
+)
+
+// AIMProfileTypeFloor enumerates the values accepted by a profile selector's
+// minimumType floor: the real optimization tiers plus the selector-only "any"
+// sentinel that disables the floor.
+//
+// It is a distinct type from AIMProfileType on purpose. MinimumType cannot just
+// be an AIMProfileType: that type's own enum constrains a profile's spec.type to
+// the four real tiers (a profile is never "any"), and a field whose type already
+// declares an enum cannot widen it — controller-gen emits an allOf of the two
+// enums, whose intersection silently drops "any" and makes the documented
+// sentinel un-settable. A separate type carries the correct 5-value enum for the
+// floor while leaving spec.type constrained to real tiers.
+// +kubebuilder:validation:Enum=optimized;general;preview;unoptimized;any
+type AIMProfileTypeFloor string
+
+const (
+	// AIMProfileTypeFloorOptimized floors selection at optimized (the default
+	// for AIMService auto-selection).
+	AIMProfileTypeFloorOptimized AIMProfileTypeFloor = "optimized"
+	// AIMProfileTypeFloorGeneral floors selection at general.
+	AIMProfileTypeFloorGeneral AIMProfileTypeFloor = "general"
+	// AIMProfileTypeFloorPreview floors selection at preview.
+	AIMProfileTypeFloorPreview AIMProfileTypeFloor = "preview"
+	// AIMProfileTypeFloorUnoptimized floors selection at unoptimized (the
+	// lowest real tier — admits every typed profile).
+	AIMProfileTypeFloorUnoptimized AIMProfileTypeFloor = "unoptimized"
+	// AIMProfileTypeFloorAny disables the floor entirely (accept every tier,
+	// including untyped/unknown).
+	AIMProfileTypeFloorAny AIMProfileTypeFloor = "any"
 )
 
 // AIMProfileMetadata describes the characteristics of a cached deployment profile.

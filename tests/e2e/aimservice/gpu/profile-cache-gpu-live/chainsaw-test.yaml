@@ -4,8 +4,10 @@
 #
 # End-to-end test for the full v1alpha2 profile cache pipeline on real GPU
 # hardware. Exercises GLM-4.7-FP8 on MI300X (TP=2 latency) using
-# ghcr.io/silogen/aim-zai-org-glm-4-7:0.12.0-rc3 — the aim-build 0.12 image
-# that natively consumes the v1alpha2 AIMProfile CR format.
+# amdenterpriseai/aim-zai-org-glm-4-7:0.12.0 — the aim-build 0.12 image
+# that natively consumes the v1alpha2 AIMProfile CR format. This image is
+# published publicly under the amdenterpriseai Docker Hub org, so no pull
+# secret is needed to fetch it.
 #
 # Flow:
 # 1. Create AIMProfile with modelSources and acceleratorModel=MI300X
@@ -18,7 +20,6 @@
 # Requires:
 # - GPU cluster with at least two MI300X-labeled nodes/devices (TP=2)
 # - Longhorn storage for the shared profile cache PVC (~450 GiB)
-# - ghcr-regcred secret on the default service account (to pull the AIM image)
 # - huggingface-creds secret in-namespace (this test copies it in; see below)
 #
 apiVersion: chainsaw.kyverno.io/v1alpha1
@@ -26,13 +27,16 @@ kind: Test
 metadata:
   name: profile-cache-gpu-live
   labels:
-    # tier=manual keeps this out of the default selectors entirely: a 362 GiB
-    # download + multi-GPU cold warmup runs for ~30-45m end-to-end and is too
-    # heavy for routine CI. Whoever invokes a manual test already knows the
-    # environmental prerequisites (GPU cluster, Longhorn, HF token), so we
-    # don't bother tagging requires=gpu/longhorn/hf_token here. Run it via:
-    #   make test-chainsaw-gpu CHAINSAW_TEST_DIR=tests/e2e/aimservice/gpu/profile-cache-gpu-live
-    tier: manual
+    # requires=gpu marks this as a GPU test (excluded from the kind suite), while
+    # needs-secret=hf_token additionally excludes it from the GPU suite too (both
+    # selectors apply needs-secret notin (hf_token,dockerhub_pull_secret)). We want it
+    # out of BOTH by default: a 362 GiB download + multi-GPU cold warmup runs for
+    # ~30-45m end-to-end and is too heavy for routine CI. It genuinely needs an HF
+    # token (plus a GPU cluster and Longhorn), so the tags are accurate. Run it
+    # explicitly by invoking chainsaw without the env selector, e.g.:
+    #   PATH="$PWD/hack:$PATH" chainsaw test --test-dir tests/e2e/aimservice/gpu/profile-cache-gpu-live --config tests/chainsaw/config/gpu.yaml
+    requires: gpu
+    needs-secret: hf_token
 spec:
   description: Full profile cache pipeline with real MI300X inference and endpoint validation
   timeouts:
@@ -47,20 +51,13 @@ spec:
     # anonymous-rate-limit hard on repos this large. Inject a real user token
     # so the download job can authenticate. Referenced as HF_TOKEN via
     # caching.env in profile.yaml.
-    - name: Copy HF token secret into the test namespace
+    - name: Ensure HF token secret in the test namespace
       try:
         - script:
             env:
               - name: NAMESPACE
                 value: ($namespace)
-            content: |
-              SRC="${HF_TOKEN_SECRET_FILE:-$HOME/workspace/silogen/hf-token-secret.yaml}"
-              if [ ! -f "$SRC" ]; then
-                echo "ERROR: HF token secret file not found at $SRC" >&2
-                echo "Set HF_TOKEN_SECRET_FILE to point at a v1 Secret named 'huggingface-creds' with key 'token'." >&2
-                exit 1
-              fi
-              kubectl -n "$NAMESPACE" apply -f "$SRC"
+            content: bash ../../../_shared/ensure-hf-secret.sh
 
     - name: Create runtime config with routing
       try:
@@ -90,7 +87,12 @@ spec:
         - apply:
             file: service.yaml
 
-    - name: Verify AIMProfileCache is created
+    # The profile sets spec.caching.enabled=true, so the AIMProfile reconciler
+    # materialises a profile-owned AIMProfileCache named after the profile
+    # itself (1:1, owner-ref'd to it). The AIMService's fetchProfileCache
+    # picks this up via the Shared-mode list-by-profile-name search and
+    # reuses it instead of creating its own service-driven cache.
+    - name: Verify the profile-driven AIMProfileCache is materialised and reused
       try:
         - assert:
             timeout: 60s
@@ -98,9 +100,11 @@ spec:
               apiVersion: aim.eai.amd.com/v1alpha2
               kind: AIMProfileCache
               metadata:
+                name: glm-4-7-mi300x-live
                 namespace: ($namespace)
-                labels:
-                  aim.eai.amd.com/service: test-profile-cache-gpu
+                (ownerReferences[?kind == 'AIMProfile']):
+                  - name: glm-4-7-mi300x-live
+                    controller: true
               spec:
                 profileName: glm-4-7-mi300x-live
                 profileScope: Namespace
@@ -130,9 +134,8 @@ spec:
               apiVersion: aim.eai.amd.com/v1alpha2
               kind: AIMProfileCache
               metadata:
+                name: glm-4-7-mi300x-live
                 namespace: ($namespace)
-                labels:
-                  aim.eai.amd.com/service: test-profile-cache-gpu
               status:
                 status: Ready
 

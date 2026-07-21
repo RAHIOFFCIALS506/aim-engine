@@ -10,13 +10,18 @@ on:
       - 'cmd/**'
       - 'config/**'
       - 'images/artifact-downloader/**'
+      - 'images/aim-dummy/**'
       - 'Makefile'
       - 'Dockerfile'
       - '.github/workflows/publish-main.yml'
 
 permissions:
   contents: write
-  packages: write
+
+# Opt JavaScript actions onto Node 24 ahead of GitHub's June 16, 2026 default
+# flip. See https://github.blog/changelog/2025-09-19-deprecation-of-node-20-on-github-actions-runners/
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
 jobs:
   publish:
@@ -25,7 +30,11 @@ jobs:
     env:
       PUSH_IMAGE_REPO: ${{ vars.PUSH_IMAGE_REPO }}
       PULL_IMAGE_REPO: ${{ vars.PULL_IMAGE_REPO }}
-      CHART_NAME: aim-engine
+      # OCI registry that receives the packaged Helm chart for publish-main
+      # builds. Defaults to the same DockerHub silogenai org used by tagged
+      # releases on this fork.
+      CHART_OCI_REPO: ${{ vars.CHART_OCI_REPO || (github.repository_owner == 'silogen' && 'oci://registry-1.docker.io/silogenai' || 'oci://registry-1.docker.io/amdenterpriseai') }}
+      CHART_NAME: aim-engine-chart
 
     steps:
       - name: Checkout main
@@ -53,8 +62,12 @@ jobs:
           echo "image_tag=${IMAGE_TAG}" >> "$GITHUB_OUTPUT"
           echo "chart_version=${CHART_VERSION}" >> "$GITHUB_OUTPUT"
 
-      - name: Log in to GHCR
-        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u $GITHUB_ACTOR --password-stdin
+      - name: Log in to DockerHub
+        uses: docker/login-action@v3
+        with:
+          registry: docker.io
+          username: ${{ secrets.DOCKER_HUB_PUSH_USER }}
+          password: ${{ secrets.DOCKER_HUB_PUSH }}
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -65,28 +78,51 @@ jobs:
           context: images/artifact-downloader
           push: true
           tags: |
-            ghcr.io/${{ github.repository_owner }}/aim-artifact-downloader:${{ env.IMAGE_TAG }}
-            ghcr.io/${{ github.repository_owner }}/aim-artifact-downloader:publish-main
+            docker.io/silogenai/aim-artifact-downloader:${{ env.IMAGE_TAG }}
+            docker.io/silogenai/aim-artifact-downloader:publish-main
           cache-from: type=gha,scope=artifact-downloader
           cache-to: type=gha,scope=artifact-downloader,mode=max
 
+      - name: Build and push aim-dummy image
+        uses: docker/build-push-action@v6
+        with:
+          context: images/aim-dummy
+          push: true
+          tags: |
+            docker.io/silogenai/aim-dummy:${{ env.IMAGE_TAG }}
+            docker.io/silogenai/aim-dummy:publish-main
+          cache-from: type=gha,scope=aim-dummy
+          cache-to: type=gha,scope=aim-dummy,mode=max
+
+      - name: Log in to DockerHub (controller image)
+        run: echo "${{ secrets.DOCKER_HUB_PUSH }}" | docker login docker.io -u "${{ secrets.DOCKER_HUB_PUSH_USER }}" --password-stdin
+
       - name: Build and push Docker image
         run: |
-          make docker-build IMG=${PUSH_IMAGE_REPO}:${IMAGE_TAG} TAG=${IMAGE_TAG}
+          # Override ARTIFACT_DOWNLOADER_IMG so the publish-main operator binary
+          # spawns artifact-downloader pods from the same silogenai tag we just
+          # pushed above, not the public amdenterpriseai default in Dockerfile.
+          make docker-build \
+            IMG=${PUSH_IMAGE_REPO}:${IMAGE_TAG} \
+            TAG=${IMAGE_TAG} \
+            ARTIFACT_DOWNLOADER_IMG=docker.io/silogenai/aim-artifact-downloader:${IMAGE_TAG}
           make docker-push IMG=${PUSH_IMAGE_REPO}:${IMAGE_TAG}
           docker tag ${PUSH_IMAGE_REPO}:${IMAGE_TAG} ${PUSH_IMAGE_REPO}:publish-main
           docker push ${PUSH_IMAGE_REPO}:publish-main
 
-      - name: Update Helm values with image repository, tag, and pull secret
+      - name: Resolve chart image repo
+        run: echo "CHART_IMAGE_REPO=${PULL_IMAGE_REPO:-$PUSH_IMAGE_REPO}" >> "$GITHUB_ENV"
+
+      - name: Inject manager imagePullSecrets into Helm values
         run: |
-          CHART_IMAGE_REPO="${PULL_IMAGE_REPO:-$PUSH_IMAGE_REPO}" \
-          IMAGE_TAG="${IMAGE_TAG}" \
+          # Only the manager image lives in the private silogenai DockerHub
+          # registry; acceleratorDetector images are publicly pullable and
+          # don't need a pull secret. Silogen-managed clusters carry a
+          # `dockerhub-regcred` secret in the install namespace, so baking
+          # it as the manager default makes the snapshot install with no
+          # extra setup.
           yq -i '
-            .manager.image.repository = strenv(CHART_IMAGE_REPO) |
-            .manager.image.tag = strenv(IMAGE_TAG) |
-            .manager.imagePullSecrets = [{"name": "regcred"}] |
-            .acceleratorDetector.gpu.imagePullSecrets = [{"name": "regcred"}] |
-            .acceleratorDetector.cpu.imagePullSecrets = [{"name": "regcred"}]
+            .manager.imagePullSecrets = [{"name": "dockerhub-regcred"}]
           ' config/helm/values.yaml
 
       - name: Generate CRDs
@@ -94,7 +130,11 @@ jobs:
 
       - name: Package Helm chart
         run: |
-          make helm-package TAG=${IMAGE_TAG} CHART_VERSION=${CHART_VERSION}
+          make helm-package \
+            CHART_VERSION=${CHART_VERSION} \
+            CHART_IMAGE_REPO=${CHART_IMAGE_REPO} \
+            CHART_IMAGE_TAG=${IMAGE_TAG} \
+            TAG=${IMAGE_TAG}
 
       - name: Validate chart with helm template
         run: helm template aim-engine ./dist/chart > /dev/null
@@ -102,12 +142,12 @@ jobs:
       - name: Lint Helm chart
         run: helm lint ./dist/chart
 
-      - name: Log in to GHCR (Helm/OCI)
-        run: echo "${{ secrets.GITHUB_TOKEN }}" | helm registry login ghcr.io -u $GITHUB_ACTOR --password-stdin
+      - name: Log in to DockerHub (Helm/OCI)
+        run: echo "${{ secrets.DOCKER_HUB_PUSH }}" | helm registry login registry-1.docker.io -u "${{ secrets.DOCKER_HUB_PUSH_USER }}" --password-stdin
 
       - name: Push Helm chart to OCI registry
         run: |
-          make helm-push-oci CHART_VERSION=${CHART_VERSION} CHART_OCI_OWNER=${{ github.repository_owner }}
+          make helm-push-oci CHART_VERSION=${CHART_VERSION} CHART_OCI_REPO=${CHART_OCI_REPO}
 
       - name: Create or update publish-main branch
         run: |
@@ -138,6 +178,30 @@ jobs:
 
           ## Installation
 
+          ### Prerequisite: image pull secret
+
+          The operator image is hosted on a private DockerHub registry. The
+          packaged chart's `values.yaml` defaults `manager.imagePullSecrets`
+          to a secret named `dockerhub-regcred`. Provision it in the install
+          namespace before installing the operator (skip if the secret is
+          already present):
+
+          ```bash
+          kubectl create namespace aim-system --dry-run=client -o yaml | kubectl apply -f -
+          kubectl create secret docker-registry dockerhub-regcred \
+            --namespace aim-system \
+            --docker-server=https://index.docker.io/v1/ \
+            --docker-username=<your-dockerhub-username> \
+            --docker-password=<your-dockerhub-token>
+          ```
+
+          To use a different secret name, override at install time with
+          `--set manager.imagePullSecrets[0].name=...`.
+
+          The private `aim-artifact-downloader` image is pulled by download Jobs
+          in your workload namespace, which requires node-level (containerd)
+          registry credentials configured on each node.
+
           CRDs are distributed separately and must be installed first:
 
           ```bash
@@ -146,13 +210,21 @@ jobs:
           kubectl wait --for=condition=Established crd --all --timeout=60s
 
           # 2a. Install operator via Helm OCI (recommended)
-          helm install aim-engine oci://ghcr.io/${{ github.repository_owner }}/charts/aim-engine \
+          helm install aim-engine ${{ env.CHART_OCI_REPO }}/${{ env.CHART_NAME }} \
             --version ${{ steps.ver.outputs.chart_version }} \
             --namespace aim-system --create-namespace
 
           # 2b. Or install from this branch
           helm install aim-engine ./chart --namespace aim-system --create-namespace
           ```
+
+          Scale-from-zero: the chart ships the cluster-wide gateway-metrics
+          collector by default (`scaleFromZero.gatewayMetricsCollector.enable=true`),
+          required for any AIMService with `spec.minReplicas: 0`. It needs the
+          OpenTelemetry Operator on the cluster. To manage it yourself instead,
+          install with `--set scaleFromZero.gatewayMetricsCollector.enable=false`
+          and apply `config/prereqs/scale-from-zero/kgateway-metrics-collector.yaml`
+          (see its README for customization knobs).
 
           Or clone this branch:
 

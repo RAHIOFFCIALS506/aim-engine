@@ -23,6 +23,7 @@
 package aimservice
 
 import (
+	"reflect"
 	"strings"
 	"testing"
 
@@ -91,6 +92,36 @@ func TestGenerateInferenceServiceName_Deterministic(t *testing.T) {
 
 	if result1 != result2 {
 		t.Errorf("expected deterministic output, got %q and %q", result1, result2)
+	}
+}
+
+// Long namespaces leave only a few chars for the visible serviceName prefix, so
+// the hash suffix has to carry the uniqueness. Two services in the same namespace
+// must still produce distinct names.
+func TestGenerateInferenceServiceName_NoCollisionInLongNamespace(t *testing.T) {
+	namespace := "qa-another-long-project-name-that-is-max" // 40 chars
+	result1, err1 := GenerateInferenceServiceName("wb-aim-c4b421e5", namespace)
+	result2, err2 := GenerateInferenceServiceName("wb-aim-7adf99e9", namespace)
+
+	if err1 != nil || err2 != nil {
+		t.Fatalf("unexpected errors: %v, %v", err1, err2)
+	}
+	if result1 == result2 {
+		t.Errorf("expected distinct InferenceService names for different AIMServices "+
+			"in the same namespace, both got %q", result1)
+	}
+}
+
+// Same serviceName in different namespaces must still yield different names.
+func TestGenerateInferenceServiceName_DistinctNamespaces(t *testing.T) {
+	result1, err1 := GenerateInferenceServiceName("svc", "ns-one")
+	result2, err2 := GenerateInferenceServiceName("svc", "ns-two")
+
+	if err1 != nil || err2 != nil {
+		t.Fatalf("unexpected errors: %v, %v", err1, err2)
+	}
+	if result1 == result2 {
+		t.Errorf("expected distinct InferenceService names across namespaces, both got %q", result1)
 	}
 }
 
@@ -436,6 +467,22 @@ func TestPlanInferenceService_UpdatesReplicasWhenISVCExists(t *testing.T) {
 			maxReplicas: nil,
 			expectMin:   3,
 			expectMax:   3,
+		},
+		{
+			// Scale-to-zero: max must clamp to 1 when omitted (else the
+			// service is pinned at 0 forever).
+			name:        "scale to zero, max defaults to 1",
+			minReplicas: ptr.To(int32(0)),
+			maxReplicas: nil,
+			expectMin:   0,
+			expectMax:   1,
+		},
+		{
+			name:        "scale to zero with explicit max",
+			minReplicas: ptr.To(int32(0)),
+			maxReplicas: ptr.To(int32(5)),
+			expectMin:   0,
+			expectMax:   5,
 		},
 	}
 
@@ -1235,6 +1282,129 @@ func TestBuildMergedEnvVars_AimIdAndModelIdAreMutuallyExclusive(t *testing.T) {
 	}
 }
 
+// TestResolvedModelId verifies the model-id identity follows the runtime
+// resolution chain `profile.model_id or config.model_id or config.aim_id`:
+// ModelId wins, then modelSources[0].modelId, then aimId. This is what the
+// runtime writes into vLLM's --served-model-name and exposes at /v1/models.
+func TestResolvedModelId(t *testing.T) {
+	engineArgs := &apiextensionsv1.JSON{Raw: []byte(`{"tensor-parallel-size":1}`)}
+	customProfile := &aimv1alpha1.AIMCustomProfile{EngineArgs: engineArgs}
+
+	tests := []struct {
+		name         string
+		templateSpec *aimv1alpha1.AIMServiceTemplateSpecCommon
+		want         string
+	}{
+		{
+			name:         "nil template",
+			templateSpec: nil,
+			want:         "",
+		},
+		{
+			name: "ModelId wins over modelSources and aimId (custom profile)",
+			templateSpec: &aimv1alpha1.AIMServiceTemplateSpecCommon{
+				AimId:         "meta-llama/Llama-3.2-1B-Instruct",
+				ModelId:       "acme/my-finetune-v1",
+				CustomProfile: customProfile,
+				ModelSources: []aimv1alpha1.AIMModelSource{
+					{ModelID: "ignored/weights-id", SourceURI: "pvc://weights"},
+				},
+			},
+			want: "acme/my-finetune-v1",
+		},
+		{
+			name: "ModelId empty: falls back to modelSources[0].modelId",
+			templateSpec: &aimv1alpha1.AIMServiceTemplateSpecCommon{
+				AimId: "qwen/qwen3-32b",
+				ModelSources: []aimv1alpha1.AIMModelSource{
+					{ModelID: "qwen/qwen3-32b-fp8", SourceURI: "s3://weights"},
+				},
+			},
+			want: "qwen/qwen3-32b-fp8",
+		},
+		{
+			name: "ModelId and modelSources empty: falls back to aimId",
+			templateSpec: &aimv1alpha1.AIMServiceTemplateSpecCommon{
+				AimId:     "qwen/qwen3-32b",
+				ProfileId: "vllm-mi300x-fp16-tp1-latency",
+			},
+			want: "qwen/qwen3-32b",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := resolvedModelId(tt.templateSpec); got != tt.want {
+				t.Errorf("resolvedModelId() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestBuildInferenceService_AnnotationPropagation verifies that cluster-auth
+// annotations on the AIMService are propagated to the InferenceService, that
+// unrelated annotations (including our own control annotations) are dropped,
+// and that the controller-owned model-id annotation is stamped from the
+// resolved template rather than any user-supplied value.
+func TestBuildInferenceService_AnnotationPropagation(t *testing.T) {
+	ctx := testContext()
+
+	service := NewService("svc").WithModelImage("test-image:v1").Build()
+	service.Annotations = map[string]string{
+		"cluster-auth/allowed-group":            "ce0c754f-bb1b-63bb-5134-5501142effe7",
+		"aim.eai.amd.com/model-id":              "user-tried-to-override",
+		"aim.eai.amd.com/reconciliation-paused": "true",
+		"example.com/foreign":                   "drop-me",
+	}
+
+	templateSpec := &aimv1alpha1.AIMServiceTemplateSpecCommon{
+		ModelName: testModelName,
+		ModelSources: []aimv1alpha1.AIMModelSource{
+			{ModelID: "qwen/qwen3-32b-fp8", SourceURI: "s3://weights"},
+		},
+	}
+	templateStatus := &aimv1alpha1.AIMServiceTemplateStatus{Status: constants.AIMStatusReady}
+
+	obs := ServiceObservation{
+		ServiceFetchResult: ServiceFetchResult{
+			service: service,
+			modelResult: ModelFetchResult{
+				Model: controllerutils.FetchResult[*aimv1alpha1.AIMModel]{
+					Value: NewModel("m").WithImage("test-image:v1").WithStatus(constants.AIMStatusReady).Build(),
+				},
+			},
+			templateCache: controllerutils.FetchResult[*aimv1alpha1.AIMTemplateCache]{
+				Value: &aimv1alpha1.AIMTemplateCache{
+					Status: aimv1alpha1.AIMTemplateCacheStatus{Status: constants.AIMStatusReady},
+				},
+			},
+		},
+	}
+
+	result := planInferenceService(ctx, service, "test-template", templateSpec, templateStatus, obs)
+	if result == nil {
+		t.Fatal("expected InferenceService to be planned, got nil")
+	}
+	isvc, ok := result.(*servingv1beta1.InferenceService)
+	if !ok {
+		t.Fatalf("expected *InferenceService, got %T", result)
+	}
+
+	ann := isvc.Annotations
+	if got := ann["cluster-auth/allowed-group"]; got != "ce0c754f-bb1b-63bb-5134-5501142effe7" {
+		t.Errorf("expected cluster-auth annotation propagated, got %q", got)
+	}
+	if _, ok := ann["example.com/foreign"]; ok {
+		t.Error("foreign annotation example.com/foreign must not be propagated")
+	}
+	if _, ok := ann["aim.eai.amd.com/reconciliation-paused"]; ok {
+		t.Error("control annotation aim.eai.amd.com/reconciliation-paused must not be propagated")
+	}
+	if got := ann[constants.AnnotationModelId]; got != "qwen/qwen3-32b-fp8" {
+		t.Errorf("model-id annotation = %q, want controller-owned %q (must not be overridable from service spec)", got, "qwen/qwen3-32b-fp8")
+	}
+}
+
 func assertEnvMatches(t *testing.T, counts map[string]int, values map[string]string, name string, want *string) {
 	t.Helper()
 	if want == nil {
@@ -1282,5 +1452,139 @@ func TestBuildMergedEnvVars_ClusterTemplateEnv(t *testing.T) {
 		t.Error("missing env var SHARED_VAR")
 	} else if val != "from-cluster-template" {
 		t.Errorf("expected SHARED_VAR='from-cluster-template', got '%s'", val)
+	}
+}
+
+// TestConfigureReplicasAndAutoscaling_AutoscalerClass verifies the ISVC
+// carries autoscalerClass=external when autoscaling is requested and
+// autoscalerClass=none on the legacy fixed-replica path.
+func TestConfigureReplicasAndAutoscaling_AutoscalerClass(t *testing.T) {
+	tests := []struct {
+		name        string
+		minReplicas *int32
+		maxReplicas *int32
+		autoScaling *aimv1alpha1.AIMServiceAutoScaling
+		replicas    *int32
+		expectClass string
+	}{
+		{
+			name:        "scale-to-zero service",
+			minReplicas: ptr.To(int32(0)),
+			maxReplicas: ptr.To(int32(3)),
+			expectClass: constants.AutoscalerClassExternal,
+		},
+		{
+			name:        "warm autoscaling service",
+			minReplicas: ptr.To(int32(1)),
+			maxReplicas: ptr.To(int32(4)),
+			autoScaling: &aimv1alpha1.AIMServiceAutoScaling{
+				Metrics: []aimv1alpha1.AIMServiceMetricsSpec{{Type: "PodMetric"}},
+			},
+			expectClass: constants.AutoscalerClassExternal,
+		},
+		{
+			name:        "legacy fixed-replica path stays on autoscalerClass=none",
+			replicas:    ptr.To(int32(2)),
+			expectClass: constants.AutoscalerClassNone,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			service := NewService("svc").Build()
+			service.Spec.MinReplicas = tt.minReplicas
+			service.Spec.MaxReplicas = tt.maxReplicas
+			service.Spec.AutoScaling = tt.autoScaling
+			service.Spec.Replicas = tt.replicas
+
+			isvc := &servingv1beta1.InferenceService{
+				ObjectMeta: metav1.ObjectMeta{Name: "isvc", Namespace: testNamespace},
+			}
+			configureReplicasAndAutoscaling(isvc, service)
+
+			if got := isvc.Annotations[constants.AnnotationKServeAutoscalerClass]; got != tt.expectClass {
+				t.Errorf("autoscalerClass: expected %q, got %q", tt.expectClass, got)
+			}
+		})
+	}
+}
+
+// TestConfigureReplicasAndAutoscaling_ForwardsUserMetricsForOTelCollector
+// verifies user metrics are written into isvc.Spec.Predictor.AutoScaling.Metrics
+// so KServe's RawKubeReconciler creates the OpenTelemetryCollector CR that
+// feeds in-pod sidecar injection. The gateway-rate metric must NOT appear
+// here -- that trigger belongs solely on the controller-owned ScaledObject.
+func TestConfigureReplicasAndAutoscaling_ForwardsUserMetricsForOTelCollector(t *testing.T) {
+	service := NewService("svc").Build()
+	service.Spec.MinReplicas = ptr.To(int32(0))
+	service.Spec.MaxReplicas = ptr.To(int32(3))
+	service.Spec.AutoScaling = &aimv1alpha1.AIMServiceAutoScaling{
+		Metrics: []aimv1alpha1.AIMServiceMetricsSpec{
+			{
+				Type: "PodMetric",
+				PodMetric: &aimv1alpha1.AIMServicePodMetricSource{
+					Metric: &aimv1alpha1.AIMServicePodMetric{
+						Backend:           "opentelemetry",
+						MetricNames:       []string{"vllm:num_requests_running"},
+						Query:             "vllm:num_requests_running",
+						OperationOverTime: "avg",
+					},
+					Target: &aimv1alpha1.AIMServiceMetricTarget{
+						Type:  "Value",
+						Value: "1",
+					},
+				},
+			},
+		},
+	}
+
+	isvc := &servingv1beta1.InferenceService{
+		ObjectMeta: metav1.ObjectMeta{Name: "isvc", Namespace: testNamespace},
+	}
+	configureReplicasAndAutoscaling(isvc, service)
+
+	if isvc.Spec.Predictor.AutoScaling == nil {
+		t.Fatal("isvc.Spec.Predictor.AutoScaling must be populated; got nil")
+	}
+	if len(isvc.Spec.Predictor.AutoScaling.Metrics) != 1 {
+		t.Fatalf("expected 1 forwarded user metric, got %d", len(isvc.Spec.Predictor.AutoScaling.Metrics))
+	}
+
+	got := isvc.Spec.Predictor.AutoScaling.Metrics[0]
+	if got.PodMetric == nil {
+		t.Fatalf("forwarded metric must be a PodMetric; got %+v", got)
+	}
+	if string(got.PodMetric.Metric.Backend) != "opentelemetry" {
+		t.Errorf("forwarded metric backend must be 'opentelemetry'; got %q", got.PodMetric.Metric.Backend)
+	}
+	if !reflect.DeepEqual(got.PodMetric.Metric.MetricNames, []string{"vllm:num_requests_running"}) {
+		t.Errorf("forwarded metric names mismatch; got %v", got.PodMetric.Metric.MetricNames)
+	}
+
+	for _, m := range isvc.Spec.Predictor.AutoScaling.Metrics {
+		if m.PodMetric != nil && strings.Contains(m.PodMetric.Metric.Query, "envoy_cluster_external_upstream_rq_completed") {
+			t.Fatalf("controller must not inject the gateway-rate metric into the ISVC AutoScaling spec; got: %+v", m)
+		}
+	}
+}
+
+// TestConfigureReplicasAndAutoscaling_SidecarAnnotations verifies the OTel
+// sidecar and Prometheus port annotations are applied to autoscaled services.
+func TestConfigureReplicasAndAutoscaling_SidecarAnnotations(t *testing.T) {
+	service := NewService("qwen").Build()
+	service.Spec.MinReplicas = ptr.To(int32(0))
+	service.Spec.MaxReplicas = ptr.To(int32(3))
+
+	isvc := &servingv1beta1.InferenceService{
+		ObjectMeta: metav1.ObjectMeta{Name: "qwen", Namespace: testNamespace},
+	}
+	configureReplicasAndAutoscaling(isvc, service)
+
+	want := "qwen" + constants.PredictorServiceSuffix
+	if got := isvc.Annotations[constants.AnnotationOTelSidecarInject]; got != want {
+		t.Errorf("expected sidecar inject annotation %q; got %q", want, got)
+	}
+	if got := isvc.Annotations[constants.AnnotationPrometheusPort]; got != constants.DefaultPrometheusPort {
+		t.Errorf("expected Prometheus port annotation %q; got %q", constants.DefaultPrometheusPort, got)
 	}
 }

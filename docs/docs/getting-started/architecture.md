@@ -1,161 +1,117 @@
 # Architecture
 
-AIM Engine is a Kubernetes operator that orchestrates the full lifecycle of AI inference workloads. It bridges the gap between model artifacts and production-ready inference endpoints by coordinating several Kubernetes-native components.
+AIM Engine is a Kubernetes operator that orchestrates the full lifecycle of AI inference workloads on AMD GPUs. It bridges the gap between model artifacts and production-ready inference endpoints by coordinating several Kubernetes-native components.
 
-## High-Level Architecture
+## High-level architecture
 
-```mermaid
-graph TB
-    subgraph User["User Resources"]
-        AIMService["AIMService"]
-        AIMModel["AIMModel /<br/>AIMClusterModel"]
-        ModelSource["AIMClusterModelSource"]
-        RuntimeConfig["AIMRuntimeConfig /<br/>AIMClusterRuntimeConfig"]
-    end
+AIM Engine has two cooperating flows that meet at the `AIMProfile`: **onboarding** turns models into deployable profiles, and **serving** turns a profile into a running endpoint. Throughout these diagrams, colour denotes the kind of resource — blue for user-applied, red for operator controllers, green for operator-managed, grey for infrastructure.
 
-    subgraph Operator["AIM Engine Operator"]
-        direction TB
-        Reconciler["Reconciliation Engine"]
-        Selection["Template Selection"]
-        CacheCtrl["Cache Controller"]
-        ModelCtrl["Model Controller"]
-    end
+### Onboarding: from models to profiles
 
-    subgraph Managed["Managed Resources"]
-        Profile["AIMProfile /<br/>AIMClusterProfile"]
-        Template["AIMServiceTemplate /<br/>AIMClusterServiceTemplate<br/><small>(deprecated)</small>"]
-        TemplateCache["AIMTemplateCache"]
-        Artifact["AIMArtifact"]
-        ISVC["KServe<br/>InferenceService"]
-        HTTPRoute["Gateway API<br/>HTTPRoute"]
-    end
+Official models (via discovery), profile sets (via derivation), and hand-authored profiles all converge on a deployable `AIMProfile`.
 
-    subgraph Infra["Infrastructure"]
-        KServe["KServe"]
-        GatewayAPI["Gateway API"]
-        PVC["Persistent Volumes"]
-        GPU["AMD GPUs"]
-    end
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="../assets/diagrams/model-onboarding-dark.svg">
+  <img alt="Model onboarding flow: AIMClusterModelSource discovers AIMModels; the Model controller runs image discovery and derivation; profile sets and hand-authored profiles also resolve to deployable AIMProfiles." src="../assets/diagrams/model-onboarding.svg">
+</picture>
 
-    AIMService --> Reconciler
-    AIMModel --> ModelCtrl
-    ModelSource -->|discovers| AIMModel
-    RuntimeConfig --> Reconciler
+### Serving: from profile to endpoint
 
-    ModelCtrl --> Profile
-    Reconciler --> Selection
-    Selection --> Profile
-    Selection --> Template
-    Reconciler --> CacheCtrl
-    CacheCtrl --> TemplateCache
-    TemplateCache --> Artifact
-    Artifact --> PVC
+An `AIMService` resolves one of those profiles, and the Service controller creates the cache, InferenceService, and route that back a running endpoint.
 
-    Reconciler --> ISVC
-    Reconciler --> HTTPRoute
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="../assets/diagrams/service-deployment-dark.svg">
+  <img alt="Service deployment flow: AIMService drives the Service controller, which resolves an AIMProfile, warms a cache to a PVC via AIMProfileCache and AIMArtifact, and creates a KServe InferenceService and Gateway API HTTPRoute." src="../assets/diagrams/service-deployment.svg">
+</picture>
 
-    ISVC --> KServe
-    HTTPRoute --> GatewayAPI
-    KServe --> GPU
-```
+## CRDs and their roles
 
-## Resource Relationships
+v1alpha2 is the current API. v1alpha1 resources remain supported during the deprecation window — see [Legacy v1alpha1](../legacy/index.md).
 
-The diagram below shows how AIM resources relate to each other during a typical service deployment:
+| CRD | Scope | Role |
+|---|---|---|
+| `AIMService` | Namespace | Deploys an inference endpoint by resolving a profile and creating a KServe InferenceService. |
+| `AIMModel` / `AIMClusterModel` | Namespace / Cluster | Onboards a model — three flows (official, fine-tuned, custom). Produces profiles. |
+| `AIMProfile` / `AIMClusterProfile` | Namespace / Cluster | Self-contained runtime configuration (image, accelerator, engine args, model sources). The unit a service resolves to. |
+| `AIMProfileSet` / `AIMClusterProfileSet` | Namespace / Cluster | Derives profiles by selector + overrides. Usually synthesised by `AIMModel.spec.profiles`, also usable standalone. |
+| `AIMProfileCache` | Namespace | Pre-warms a profile's `modelSources` to a PVC for fast service start. |
+| `AIMArtifact` | Namespace | Manages a single model artifact download to a PVC. |
+| `AIMClusterModelSource` | Cluster | Auto-discovers AIM models from a container registry. |
+| `AIMRuntimeConfig` / `AIMClusterRuntimeConfig` | Namespace / Cluster | Storage defaults, routing defaults, environment defaults. |
 
-```mermaid
-flowchart LR
-    subgraph input["Input"]
-        Service["AIMService"]
-    end
+## Three model flows
 
-    subgraph resolution["Resolution"]
-        Model["AIMModel"]
-        Template["AIMServiceTemplate"]
-        RC["AIMRuntimeConfig"]
-    end
+Every `AIMModel` resolves to one of three flows, selected by which spec field is set. The full mechanics live in [AIM Models](../concepts/models.md):
 
-    subgraph output["Output"]
-        ISVC["InferenceService"]
-        Route["HTTPRoute"]
-        Cache["AIMTemplateCache"]
-    end
+| Flow | Spec | Source of profiles |
+|---|---|---|
+| **Official** | `spec.image` (AIM image) | Image discovery — profile YAMLs inside the container |
+| **Fine-tuned** | `spec.profiles.derivedFrom` (selecting deployable profiles) | A previously-applied official AIMModel |
+| **Custom** | `spec.profiles.derivedFrom` (selecting base-image base profiles) | A previously-applied base-image AIMModel |
 
-    Service -->|resolves| Model
-    Service -->|selects| Template
-    Service -->|reads| RC
-    Service -->|creates| ISVC
-    Service -->|creates| Route
-    Service -->|triggers| Cache
-```
+CRD validation enforces "exactly one of `spec.image` or `spec.profiles`" — neither can be set, both cannot be set.
 
-## Component Overview
+## Service resolution
 
-| Component | API Version | Purpose | Scope |
-|-----------|-------------|---------|-------|
-| **AIMService** | v1alpha1 | Primary resource for deploying inference endpoints | Namespace |
-| **AIMModel** / **AIMClusterModel** | v1alpha1 | Maps model names to container images | Namespace / Cluster |
-| **AIMProfile** / **AIMClusterProfile** | v1alpha2 | Self-contained runtime configurations (accelerator, resources, engine config, image) | Namespace / Cluster |
-| **AIMServiceTemplate** / **AIMClusterServiceTemplate** | v1alpha1 | Runtime profiles (deprecated — use Profiles) | Namespace / Cluster |
-| **AIMRuntimeConfig** / **AIMClusterRuntimeConfig** | v1alpha1 | Provides storage defaults, routing, and environment variables | Namespace / Cluster |
-| **AIMClusterModelSource** | v1alpha1 | Discovers models automatically from container registries | Cluster |
-| **AIMArtifact** | v1alpha1 | Manages model artifact downloads to persistent volumes | Namespace |
+When you apply an `AIMService`, the controller reaches a single `AIMProfile` through one of five resolution shapes:
 
-## Cluster vs Namespace Scoping
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="../assets/diagrams/service-resolution-dark.svg">
+  <img alt="AIMService resolution shapes converging on a single resolved AIMProfile, then an optional overlay before deployment." src="../assets/diagrams/service-resolution.svg">
+</picture>
 
-Several CRDs have both a namespace-scoped and a cluster-scoped variant:
+The image shape requires the `aim.eai.amd.com/reconciler-pipeline: profile` annotation during the migration window — see [Migration window](../admin/upgrading.md#migration-window). See [Services](../concepts/services.md#resolution-shapes) for the canonical resolution table and mechanics.
 
-| Namespace-Scoped | Cluster-Scoped | Purpose |
-|-----------------|----------------|---------|
+## Cluster vs namespace scope
+
+Several CRDs have both a namespace-scoped and a cluster-scoped variant.
+
+| Namespace | Cluster | Purpose |
+|---|---|---|
 | `AIMModel` | `AIMClusterModel` | Model definitions |
-| `AIMProfile` | `AIMClusterProfile` | Self-contained runtime configurations (v1alpha2) |
-| `AIMServiceTemplate` | `AIMClusterServiceTemplate` | Runtime profiles (v1alpha1, deprecated) |
-| `AIMRuntimeConfig` | `AIMClusterRuntimeConfig` | Storage, routing, and environment defaults |
+| `AIMProfile` | `AIMClusterProfile` | Runtime configurations |
+| `AIMProfileSet` | `AIMClusterProfileSet` | Profile derivation |
+| `AIMRuntimeConfig` | `AIMClusterRuntimeConfig` | Storage, routing, environment defaults |
 
-**Cluster-scoped** resources are shared across all namespaces. A cluster admin creates them to provide platform-wide defaults: a model catalog, validated runtime profiles, and shared configuration.
+**Cluster-scoped** resources are shared across all namespaces. Platform admins create them to provide a model catalog and validated runtime profiles.
 
-**Namespace-scoped** resources are visible only within their namespace. Teams create them for custom models, per-project overrides, or private configurations.
+**Namespace-scoped** resources are visible only within their namespace. Teams create them for custom models or per-project overrides.
 
-### Resolution Order
+### Resolution order
 
-When an AIMService needs a model, template, or config, AIM Engine resolves the reference in this order:
+When an AIMService needs a model or profile, AIM Engine resolves it in this order:
 
-1. **Namespace** — look for the resource in the service's namespace
-2. **Cluster** — if not found, fall back to the cluster-scoped variant
+1. **Namespace** — look for the resource in the service's namespace.
+2. **Cluster** — fall back to the cluster-scoped variant.
 
-Namespace always wins. This lets teams override any cluster default by creating a namespace resource with the same name.
+Namespace wins. The resolved scope is recorded in `status.resolvedModel.scope` and `status.resolvedProfile.scope`.
 
-**RuntimeConfig** is special: if both namespace and cluster configs exist, they are **merged** rather than one replacing the other. Namespace values override cluster values for any fields that are set in both.
+**RuntimeConfig** is special: if both namespace and cluster configs exist, they're **merged** rather than one replacing the other. Namespace values override cluster values for any fields set in both.
 
-The resolution scope (`Namespace`, `Cluster`, or `Merged`) is recorded in the AIMService status so you can see which scope was used:
+## Reconciliation pipeline
 
-```bash
-kubectl get aimservice <name> -o jsonpath='{.status.resolvedModel.scope}'
-```
+Every AIM controller follows the same pipeline:
 
-## Reconciliation Flow
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="../assets/diagrams/reconcile-pipeline-dark.svg">
+  <img alt="The shared reconciliation pipeline: Fetch, Compose, Plan, Apply, Status." src="../assets/diagrams/reconcile-pipeline.svg">
+</picture>
 
-When an `AIMService` is created or updated, the operator follows this pipeline:
+Each step is idempotent: the operator converges toward the desired state on every reconciliation, handling partial failures and eventual consistency gracefully.
 
-```mermaid
-flowchart LR
-    Fetch["Fetch<br/><small>Gather all referenced<br/>resources</small>"]
-    Compose["Compose<br/><small>Interpret state and<br/>check health</small>"]
-    Plan["Plan<br/><small>Decide what to<br/>create or update</small>"]
-    Apply["Apply<br/><small>Execute changes<br/>against the cluster</small>"]
-    Status["Status<br/><small>Update conditions<br/>and health</small>"]
+## Integration points
 
-    Fetch --> Compose --> Plan --> Apply --> Status
-```
+| Component | Role |
+|---|---|
+| **KServe** | Underlying model serving runtime. AIM Engine creates and manages `InferenceService` resources. |
+| **Gateway API** | HTTP routing. When routing is enabled, AIM Engine creates `HTTPRoute` resources attached to a configured Gateway. |
+| **Persistent Volumes** | Back the caching system. `AIMProfileCache` downloads model artifacts once to shared (or dedicated) PVCs. |
+| **AMD GPUs + NFD** | Detected via node labels (`feature.node.kubernetes.io/aim-accelerator.<model>`) written by the AcceleratorDetector DaemonSet. The profile selector filters candidates by node label availability. |
 
-Each step is designed to be idempotent: the operator converges toward the desired state on every reconciliation loop, handling partial failures and eventual consistency gracefully.
+## Where to read next
 
-## Integration Points
-
-**KServe** provides the underlying model serving runtime. AIM Engine creates and manages `InferenceService` resources, translating its high-level configuration into KServe-native specs.
-
-**Gateway API** handles HTTP routing. When routing is enabled, AIM Engine creates `HTTPRoute` resources that expose inference endpoints through a configured Gateway.
-
-**Persistent Volumes** back the caching system. Model artifacts are downloaded once to shared PVCs and reused across service replicas and restarts.
-
-**AMD GPUs** are detected via node labels. The template selection algorithm filters candidates based on available GPU hardware in the cluster.
+- [Quickstart](quickstart.md) — Deploy a service in minutes
+- [AIM Models](../concepts/models.md) — Three model flows in detail
+- [Services](../concepts/services.md) — Resolution shapes, overlays, caching
+- [Profiles](../concepts/profiles.md) — Self-contained runtime configurations
+- [AIM Profile Sets](../concepts/profilesets.md) — Derivation engine

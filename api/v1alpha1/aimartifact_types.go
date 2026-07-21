@@ -31,12 +31,44 @@ import (
 )
 
 // DefaultDownloadImage is the container image used for artifact downloads when
-// not overridden per-resource. Set at build time via ldflags to match the release tag.
-var DefaultDownloadImage = "ghcr.io/silogen/aim-artifact-downloader:latest"
+// not overridden per-resource. MUST be set at build time via ldflags to match
+// the release tag (see the Makefile's LDFLAGS or the Dockerfile).
+var DefaultDownloadImage = ""
 
 const (
 	// ArtifactSourceURIIndexKey is the field index key for AIMArtifact.Spec.SourceURI
 	ArtifactSourceURIIndexKey = ".spec.sourceUri"
+
+	// ArtifactParentIndexKey is the field index key for AIMArtifact.Spec.ParentArtifact.
+	// Used to enqueue adapter artifacts when their parent model artifact changes.
+	ArtifactParentIndexKey = ".spec.parentArtifact"
+)
+
+// AIMArtifactType discriminates a model artifact from a LoRA adapter artifact.
+// +kubebuilder:validation:Enum=model;adapter
+type AIMArtifactType string
+
+const (
+	// ArtifactTypeModel is a base model artifact backed by a cache PVC. This is the
+	// default and matches the behavior of artifacts created before adapters existed.
+	ArtifactTypeModel AIMArtifactType = "model"
+
+	// ArtifactTypeAdapter is a LoRA adapter definition. Adapter artifacts do not get
+	// their own cache PVC; their bytes are staged per-consuming-service into the
+	// parent model artifact's adapter disk.
+	ArtifactTypeAdapter AIMArtifactType = "adapter"
+)
+
+// Adapter-related condition reasons surfaced on AIMArtifact:type=adapter.
+const (
+	// ArtifactReasonParentNotFound indicates the referenced parentArtifact does not exist.
+	ArtifactReasonParentNotFound = "ParentArtifactNotFound"
+	// ArtifactReasonParentNotModel indicates the referenced parentArtifact is not type=model.
+	ArtifactReasonParentNotModel = "ParentArtifactNotModel"
+	// ArtifactReasonParentLacksAdapterDisk indicates the parent model artifact has no adapterDisk.
+	ArtifactReasonParentLacksAdapterDisk = "ParentLacksAdapterDisk"
+	// ArtifactReasonAdapterValidated indicates an adapter's source and lineage are validated.
+	ArtifactReasonAdapterValidated = "AdapterValidated"
 )
 
 const (
@@ -48,6 +80,11 @@ const (
 	ArtifactReasonDownloadComplete = "DownloadComplete"
 	ArtifactReasonVerifying        = "Verifying"
 	ArtifactReasonVerified         = "Verified"
+
+	// ArtifactReasonFilesystemStalled indicates the progress monitor could not
+	// measure download progress because the cache filesystem stopped responding.
+	// Surfaced as Degraded (non-terminal) so it bubbles up to consumers.
+	ArtifactReasonFilesystemStalled = "FilesystemStalled"
 )
 
 const (
@@ -87,8 +124,33 @@ const (
 	ArtifactModeShared AIMArtifactMode = "Shared"
 )
 
+// AIMAdapterDisk configures the shared, RWX adapter disk provisioned alongside a
+// model artifact. When present on a type=model artifact, the controller provisions
+// a second PersistentVolumeClaim (ReadWriteMany) owned by the model artifact and
+// shared by every AIMService that serves adapters on this base model.
+type AIMAdapterDisk struct {
+	// Size is the requested size of the adapter disk PVC.
+	// Defaults to 50Gi when unset (a cascade default may override it).
+	// +optional
+	Size resource.Quantity `json:"size,omitempty"`
+
+	// StorageClassName specifies the storage class for the adapter disk.
+	// When empty, the cluster default storage class is used.
+	// The access mode is fixed at ReadWriteMany by the controller.
+	// +optional
+	StorageClassName string `json:"storageClassName,omitempty"`
+}
+
 // AIMArtifactSpec defines the desired state of AIMArtifact
 type AIMArtifactSpec struct {
+	// Type discriminates a base model artifact (`model`) from a LoRA adapter
+	// definition (`adapter`). Defaults to `model`; immutable after creation.
+	// Adapter artifacts require parentArtifact and modelId, and do not get their
+	// own cache PVC.
+	// +optional
+	// +kubebuilder:default=model
+	Type AIMArtifactType `json:"type,omitempty"`
+
 	// SourceURI specifies the source location of the model to download.
 	// Supported protocols: hf:// (HuggingFace) and s3:// (S3-compatible storage).
 	// This field uniquely identifies the artifact and is immutable after creation.
@@ -97,6 +159,25 @@ type AIMArtifactSpec struct {
 	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="sourceUri is immutable"
 	// +kubebuilder:validation:Pattern=`^(hf|s3)://[^ \t\r\n]+$`
 	SourceURI string `json:"sourceUri"`
+
+	// ParentArtifact names the base model AIMArtifact (type=model) this adapter is
+	// compatible with. Required and only allowed when type=adapter; immutable.
+	// The adapter is owned by (cascade-deleted with) the parent. Compatibility is
+	// keyed on the parent's modelId.
+	// +optional
+	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="parentArtifact is immutable"
+	ParentArtifact string `json:"parentArtifact,omitempty"`
+
+	// Rank is the LoRA rank of the adapter. Optional; only meaningful when type=adapter.
+	// +optional
+	// +kubebuilder:validation:Minimum=1
+	Rank *int32 `json:"rank,omitempty"`
+
+	// AdapterDisk, when set on a type=model artifact, provisions a shared ReadWriteMany
+	// adapter disk owned by this model artifact and partitioned per consuming service.
+	// Only allowed when type=model.
+	// +optional
+	AdapterDisk *AIMAdapterDisk `json:"adapterDisk,omitempty"`
 
 	// ModelID is the canonical identifier in {org}/{name} format.
 	// Determines the cache download path: /workspace/cache/{modelId}
@@ -175,6 +256,11 @@ type DownloadProgress struct {
 	// This field is automatically populated from Progress.Percentage
 	// +optional
 	DisplayPercentage string `json:"displayPercentage,omitempty"`
+
+	// Message is an optional human-readable diagnostic from the progress monitor.
+	// Empty during normal progress; cleared once the download completes.
+	// +optional
+	Message string `json:"message,omitempty"`
 }
 
 // DownloadState represents the current download attempt state, updated by the downloader pod
@@ -256,6 +342,28 @@ type AIMArtifactStatus struct {
 	// When empty, spec.sourceUri is used directly.
 	// +optional
 	ResolvedSourceURI string `json:"resolvedSourceUri,omitempty"`
+
+	// AdapterPersistentVolumeClaim is the name of the shared adapter disk PVC
+	// provisioned for a type=model artifact that declares an adapterDisk. Empty
+	// otherwise.
+	// +optional
+	AdapterPersistentVolumeClaim string `json:"adapterPersistentVolumeClaim,omitempty"`
+
+	// AdapterPath is the resolved on-disk directory name for a type=adapter artifact,
+	// frozen at first resolution (defaults to metadata.name). This is the canonical
+	// copy, mirrored into consuming services' status.
+	// +optional
+	AdapterPath string `json:"adapterPath,omitempty"`
+
+	// ResolvedParent captures the resolved parent model artifact for a type=adapter
+	// artifact, including its UID.
+	// +optional
+	ResolvedParent *AIMResolvedReference `json:"resolvedParent,omitempty"`
+
+	// ParentModelID is the parent model artifact's modelId, denormalized onto the
+	// adapter for convenience (refreshed each reconcile).
+	// +optional
+	ParentModelID string `json:"parentModelId,omitempty"`
 }
 
 func (m *AIMArtifact) GetStatus() *AIMArtifactStatus {
@@ -285,6 +393,7 @@ func (s *AIMArtifactStatus) GetAIMStatus() constants.AIMStatus {
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
 // +kubebuilder:resource:shortName=aimart,categories=aim;all
+// +kubebuilder:printcolumn:name="Type",type=string,JSONPath=`.spec.type`,priority=1
 // +kubebuilder:printcolumn:name="Status",type=string,JSONPath=`.status.status`
 // +kubebuilder:printcolumn:name="Mode",type=string,JSONPath=`.status.mode`
 // +kubebuilder:printcolumn:name="Model Size",type=string,JSONPath=`.status.displaySize`
@@ -292,6 +401,12 @@ func (s *AIMArtifactStatus) GetAIMStatus() constants.AIMStatus {
 // +kubebuilder:printcolumn:name="Protocol",type=string,JSONPath=`.status.download.protocol`,priority=1
 // +kubebuilder:printcolumn:name="Attempt",type=string,JSONPath=`.status.download.attempt`,priority=1
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
+// +kubebuilder:validation:XValidation:rule="!has(self.spec.type) || !oldSelf.hasValue() || !has(oldSelf.value().spec.type) || self.spec.type == oldSelf.value().spec.type",message="spec.type is immutable",optionalOldSelf=true
+// +kubebuilder:validation:XValidation:rule="!has(self.spec.type) || self.spec.type != 'adapter' || has(self.spec.parentArtifact)",message="spec.parentArtifact is required when spec.type is adapter"
+// +kubebuilder:validation:XValidation:rule="!has(self.spec.type) || self.spec.type != 'adapter' || (has(self.spec.modelId) && size(self.spec.modelId) > 0)",message="spec.modelId is required when spec.type is adapter"
+// +kubebuilder:validation:XValidation:rule="!has(self.spec.parentArtifact) || (has(self.spec.type) && self.spec.type == 'adapter')",message="spec.parentArtifact is only allowed when spec.type is adapter"
+// +kubebuilder:validation:XValidation:rule="!has(self.spec.adapterDisk) || !has(self.spec.type) || self.spec.type == 'model'",message="spec.adapterDisk is only allowed when spec.type is model"
+// +kubebuilder:validation:XValidation:rule="!has(self.spec.rank) || (has(self.spec.type) && self.spec.type == 'adapter')",message="spec.rank is only allowed when spec.type is adapter"
 
 // AIMArtifact is the Schema for the artifacts API
 type AIMArtifact struct {

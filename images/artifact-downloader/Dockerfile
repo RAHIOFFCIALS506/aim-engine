@@ -4,11 +4,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     s3cmd kubectl \
     procps \
     && rm -rf /var/lib/apt/lists/* \
-    && pip install --no-cache-dir -U huggingface_hub==1.11.0 hf_transfer hf_xet
+    # huggingface_hub 1.11.0's `hf` CLI imports `click` directly
+    # (huggingface_hub/cli/_cli_utils.py), but its `typer` dependency no longer
+    # pulls in `click`, so it must be installed explicitly or the CLI crashes
+    # with `ModuleNotFoundError: No module named 'click'` on every invocation.
+    && pip install --no-cache-dir -U huggingface_hub==1.11.0 hf_transfer hf_xet click
 
 ENV PYTHONUNBUFFERED=1
 
 COPY entrypoint.sh /entrypoint.sh
+COPY adapter-stage.sh /adapter-stage.sh
+COPY adapter-reap.sh /adapter-reap.sh
+COPY adapter-subtree-sync.sh /adapter-subtree-sync.sh
 COPY progress-monitor.sh /progress-monitor.sh
 COPY check-size.sh /check-size.sh
 COPY hf-download.sh /hf-download.sh
@@ -18,7 +25,7 @@ COPY check-size/check-hf-size.py /check-size/check-hf-size.py
 COPY verify-files.py /verify-files.py
 COPY kserve-entrypoint.sh /storage-initializer/scripts/initializer-entrypoint
 
-RUN chmod +x /entrypoint.sh /check-size.sh /progress-monitor.sh /storage-initializer/scripts/initializer-entrypoint /hf-download.sh /hf-verify.sh
+RUN chmod +x /entrypoint.sh /adapter-stage.sh /adapter-reap.sh /adapter-subtree-sync.sh /check-size.sh /progress-monitor.sh /storage-initializer/scripts/initializer-entrypoint /hf-download.sh /hf-verify.sh
 
 
 RUN mkdir -p /cache/models && chown -R 1000:1000 /cache

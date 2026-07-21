@@ -138,6 +138,20 @@ func TestFilterTemplatesByVersion_Any(t *testing.T) {
 	}
 }
 
+func TestFilterTemplatesByVersion_All(t *testing.T) {
+	templates := []templateVersionAccessor{
+		{&aimv1alpha1.AIMServiceTemplate{Status: aimv1alpha1.AIMServiceTemplateStatus{Version: "0.8.5"}}},
+		{&aimv1alpha1.AIMServiceTemplate{Status: aimv1alpha1.AIMServiceTemplateStatus{Version: "0.9.0"}}},
+	}
+
+	// `all` is the canonical spelling; it must behave identically to the
+	// deprecated `any` alias and return every template.
+	result := FilterTemplatesByVersion(templates, aimv1alpha1.AIMVersionPolicyAll, "")
+	if len(result) != 2 {
+		t.Fatalf("expected all 2 templates for all policy, got %d", len(result))
+	}
+}
+
 func TestFilterTemplatesByVersion_Pinned_NoMatch(t *testing.T) {
 	templates := []templateVersionAccessor{
 		{&aimv1alpha1.AIMServiceTemplate{Status: aimv1alpha1.AIMServiceTemplateStatus{Version: "0.9.0"}}},
@@ -774,7 +788,7 @@ func TestBuildFineTunedServiceTemplates_InlineModelSourcesNoEngineConfig(t *test
 	model := &aimv1alpha1.AIMModel{
 		ObjectMeta: metav1.ObjectMeta{Name: "ft-dummy", Namespace: "default"},
 		Spec: aimv1alpha1.AIMModelSpec{
-			Image: "ghcr.io/silogen/aim-dummy:0.1.10",
+			Image: "aim-dummy:0.1.10",
 			AimId: "test/cluster-base-model",
 			ModelSources: []aimv1alpha1.AIMModelSource{
 				{ModelID: "test/model-fp8", SourceURI: "hf://my-org/cluster-finetuned-weights"},

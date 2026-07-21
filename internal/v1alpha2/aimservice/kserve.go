@@ -98,15 +98,22 @@ func buildInferenceServiceFromProfile(
 		labels[constants.LabelPrecision] = precisionVal
 	}
 
+	// Propagate auth annotations (cluster-auth/*) from the AIMService, then
+	// stamp the controller-owned model-id from the resolved profile.
+	annotations := utils.FilterAnnotationsByPrefix(service.Annotations, constants.AnnotationPrefixClusterAuth)
+	if modelId := resolvedModelId(profileSpec); modelId != "" {
+		annotations[constants.AnnotationModelId] = modelId
+	}
+
 	// Build environment variables. Order of precedence (last wins on conflict):
-	//   profileSpec.ContainerEnv (author defaults)
-	//     -> framework AIM_* vars (must not be overridable from the profile)
-	//     -> service.Spec.ProfileOverrides.ContainerEnv (explicit user override)
+	//   profileSpec.ContainerEnv (author defaults, with any user overrides
+	//     from spec.profileOverrides.containerEnv already merged in by the
+	//     overlay materialisation step in ComposeState)
+	//     -> framework AIM_* vars (controller-owned; user cannot override
+	//        these — AIM_* identity-of-the-profile semantics belong to the
+	//        framework, not to the user)
 	envVars := upsertEnvVars(nil, profileSpec.ContainerEnv)
 	envVars = upsertEnvVars(envVars, buildFrameworkEnvVars(profileSpec, obs.profileYAMLName))
-	if service.Spec.ProfileOverrides != nil {
-		envVars = upsertEnvVars(envVars, service.Spec.ProfileOverrides.ContainerEnv)
-	}
 
 	resources := resolveResourcesFromProfile(service, profileSpec, profileStatus)
 
@@ -121,7 +128,7 @@ func buildInferenceServiceFromProfile(
 			Name:        obs.isvcName,
 			Namespace:   service.Namespace,
 			Labels:      labels,
-			Annotations: make(map[string]string),
+			Annotations: annotations,
 		},
 		Spec: servingv1beta1.InferenceServiceSpec{
 			Predictor: servingv1beta1.PredictorSpec{
@@ -133,7 +140,7 @@ func buildInferenceServiceFromProfile(
 						{
 							Name:            constants.ContainerKServe,
 							Image:           profileSpec.Image,
-							ImagePullPolicy: corev1.PullAlways,
+							ImagePullPolicy: utils.PullPolicyForImage(profileSpec.Image),
 							Env:             envVars,
 							Resources:       resources,
 							Ports: []corev1.ContainerPort{
@@ -256,9 +263,11 @@ func addProfileCacheVolumes(isvc *servingv1beta1.InferenceService, obs ServiceOb
 // locate the projected profile and, when model caching is active, to redirect
 // model loading to the PVC-backed local path.
 //
-// These vars are treated as framework-owned: profile.ContainerEnv cannot
-// override them (we layer them on top), but service.Spec.ProfileOverrides
-// still can since user intent wins.
+// These vars are framework-owned: neither profile.ContainerEnv nor user
+// spec.profileOverrides.containerEnv can override them. The AIMService
+// reconciler layers them on top of the resolved profile's containerEnv (which
+// already carries user overrides via the materialised overlay AIMProfile), so
+// AIM_* identity vars cannot be reshaped from outside the controller.
 func buildFrameworkEnvVars(profileSpec *aimv1alpha2.AIMProfileSpecCommon, profileYAMLFilename string) []corev1.EnvVar {
 	profileName := strings.TrimSuffix(profileYAMLFilename, ".yaml")
 	aimProfileID := fmt.Sprintf("custom/%s/%s", profileSpec.AimId, profileName)
@@ -294,6 +303,33 @@ func buildFrameworkEnvVars(profileSpec *aimv1alpha2.AIMProfileSpecCommon, profil
 	}
 
 	return vars
+}
+
+// resolveEffectiveResourcesFromProfile returns the fully-merged predictor
+// ResourceRequirements, or nil when the profile is not yet Ready.
+// PlanScaledObject uses this to derive a memory-aware cooldown.
+func resolveEffectiveResourcesFromProfile(
+	service *aimv1alpha1.AIMService,
+	profileSpec *aimv1alpha2.AIMProfileSpecCommon,
+	profileStatus *aimv1alpha2.AIMProfileStatus,
+) *corev1.ResourceRequirements {
+	if profileSpec == nil || profileStatus == nil || profileStatus.Status != constants.AIMStatusReady {
+		return nil
+	}
+	rr := resolveResourcesFromProfile(service, profileSpec, profileStatus)
+	return &rr
+}
+
+// resolvedModelId returns the model id the runtime serves under, mirroring its
+// resolution order: ModelId, else modelSources[0].modelId, else aimId.
+func resolvedModelId(profileSpec *aimv1alpha2.AIMProfileSpecCommon) string {
+	if profileSpec.ModelId != "" {
+		return profileSpec.ModelId
+	}
+	if len(profileSpec.ModelSources) > 0 {
+		return profileSpec.ModelSources[0].ModelID
+	}
+	return profileSpec.AimId
 }
 
 func resolveResourcesFromProfile(

@@ -1,0 +1,16 @@
+apiVersion: aim.eai.amd.com/v1alpha2
+kind: AIMService
+metadata:
+  name: resolve-by-model-and-selector-service
+spec:
+  model:
+    name: resolve-by-model-and-selector-model
+  profile:
+    selector:
+      precision: bf16
+      # This test deliberately asserts the bf16/general profile is chosen over
+      # the fp8/optimized one to prove the precision filter wins over tier
+      # ranking. AIMService auto-selection defaults minimumType=optimized, which
+      # would exclude the general profile; "any" disables the floor so the
+      # precision-narrowing axis under test is not masked by it.
+      minimumType: any

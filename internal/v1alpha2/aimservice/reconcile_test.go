@@ -28,41 +28,123 @@ import (
 	"testing"
 
 	servingv1beta1 "github.com/kserve/kserve/pkg/apis/serving/v1beta1"
+	autoscalingv2 "k8s.io/api/autoscaling/v2"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/utils/ptr"
+	gatewayapiv1 "sigs.k8s.io/gateway-api/apis/v1"
 
 	aimv1alpha1 "github.com/amd-enterprise-ai/aim-engine/api/v1alpha1"
 	aimv1alpha2 "github.com/amd-enterprise-ai/aim-engine/api/v1alpha2"
 	"github.com/amd-enterprise-ai/aim-engine/internal/constants"
 	controllerutils "github.com/amd-enterprise-ai/aim-engine/internal/controller/utils"
+	v1alpha1service "github.com/amd-enterprise-ai/aim-engine/internal/v1alpha1/aimservice"
 )
 
 const (
 	testProfileA    = "profile-a"
 	testServiceName = "svc"
+	testModelIDFP8  = "qwen/qwen3-32b-fp8"
+
+	componentNameInferenceService = "InferenceService"
+	componentNameHTTPRoute        = "HTTPRoute"
+	componentNameProfileCache     = "ProfileCache"
 )
 
-func TestGenerateProfileCacheName_Deterministic(t *testing.T) {
-	a, err := GenerateProfileCacheName("my-profile", "ns-alpha")
+func TestGenerateProfileCacheName_SharedDeterministic(t *testing.T) {
+	a, err := GenerateProfileCacheName("my-profile", "ns-alpha", "svc-a", "uid-a", aimv1alpha1.CachingModeShared, aimv1alpha1.AIMResolutionScopeNamespace)
 	if err != nil {
 		t.Fatalf("generate: %v", err)
 	}
-	b, err := GenerateProfileCacheName("my-profile", "ns-alpha")
+	b, err := GenerateProfileCacheName("my-profile", "ns-alpha", "svc-b", "uid-b", aimv1alpha1.CachingModeShared, aimv1alpha1.AIMResolutionScopeNamespace)
 	if err != nil {
 		t.Fatalf("generate: %v", err)
 	}
 	if a != b {
-		t.Fatalf("cache name should be deterministic: %q vs %q", a, b)
+		t.Fatalf("Shared cache name must depend only on (profile, namespace, scope) so services in the same namespace converge: %q vs %q", a, b)
 	}
 }
 
-func TestGenerateProfileCacheName_NamespaceScoped(t *testing.T) {
-	same, _ := GenerateProfileCacheName("profile-x", "ns-a")
-	other, _ := GenerateProfileCacheName("profile-x", "ns-b")
+func TestGenerateProfileCacheName_SharedNamespaceScoped(t *testing.T) {
+	same, _ := GenerateProfileCacheName("profile-x", "ns-a", "", "", aimv1alpha1.CachingModeShared, aimv1alpha1.AIMResolutionScopeNamespace)
+	other, _ := GenerateProfileCacheName("profile-x", "ns-b", "", "", aimv1alpha1.CachingModeShared, aimv1alpha1.AIMResolutionScopeNamespace)
 	if same == other {
-		t.Fatalf("profile cache names should differ when namespace differs")
+		t.Fatalf("Shared cache names must differ across namespaces")
+	}
+}
+
+// TestGenerateProfileCacheName_SharedScopeIsolation guards against the
+// pre-fix collision where a namespace AIMProfile and a cluster
+// AIMClusterProfile with the same name in the same service namespace shared
+// a single AIMProfileCache and could service the wrong workload.
+func TestGenerateProfileCacheName_SharedScopeIsolation(t *testing.T) {
+	ns, _ := GenerateProfileCacheName("collides", "ns-alpha", "", "", aimv1alpha1.CachingModeShared, aimv1alpha1.AIMResolutionScopeNamespace)
+	cluster, _ := GenerateProfileCacheName("collides", "ns-alpha", "", "", aimv1alpha1.CachingModeShared, aimv1alpha1.AIMResolutionScopeCluster)
+	if ns == cluster {
+		t.Fatalf("Shared cache names must differ across profile scopes for the same profile name + namespace: %q == %q", ns, cluster)
+	}
+}
+
+func TestGenerateProfileCacheName_DedicatedPerService(t *testing.T) {
+	a, err := GenerateProfileCacheName("my-profile", "ns-alpha", "svc-a", "uid-a", aimv1alpha1.CachingModeDedicated, aimv1alpha1.AIMResolutionScopeNamespace)
+	if err != nil {
+		t.Fatalf("generate: %v", err)
+	}
+	b, err := GenerateProfileCacheName("my-profile", "ns-alpha", "svc-b", "uid-b", aimv1alpha1.CachingModeDedicated, aimv1alpha1.AIMResolutionScopeNamespace)
+	if err != nil {
+		t.Fatalf("generate: %v", err)
+	}
+	if a == b {
+		t.Fatalf("Dedicated cache names must differ across services on the same profile: %q vs %q", a, b)
+	}
+}
+
+func TestGenerateProfileCacheName_DedicatedSurvivesRecreate(t *testing.T) {
+	// Same service name but different UIDs (delete-and-recreate) must
+	// produce different cache names so the new instance does not pick up
+	// the old cache before the previous one is GC'd.
+	a, err := GenerateProfileCacheName("my-profile", "ns-alpha", "svc", "uid-old", aimv1alpha1.CachingModeDedicated, aimv1alpha1.AIMResolutionScopeNamespace)
+	if err != nil {
+		t.Fatalf("generate: %v", err)
+	}
+	b, err := GenerateProfileCacheName("my-profile", "ns-alpha", "svc", "uid-new", aimv1alpha1.CachingModeDedicated, aimv1alpha1.AIMResolutionScopeNamespace)
+	if err != nil {
+		t.Fatalf("generate: %v", err)
+	}
+	if a == b {
+		t.Fatalf("Dedicated cache names must include service UID to survive delete-and-recreate: %q vs %q", a, b)
+	}
+}
+
+func TestGenerateProfileCacheName_SharedAndDedicatedDiffer(t *testing.T) {
+	shared, _ := GenerateProfileCacheName("my-profile", "ns-alpha", "svc", "uid", aimv1alpha1.CachingModeShared, aimv1alpha1.AIMResolutionScopeNamespace)
+	dedicated, _ := GenerateProfileCacheName("my-profile", "ns-alpha", "svc", "uid", aimv1alpha1.CachingModeDedicated, aimv1alpha1.AIMResolutionScopeNamespace)
+	if shared == dedicated {
+		t.Fatalf("Shared and Dedicated caches must never collide: %q == %q", shared, dedicated)
+	}
+}
+
+// Regression test: distinct long profile names that share a prefix must not
+// collide on the same cache resource after truncation.
+func TestGenerateProfileCacheName_NoTruncationCollision(t *testing.T) {
+	namespace := "qa-test-may12"
+	profileA := "amdenterpriseai-aim-meta-llama-llama-3-1x-mi300x-thr-fp16-e87a"
+	profileB := "amdenterpriseai-aim-meta-llama-llama-3-1x-mi300x-thr-fp16-db70"
+
+	nameA, err := GenerateProfileCacheName(profileA, namespace, "", "", aimv1alpha1.CachingModeShared, aimv1alpha1.AIMResolutionScopeNamespace)
+	if err != nil {
+		t.Fatalf("generate A: %v", err)
+	}
+	nameB, err := GenerateProfileCacheName(profileB, namespace, "", "", aimv1alpha1.CachingModeShared, aimv1alpha1.AIMResolutionScopeNamespace)
+	if err != nil {
+		t.Fatalf("generate B: %v", err)
+	}
+
+	if nameA == nameB {
+		t.Fatalf("profile cache names collided for distinct profiles: %q", nameA)
 	}
 }
 
@@ -261,6 +343,99 @@ func TestBuildInferenceServiceFromProfile_NilSpecReturnsNil(t *testing.T) {
 	}
 }
 
+// TestResolvedModelIdFromProfile verifies the model-id identity follows the
+// runtime resolution chain `profile.model_id or config.model_id or config.aim_id`:
+// ModelId wins, then modelSources[0].modelId, then aimId.
+func TestResolvedModelIdFromProfile(t *testing.T) {
+	// ModelId wins even when modelSources carry a different id (matches the
+	// runtime, which writes profile.model_id from spec.ModelId).
+	modelIDWins := sampleProfileSpec() // ModelId = qwen/qwen3-32b-fp8
+	modelIDWins.ModelSources = []aimv1alpha1.AIMModelSource{
+		{ModelID: "acme/my-finetune-v1", SourceURI: "hf://acme/my-finetune-v1"},
+	}
+	if got := resolvedModelId(modelIDWins); got != testModelIDFP8 {
+		t.Errorf("ModelId set: resolvedModelId() = %q, want ModelId %q", got, testModelIDFP8)
+	}
+
+	// ModelId empty falls back to modelSources[0].modelId.
+	viaSources := sampleProfileSpec()
+	viaSources.ModelId = ""
+	viaSources.ModelSources = []aimv1alpha1.AIMModelSource{
+		{ModelID: "acme/my-finetune-v1", SourceURI: "hf://acme/my-finetune-v1"},
+	}
+	if got := resolvedModelId(viaSources); got != "acme/my-finetune-v1" {
+		t.Errorf("ModelId empty + modelSources: resolvedModelId() = %q, want %q", got, "acme/my-finetune-v1")
+	}
+
+	// ModelId and modelSources empty falls back to aimId.
+	viaAimID := sampleProfileSpec() // AimId = qwen/qwen3-32b
+	viaAimID.ModelId = ""
+	if got := resolvedModelId(viaAimID); got != "qwen/qwen3-32b" {
+		t.Errorf("ModelId + modelSources empty: resolvedModelId() = %q, want aimId %q", got, "qwen/qwen3-32b")
+	}
+}
+
+// TestBuildInferenceServiceFromProfile_AnnotationPropagation verifies cluster-auth
+// annotations propagate from the AIMService to the InferenceService, unrelated
+// annotations (including our own control annotations) are dropped, and the
+// controller-owned model-id annotation is stamped from the resolved profile
+// rather than any user-supplied value.
+func TestBuildInferenceServiceFromProfile_AnnotationPropagation(t *testing.T) {
+	service := &aimv1alpha1.AIMService{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      testServiceName,
+			Namespace: "ns",
+			Annotations: map[string]string{
+				"cluster-auth/allowed-group":            "ce0c754f-bb1b-63bb-5134-5501142effe7",
+				"aim.eai.amd.com/model-id":              "user-tried-to-override",
+				"aim.eai.amd.com/reconciliation-paused": "true",
+				"example.com/foreign":                   "drop-me",
+			},
+		},
+		Spec: aimv1alpha1.AIMServiceSpec{
+			Profile: &aimv1alpha1.AIMServiceProfileConfig{Name: testProfileA},
+		},
+	}
+
+	profileSpec := sampleProfileSpec()
+	profileSpec.ModelSources = []aimv1alpha1.AIMModelSource{
+		{ModelID: testModelIDFP8, SourceURI: "hf://qwen/qwen3-32b-fp8"},
+	}
+	profileStatus := &aimv1alpha2.AIMProfileStatus{Status: constants.AIMStatusReady}
+
+	r := &ProfileServiceReconciler{}
+	obs := ServiceObservation{
+		ServiceFetchResult:    ServiceFetchResult{service: service},
+		resolvedProfileSpec:   profileSpec,
+		resolvedProfileStatus: profileStatus,
+		profileName:           testProfileA,
+		profileScope:          aimv1alpha1.AIMResolutionScopeNamespace,
+	}
+	r.composeDerivedNames(context.Background(), &obs)
+	if obs.configErr != nil {
+		t.Fatalf("composeDerivedNames returned error: %v", obs.configErr)
+	}
+
+	isvc := buildInferenceServiceFromProfile(service, obs)
+	if isvc == nil {
+		t.Fatalf("buildInferenceServiceFromProfile returned nil")
+	}
+
+	ann := isvc.Annotations
+	if got := ann["cluster-auth/allowed-group"]; got != "ce0c754f-bb1b-63bb-5134-5501142effe7" {
+		t.Errorf("expected cluster-auth annotation propagated, got %q", got)
+	}
+	if _, ok := ann["example.com/foreign"]; ok {
+		t.Error("foreign annotation example.com/foreign must not be propagated")
+	}
+	if _, ok := ann["aim.eai.amd.com/reconciliation-paused"]; ok {
+		t.Error("control annotation aim.eai.amd.com/reconciliation-paused must not be propagated")
+	}
+	if got := ann[constants.AnnotationModelId]; got != testModelIDFP8 {
+		t.Errorf("model-id annotation = %q, want controller-owned %q (must not be overridable from service spec)", got, testModelIDFP8)
+	}
+}
+
 func TestGetConfigHealth_NoErrorReturnsEmpty(t *testing.T) {
 	obs := ServiceObservation{}
 	if got := obs.getConfigHealth(); got.Component != "" {
@@ -305,12 +480,291 @@ func TestGetComponentHealth_IncludesConfigAndRouteEntries(t *testing.T) {
 		if e.Component == "ProfileConfig" {
 			haveConfig = true
 		}
-		if e.Component == "HTTPRoute" {
+		if e.Component == componentNameHTTPRoute {
 			t.Errorf("HTTPRoute entry should be suppressed when routing is disabled")
 		}
 	}
 	if !haveConfig {
 		t.Errorf("expected ProfileConfig entry to be emitted when configErr is set")
+	}
+}
+
+// TestGetComponentHealth_ScaleToZeroRequiresRouting verifies the profile
+// pipeline surfaces the invalid scale-from-zero-without-routing combination as
+// a ConfigValid-driving InvalidSpec error, even before a profile resolves.
+func TestGetComponentHealth_ScaleToZeroRequiresRouting(t *testing.T) {
+	service := &aimv1alpha1.AIMService{
+		ObjectMeta: metav1.ObjectMeta{Name: testServiceName, Namespace: "ns"},
+		Spec:       aimv1alpha1.AIMServiceSpec{MinReplicas: ptr.To(int32(0))},
+	}
+	obs := ServiceObservation{
+		ServiceFetchResult: ServiceFetchResult{service: service},
+	}
+
+	entries := obs.GetComponentHealth(context.Background(), nil)
+
+	var cfg *controllerutils.ComponentHealth
+	for i := range entries {
+		if entries[i].Component == v1alpha1service.ComponentScaleToZeroConfig {
+			cfg = &entries[i]
+		}
+	}
+	if cfg == nil {
+		t.Fatalf("expected a ScaleToZeroConfig component health entry")
+	}
+	if cfg.State != constants.AIMStatusFailed {
+		t.Errorf("ScaleToZeroConfig state = %q, want Failed", cfg.State)
+	}
+	if cfg.Reason != aimv1alpha1.AIMServiceReasonRoutingRequired {
+		t.Errorf("ScaleToZeroConfig reason = %q, want %q", cfg.Reason, aimv1alpha1.AIMServiceReasonRoutingRequired)
+	}
+	if len(cfg.Errors) != 1 ||
+		controllerutils.CategorizeError(cfg.Errors[0]).Category() != controllerutils.ErrorCategoryInvalidSpec {
+		t.Errorf("expected a single InvalidSpec error, got %+v", cfg.Errors)
+	}
+}
+
+// TestGetComponentHealth_MultiListenerRequiresHostname verifies the profile
+// pipeline surfaces the host-pinning guard (multi-listener parent gateway with
+// no routing hostnames) as a ConfigValid-driving InvalidSpec error on the
+// HTTPRoute component, sharing the v1alpha1 helper.
+func TestGetComponentHealth_MultiListenerRequiresHostname(t *testing.T) {
+	service := &aimv1alpha1.AIMService{
+		ObjectMeta: metav1.ObjectMeta{Name: testServiceName, Namespace: "ns"},
+	}
+	service.Spec.Routing = &aimv1alpha1.AIMRuntimeRoutingConfig{
+		Enabled:    ptr.To(true),
+		GatewayRef: &gatewayapiv1.ParentReference{Name: "gw"},
+	}
+	gateway := &gatewayapiv1.Gateway{
+		Spec: gatewayapiv1.GatewaySpec{
+			Listeners: []gatewayapiv1.Listener{
+				{Name: "a", Protocol: gatewayapiv1.HTTPProtocolType, Port: 80},
+				{Name: "b", Protocol: gatewayapiv1.HTTPProtocolType, Port: 80},
+			},
+		},
+	}
+	obs := ServiceObservation{
+		ServiceFetchResult: ServiceFetchResult{
+			service: service,
+			gateway: controllerutils.FetchResult[*gatewayapiv1.Gateway]{Value: gateway},
+		},
+	}
+
+	entries := obs.GetComponentHealth(context.Background(), nil)
+
+	var cfg *controllerutils.ComponentHealth
+	for i := range entries {
+		if entries[i].Component == v1alpha1service.ComponentRouteConfig {
+			cfg = &entries[i]
+		}
+	}
+	if cfg == nil {
+		t.Fatalf("expected a RouteConfig component health entry")
+	}
+	if cfg.State != constants.AIMStatusFailed {
+		t.Errorf("RouteConfig state = %q, want Failed", cfg.State)
+	}
+	if cfg.Reason != v1alpha1service.ReasonRouteHostnameRequired {
+		t.Errorf("RouteConfig reason = %q, want %q", cfg.Reason, v1alpha1service.ReasonRouteHostnameRequired)
+	}
+	if len(cfg.Errors) != 1 ||
+		controllerutils.CategorizeError(cfg.Errors[0]).Category() != controllerutils.ErrorCategoryInvalidSpec {
+		t.Errorf("expected a single InvalidSpec error, got %+v", cfg.Errors)
+	}
+}
+
+// TestGetComponentHealth_ProfileNotFound_SuppressesDownstream pins F13 part 1:
+// when no profile resolves, the planner intentionally skips creating ISVC
+// and HTTPRoute, so reporting them as "Creating"/"not found" would mislead
+// users. Only the gating Profile (and RuntimeConfig if observed) component
+// should be reported.
+func TestGetComponentHealth_ProfileNotFound_SuppressesDownstream(t *testing.T) {
+	service := &aimv1alpha1.AIMService{
+		ObjectMeta: metav1.ObjectMeta{Name: testServiceName, Namespace: "ns"},
+	}
+	notFound := apierrors.NewNotFound(schema.GroupResource{}, "missing-isvc")
+	obs := ServiceObservation{
+		ServiceFetchResult: ServiceFetchResult{
+			service:          service,
+			inferenceService: controllerutils.FetchResult[*servingv1beta1.InferenceService]{Error: notFound},
+		},
+	}
+
+	entries := obs.GetComponentHealth(context.Background(), nil)
+
+	var profileHealth *controllerutils.ComponentHealth
+	for i, e := range entries {
+		switch e.Component {
+		case "Profile":
+			profileHealth = &entries[i]
+		case componentNameInferenceService, componentNameHTTPRoute, componentNameProfileCache:
+			t.Errorf("downstream component %q should be suppressed when no profile resolved; got %+v", e.Component, e)
+		}
+	}
+	if profileHealth == nil {
+		t.Fatalf("expected a Profile component health entry")
+	}
+	if profileHealth.State != constants.AIMStatusFailed {
+		t.Errorf("ProfileNotFound state = %q, want Failed (so the framework rolls it up to Ready=False/ProfileNotFound)", profileHealth.State)
+	}
+	if profileHealth.Reason != aimv1alpha1.AIMServiceReasonProfileNotFound {
+		t.Errorf("ProfileNotFound reason = %q, want %q", profileHealth.Reason, aimv1alpha1.AIMServiceReasonProfileNotFound)
+	}
+}
+
+// TestGetComponentHealth_BaseProfile_SuppressesDownstream pins F13 part 1
+// for the base-profile path: the resolved profile exists but is missing
+// aimId or modelSources. The planner skips downstream creation and the user
+// must fix the profile before anything can progress.
+func TestGetComponentHealth_BaseProfile_SuppressesDownstream(t *testing.T) {
+	service := &aimv1alpha1.AIMService{
+		ObjectMeta: metav1.ObjectMeta{Name: testServiceName, Namespace: "ns"},
+	}
+	baseProfileSpec := &aimv1alpha2.AIMProfileSpecCommon{
+		Image:            "registry.example.com/base:0.1",
+		AcceleratorModel: "EPYC_ZEN5",
+		AcceleratorType:  "cpu",
+		AcceleratorCount: 128,
+	}
+	baseProfileStatus := &aimv1alpha2.AIMProfileStatus{
+		Status:     constants.AIMStatusReady,
+		Deployable: false,
+	}
+	notFound := apierrors.NewNotFound(schema.GroupResource{}, "missing-isvc")
+	obs := ServiceObservation{
+		ServiceFetchResult: ServiceFetchResult{
+			service:          service,
+			inferenceService: controllerutils.FetchResult[*servingv1beta1.InferenceService]{Error: notFound},
+		},
+		profileName:           "base-profile",
+		profileScope:          aimv1alpha1.AIMResolutionScopeNamespace,
+		resolvedProfileSpec:   baseProfileSpec,
+		resolvedProfileStatus: baseProfileStatus,
+	}
+
+	entries := obs.GetComponentHealth(context.Background(), nil)
+
+	var profileHealth *controllerutils.ComponentHealth
+	for i, e := range entries {
+		switch e.Component {
+		case "Profile":
+			profileHealth = &entries[i]
+		case componentNameInferenceService, componentNameHTTPRoute, componentNameProfileCache:
+			t.Errorf("downstream component %q should be suppressed when profile is a base profile; got %+v", e.Component, e)
+		}
+	}
+	if profileHealth == nil {
+		t.Fatalf("expected a Profile component health entry")
+	}
+	if profileHealth.State != constants.AIMStatusFailed {
+		t.Errorf("base profile state = %q, want Failed", profileHealth.State)
+	}
+	if profileHealth.Reason != aimv1alpha1.AIMServiceReasonBaseProfile {
+		t.Errorf("base profile reason = %q, want %q", profileHealth.Reason, aimv1alpha1.AIMServiceReasonBaseProfile)
+	}
+}
+
+// TestGetComponentHealth_ResolvedProfile_KeepsDownstream confirms the
+// suppression in F13 only fires for terminal-by-default Profile failures
+// (base profile / not-found). When the profile resolves to a real spec —
+// even if it's still progressing — downstream conditions remain visible
+// so users can watch cache / ISVC progress.
+func TestGetComponentHealth_ResolvedProfile_KeepsDownstream(t *testing.T) {
+	service := &aimv1alpha1.AIMService{
+		ObjectMeta: metav1.ObjectMeta{Name: testServiceName, Namespace: "ns"},
+	}
+	notFound := apierrors.NewNotFound(schema.GroupResource{}, "missing-isvc")
+	obs := ServiceObservation{
+		ServiceFetchResult: ServiceFetchResult{
+			service:          service,
+			inferenceService: controllerutils.FetchResult[*servingv1beta1.InferenceService]{Error: notFound},
+		},
+		profileName:           testProfileA,
+		profileScope:          aimv1alpha1.AIMResolutionScopeNamespace,
+		resolvedProfileSpec:   sampleProfileSpec(),
+		resolvedProfileStatus: &aimv1alpha2.AIMProfileStatus{Status: constants.AIMStatusReady, Deployable: true},
+	}
+
+	entries := obs.GetComponentHealth(context.Background(), nil)
+
+	var sawISVC bool
+	for _, e := range entries {
+		if e.Component == componentNameInferenceService {
+			sawISVC = true
+		}
+	}
+	if !sawISVC {
+		t.Errorf("expected InferenceService entry for a deployable resolved profile; got %+v", entries)
+	}
+}
+
+// TestGetComponentHealth_ScaleToZeroIdleReportsReady pins the v1alpha2 fix for
+// the idle-readiness gap: a healthily-idled scale-to-zero service (KEDA scaled
+// the predictor to zero, no pods, HPA reporting ScalingDisabled) must report
+// the InferenceServicePods and HPA components as Ready/ScaledToZero rather than
+// stalling at "no pods"/"waiting" forever.
+func TestGetComponentHealth_ScaleToZeroIdleReportsReady(t *testing.T) {
+	service := &aimv1alpha1.AIMService{
+		ObjectMeta: metav1.ObjectMeta{Name: testServiceName, Namespace: "ns"},
+		Spec: aimv1alpha1.AIMServiceSpec{
+			MinReplicas: ptr.To(int32(0)),
+			MaxReplicas: ptr.To(int32(3)),
+		},
+	}
+	// Routing enabled (promoted field from the inlined runtime config) so the
+	// scale-to-zero routing prerequisite passes and does not add an unrelated
+	// ConfigValid=False entry.
+	service.Spec.Routing = &aimv1alpha1.AIMRuntimeRoutingConfig{Enabled: ptr.To(true)}
+
+	// HPA at the idle floor: ScalingActive=False with KEDA's authoritative
+	// ScalingDisabled reason.
+	idleHPA := &autoscalingv2.HorizontalPodAutoscaler{
+		Status: autoscalingv2.HorizontalPodAutoscalerStatus{
+			Conditions: []autoscalingv2.HorizontalPodAutoscalerCondition{
+				{Type: autoscalingv2.ScalingActive, Status: corev1.ConditionFalse, Reason: "ScalingDisabled"},
+			},
+		},
+	}
+	emptyPods := &controllerutils.FetchResult[*corev1.PodList]{Value: &corev1.PodList{}}
+
+	obs := ServiceObservation{
+		ServiceFetchResult: ServiceFetchResult{
+			service:              service,
+			inferenceService:     controllerutils.FetchResult[*servingv1beta1.InferenceService]{Value: &servingv1beta1.InferenceService{}},
+			inferenceServicePods: emptyPods,
+			hpa:                  controllerutils.FetchResult[*autoscalingv2.HorizontalPodAutoscaler]{Value: idleHPA},
+		},
+		resolvedProfileSpec:   sampleProfileSpec(),
+		resolvedProfileStatus: &aimv1alpha2.AIMProfileStatus{Status: constants.AIMStatusReady, Deployable: true},
+		profileName:           testProfileA,
+		profileScope:          aimv1alpha1.AIMResolutionScopeNamespace,
+	}
+
+	entries := obs.GetComponentHealth(context.Background(), nil)
+
+	var pods, hpa *controllerutils.ComponentHealth
+	for i := range entries {
+		switch entries[i].Component {
+		case "InferenceServicePods":
+			pods = &entries[i]
+		case "HPA":
+			hpa = &entries[i]
+		}
+	}
+
+	if pods == nil {
+		t.Fatalf("expected an InferenceServicePods entry; got %+v", entries)
+	}
+	if pods.State != constants.AIMStatusReady || pods.Reason != aimv1alpha1.AIMServiceReasonScaledToZero {
+		t.Errorf("InferenceServicePods = %q/%q, want Ready/ScaledToZero", pods.State, pods.Reason)
+	}
+
+	if hpa == nil {
+		t.Fatalf("expected an HPA entry; got %+v", entries)
+	}
+	if hpa.State != constants.AIMStatusReady || hpa.Reason != aimv1alpha1.AIMServiceReasonScaledToZero {
+		t.Errorf("HPA = %q/%q, want Ready/ScaledToZero", hpa.State, hpa.Reason)
 	}
 }
 
@@ -397,7 +851,7 @@ func TestBuildInferenceServiceFromProfile_Replicas_FixedDisablesHPA(t *testing.T
 	}
 }
 
-func TestBuildInferenceServiceFromProfile_Replicas_AutoScalingEnablesKEDA(t *testing.T) {
+func TestBuildInferenceServiceFromProfile_Replicas_AutoScalingHandsOffToExternal(t *testing.T) {
 	isvc := buildTestISVC(t, aimv1alpha1.AIMServiceSpec{
 		MinReplicas: ptr.To(int32(2)),
 		MaxReplicas: ptr.To(int32(5)),
@@ -409,9 +863,13 @@ func TestBuildInferenceServiceFromProfile_Replicas_AutoScalingEnablesKEDA(t *tes
 	if got := isvc.Spec.Predictor.MaxReplicas; got != 5 {
 		t.Errorf("MaxReplicas: want 5, got %d", got)
 	}
-	if got := isvc.Annotations[constants.AnnotationKServeAutoscalerClass]; got != constants.AutoscalerClassKeda {
-		t.Errorf("autoscaler class: want %q (min/max triggers KEDA), got %q",
-			constants.AutoscalerClassKeda, got)
+	// autoscalerClass=external is what tells KServe's KEDA reconciler to
+	// short-circuit; the AIMService controller writes the actual
+	// ScaledObject (see scaledobject.go). Asserting "keda" here would
+	// re-introduce two ScaledObjects fighting over the same Deployment.
+	if got := isvc.Annotations[constants.AnnotationKServeAutoscalerClass]; got != constants.AutoscalerClassExternal {
+		t.Errorf("autoscaler class: want %q (AIM Engine owns the ScaledObject under min/max), got %q",
+			constants.AutoscalerClassExternal, got)
 	}
 }
 
@@ -458,24 +916,36 @@ func TestBuildInferenceServiceFromProfile_FrameworkEnvVarsWinOverProfile(t *test
 	}
 }
 
-// TestBuildInferenceServiceFromProfile_UserOverridesWinOverFramework verifies
-// the final layer of precedence: service.Spec.ProfileOverrides.ContainerEnv
-// is explicit user intent and is allowed to replace framework values.
-func TestBuildInferenceServiceFromProfile_UserOverridesWinOverFramework(t *testing.T) {
+// TestBuildInferenceServiceFromProfile_FrameworkBeatsOverlayContainerEnv pins
+// the v1alpha2 precedence rule: user-supplied ContainerEnv flows through the
+// overlay's ContainerEnv (already merged by ApplyProfileCopyOverrides in
+// ComposeState) and is then overlaid by framework AIM_* vars. AIM_* identity
+// variables belong to the controller; the user cannot reshape them via
+// spec.profileOverrides.containerEnv.
+//
+// This is a deliberate behaviour change from the inline-override era where
+// service-level overrides were re-applied after framework vars. It is the
+// natural consequence of moving overrides into a real overlay AIMProfile —
+// the AIMService never re-applies overrides at deploy time.
+func TestBuildInferenceServiceFromProfile_FrameworkBeatsOverlayContainerEnv(t *testing.T) {
+	// Simulate the post-overlay state: the overlay's spec.containerEnv
+	// already carries the user's containerEnv override. The reconciler
+	// must NOT let that hijack a framework AIM_* var.
+	overlaySpec := sampleProfileSpec()
+	overlaySpec.ContainerEnv = []corev1.EnvVar{
+		{Name: constants.EnvAIMProfileID, Value: "user-attempt-via-overlay"},
+		{Name: "USER_FLAG", Value: "kept"},
+	}
+
 	service := &aimv1alpha1.AIMService{
 		ObjectMeta: metav1.ObjectMeta{Name: testServiceName, Namespace: "ns"},
 		Spec: aimv1alpha1.AIMServiceSpec{
 			Profile: &aimv1alpha1.AIMServiceProfileConfig{Name: testProfileA},
-			ProfileOverrides: &aimv1alpha1.AIMServiceProfileOverrides{
-				ContainerEnv: []corev1.EnvVar{
-					{Name: constants.EnvAIMProfileID, Value: "user-override"},
-				},
-			},
 		},
 	}
 	obs := ServiceObservation{
 		ServiceFetchResult:    ServiceFetchResult{service: service},
-		resolvedProfileSpec:   sampleProfileSpec(),
+		resolvedProfileSpec:   overlaySpec,
 		resolvedProfileStatus: &aimv1alpha2.AIMProfileStatus{Status: constants.AIMStatusReady},
 		profileName:           testProfileA,
 		profileScope:          aimv1alpha1.AIMResolutionScopeNamespace,
@@ -488,8 +958,14 @@ func TestBuildInferenceServiceFromProfile_UserOverridesWinOverFramework(t *testi
 	}
 	env := envMap(isvc.Spec.Predictor.Containers[0].Env)
 
-	if got := env[constants.EnvAIMProfileID]; got != "user-override" {
-		t.Errorf("ProfileOverrides.ContainerEnv should take precedence over framework var, got %q", got)
+	if env[constants.EnvAIMProfileID] == "user-attempt-via-overlay" {
+		t.Errorf("framework %s must win over overlay containerEnv, got user value", constants.EnvAIMProfileID)
+	}
+	if env[constants.EnvAIMProfileID] == "" {
+		t.Errorf("framework %s must be present", constants.EnvAIMProfileID)
+	}
+	if env["USER_FLAG"] != "kept" {
+		t.Errorf("non-AIM_* user containerEnv via the overlay should survive, got %q", env["USER_FLAG"])
 	}
 }
 
@@ -509,7 +985,7 @@ func TestPlanProfileCache_CreatesSharedCache(t *testing.T) {
 		},
 	}
 	profileSpec := sampleProfileSpec()
-	profileSpec.ModelSources = []aimv1alpha2.AIMModelSource{{
+	profileSpec.ModelSources = []aimv1alpha1.AIMModelSource{{
 		ModelID:   "org/model",
 		SourceURI: "hf://org/model",
 	}}
@@ -536,5 +1012,328 @@ func TestPlanProfileCache_CreatesSharedCache(t *testing.T) {
 	}
 	if cache.Labels[constants.LabelService] != testServiceName {
 		t.Errorf("expected service label on cache, got %v", cache.Labels)
+	}
+}
+
+// TestPlanProfileCache_ServiceCachingEnvReachesCache locks the regression fix:
+// for a cluster-scoped (or overlay) profile there is no profile caching.env, so
+// the service's spec.caching.env is the only credential source that reaches the
+// download Job. obs.profile.Value is nil here to model the cluster-scoped path.
+func TestPlanProfileCache_ServiceCachingEnvReachesCache(t *testing.T) {
+	token := corev1.EnvVar{
+		Name: "HF_TOKEN",
+		ValueFrom: &corev1.EnvVarSource{
+			SecretKeyRef: &corev1.SecretKeySelector{
+				LocalObjectReference: corev1.LocalObjectReference{Name: "hf-token"},
+				Key:                  "token",
+			},
+		},
+	}
+	service := &aimv1alpha1.AIMService{
+		ObjectMeta: metav1.ObjectMeta{Name: testServiceName, Namespace: "ns"},
+		Spec: aimv1alpha1.AIMServiceSpec{
+			Profile: &aimv1alpha1.AIMServiceProfileConfig{Name: testProfileA},
+			Caching: &aimv1alpha1.AIMServiceCachingConfig{Env: []corev1.EnvVar{token}},
+		},
+	}
+	profileSpec := sampleProfileSpec()
+	profileSpec.ModelSources = []aimv1alpha1.AIMModelSource{{
+		ModelID:   "org/model",
+		SourceURI: "hf://org/model",
+	}}
+
+	obs := ServiceObservation{
+		ServiceFetchResult:  ServiceFetchResult{service: service},
+		profileName:         testProfileA,
+		profileScope:        aimv1alpha1.AIMResolutionScopeCluster,
+		resolvedProfileSpec: profileSpec,
+	}
+
+	cache := planProfileCache(service, obs)
+	if cache == nil {
+		t.Fatalf("expected profile cache to be planned")
+	}
+	if len(cache.Spec.Env) != 1 || cache.Spec.Env[0].Name != "HF_TOKEN" {
+		t.Fatalf("service caching.env must reach cache.spec.env, got %+v", cache.Spec.Env)
+	}
+	if cache.Spec.Env[0].ValueFrom == nil || cache.Spec.Env[0].ValueFrom.SecretKeyRef == nil {
+		t.Errorf("secretKeyRef must be preserved on the cache env, got %+v", cache.Spec.Env[0])
+	}
+}
+
+// TestPlanProfileCache_ServiceCachingEnvOverridesProfile verifies the merge
+// precedence: when both the namespace profile and the service set caching.env,
+// the service value wins on conflicting names.
+func TestPlanProfileCache_ServiceCachingEnvOverridesProfile(t *testing.T) {
+	service := &aimv1alpha1.AIMService{
+		ObjectMeta: metav1.ObjectMeta{Name: testServiceName, Namespace: "ns"},
+		Spec: aimv1alpha1.AIMServiceSpec{
+			Profile: &aimv1alpha1.AIMServiceProfileConfig{Name: testProfileA},
+			Caching: &aimv1alpha1.AIMServiceCachingConfig{
+				Env: []corev1.EnvVar{{Name: "HF_TOKEN", Value: "from-service"}},
+			},
+		},
+	}
+	profileSpec := sampleProfileSpec()
+	profileSpec.ModelSources = []aimv1alpha1.AIMModelSource{{ModelID: "org/model", SourceURI: "hf://org/model"}}
+
+	profile := &aimv1alpha2.AIMProfile{
+		ObjectMeta: metav1.ObjectMeta{Name: testProfileA, Namespace: "ns"},
+		Spec: aimv1alpha2.AIMProfileSpec{
+			Caching: &aimv1alpha2.AIMProfileCachingConfig{
+				Env: []corev1.EnvVar{
+					{Name: "HF_TOKEN", Value: "from-profile"},
+					{Name: "PROFILE_ONLY", Value: "profile-only-val"},
+				},
+			},
+		},
+	}
+
+	obs := ServiceObservation{
+		ServiceFetchResult:  ServiceFetchResult{service: service},
+		profileName:         testProfileA,
+		profileScope:        aimv1alpha1.AIMResolutionScopeNamespace,
+		resolvedProfileSpec: profileSpec,
+	}
+	obs.profile.Value = profile
+
+	cache := planProfileCache(service, obs)
+	if cache == nil {
+		t.Fatalf("expected profile cache to be planned")
+	}
+	got := envMap(cache.Spec.Env)
+	if got["HF_TOKEN"] != "from-service" {
+		t.Errorf("service caching.env must override profile on conflict, got %q", got["HF_TOKEN"])
+	}
+	if got["PROFILE_ONLY"] != "profile-only-val" {
+		t.Errorf("profile-only caching.env key must be preserved, got %q", got["PROFILE_ONLY"])
+	}
+}
+
+// TestPlanProfileCache_PropagatesRuntimeConfigRef verifies the service's runtime
+// config reference flows onto the AIMProfileCache so a named AIMRuntimeConfig's
+// env can feed the download Job (instead of always the default-named config).
+func TestPlanProfileCache_PropagatesRuntimeConfigRef(t *testing.T) {
+	service := &aimv1alpha1.AIMService{
+		ObjectMeta: metav1.ObjectMeta{Name: testServiceName, Namespace: "ns"},
+		Spec: aimv1alpha1.AIMServiceSpec{
+			Profile:          &aimv1alpha1.AIMServiceProfileConfig{Name: testProfileA},
+			RuntimeConfigRef: aimv1alpha1.RuntimeConfigRef{Name: "fast"},
+		},
+	}
+	profileSpec := sampleProfileSpec()
+	profileSpec.ModelSources = []aimv1alpha1.AIMModelSource{{ModelID: "org/model", SourceURI: "hf://org/model"}}
+
+	obs := ServiceObservation{
+		ServiceFetchResult:  ServiceFetchResult{service: service},
+		profileName:         testProfileA,
+		profileScope:        aimv1alpha1.AIMResolutionScopeNamespace,
+		resolvedProfileSpec: profileSpec,
+	}
+
+	cache := planProfileCache(service, obs)
+	if cache == nil {
+		t.Fatalf("expected profile cache to be planned")
+	}
+	if cache.Spec.Name != "fast" {
+		t.Errorf("expected runtimeConfigRef to propagate, got %q", cache.Spec.Name)
+	}
+}
+
+// TestPlanResources_ScaleToZeroEmitsScaledObject verifies the v1alpha2
+// pipeline wires the ScaledObject planner. Asserts at the GVK level so the
+// v1alpha1 planner tests remain the source of truth for resource shape.
+func TestPlanResources_ScaleToZeroEmitsScaledObject(t *testing.T) {
+	service := &aimv1alpha1.AIMService{
+		ObjectMeta: metav1.ObjectMeta{Name: testServiceName, Namespace: "ns"},
+		Spec: aimv1alpha1.AIMServiceSpec{
+			Profile:     &aimv1alpha1.AIMServiceProfileConfig{Name: testProfileA},
+			MinReplicas: ptr.To(int32(0)),
+			MaxReplicas: ptr.To(int32(3)),
+			AutoScaling: &aimv1alpha1.AIMServiceAutoScaling{
+				Metrics: []aimv1alpha1.AIMServiceMetricsSpec{{
+					Type: "PodMetric",
+					PodMetric: &aimv1alpha1.AIMServicePodMetricSource{
+						Metric: &aimv1alpha1.AIMServicePodMetric{
+							Backend:     "opentelemetry",
+							MetricNames: []string{"vllm:num_requests_running"},
+							Query:       "vllm:num_requests_running",
+						},
+						Target: &aimv1alpha1.AIMServiceMetricTarget{Type: "Value", Value: "1"},
+					},
+				}},
+			},
+		},
+	}
+	service.Spec.Routing = &aimv1alpha1.AIMRuntimeRoutingConfig{Enabled: ptr.To(true)}
+
+	r := &ProfileServiceReconciler{}
+	obs := ServiceObservation{
+		ServiceFetchResult:  ServiceFetchResult{service: service},
+		resolvedProfileSpec: sampleProfileSpec(),
+		// Deployable=true mirrors what the AIMProfile reconciler stamps
+		// once the profile validates and is what isDeployable() short-
+		// circuits on. Setting it here keeps the fixture spec minimal
+		// (no ModelSources) so PlanResources does not divert into the
+		// AIMProfileCache branch, which would early-return on the
+		// unready cache and skip the scale-to-zero resources we are
+		// asserting on.
+		resolvedProfileStatus: &aimv1alpha2.AIMProfileStatus{
+			Status:     constants.AIMStatusReady,
+			Deployable: true,
+		},
+		profileName:      testProfileA,
+		profileScope:     aimv1alpha1.AIMResolutionScopeNamespace,
+		profileAssembled: true,
+	}
+	r.composeDerivedNames(context.Background(), &obs)
+	if obs.configErr != nil {
+		t.Fatalf("composeDerivedNames: %v", obs.configErr)
+	}
+
+	pr := r.PlanResources(context.Background(),
+		controllerutils.ReconcileContext[*aimv1alpha1.AIMService]{Object: service},
+		obs,
+	)
+
+	var sawScaledObject bool
+	for _, obj := range pr.GetToApply() {
+		gvk := obj.GetObjectKind().GroupVersionKind()
+		if gvk.Group == "keda.sh" && gvk.Kind == "ScaledObject" {
+			sawScaledObject = true
+		}
+	}
+	if !sawScaledObject {
+		t.Errorf("scale-to-zero v1alpha2 service must produce a KEDA ScaledObject")
+	}
+}
+
+func TestResolveEffectiveResourcesFromProfile(t *testing.T) {
+	service := &aimv1alpha1.AIMService{
+		ObjectMeta: metav1.ObjectMeta{Name: testServiceName, Namespace: "ns"},
+	}
+	profileSpec := sampleProfileSpec()
+	memBlock := &corev1.ResourceRequirements{
+		Requests: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("32Gi")},
+		Limits:   corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("48Gi")},
+	}
+
+	tests := []struct {
+		name   string
+		status *aimv1alpha2.AIMProfileStatus
+		want   *corev1.ResourceRequirements
+	}{
+		{
+			name:   "nil status returns nil",
+			status: nil,
+			want:   nil,
+		},
+		{
+			name:   "profile not ready returns nil",
+			status: &aimv1alpha2.AIMProfileStatus{Status: constants.AIMStatusProgressing, Resources: memBlock},
+			want:   nil,
+		},
+		{
+			name:   "profile ready returns merged resources",
+			status: &aimv1alpha2.AIMProfileStatus{Status: constants.AIMStatusReady, Resources: memBlock},
+			want:   memBlock,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := resolveEffectiveResourcesFromProfile(service, profileSpec, tc.status)
+			switch {
+			case tc.want == nil:
+				if got != nil {
+					t.Errorf("want nil, got %+v", got)
+				}
+			case got == nil:
+				t.Errorf("want non-nil, got nil")
+			default:
+				if got.Limits.Memory().Cmp(*tc.want.Limits.Memory()) != 0 {
+					t.Errorf("limits.memory: want %v, got %v", tc.want.Limits.Memory(), got.Limits.Memory())
+				}
+				if got.Requests.Memory().Cmp(*tc.want.Requests.Memory()) != 0 {
+					t.Errorf("requests.memory: want %v, got %v", tc.want.Requests.Memory(), got.Requests.Memory())
+				}
+			}
+		})
+	}
+}
+
+// TestResolveEffectiveResourcesFromProfile_ServiceOverrideWins verifies the
+// service-level Resources override takes precedence over the profile's
+// computed resources (matching resolveResourcesFromProfile's precedence).
+func TestResolveEffectiveResourcesFromProfile_ServiceOverrideWins(t *testing.T) {
+	service := &aimv1alpha1.AIMService{
+		ObjectMeta: metav1.ObjectMeta{Name: testServiceName, Namespace: "ns"},
+		Spec: aimv1alpha1.AIMServiceSpec{
+			Resources: &corev1.ResourceRequirements{
+				Requests: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("16Gi")},
+			},
+		},
+	}
+	profileSpec := sampleProfileSpec()
+	profileStatus := &aimv1alpha2.AIMProfileStatus{
+		Status: constants.AIMStatusReady,
+		Resources: &corev1.ResourceRequirements{
+			Requests: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("128Gi")},
+		},
+	}
+
+	got := resolveEffectiveResourcesFromProfile(service, profileSpec, profileStatus)
+	if got == nil {
+		t.Fatal("expected non-nil resources")
+	}
+	if got.Requests.Memory().Cmp(resource.MustParse("16Gi")) != 0 {
+		t.Errorf("service override should win; got %v, want 16Gi", got.Requests.Memory())
+	}
+}
+
+func TestPlanProfileCache_DedicatedHonorsServiceCachingMode(t *testing.T) {
+	service := &aimv1alpha1.AIMService{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      testServiceName,
+			Namespace: "ns",
+			UID:       "service-uid-123",
+		},
+		Spec: aimv1alpha1.AIMServiceSpec{
+			Profile: &aimv1alpha1.AIMServiceProfileConfig{Name: testProfileA},
+			Caching: &aimv1alpha1.AIMServiceCachingConfig{
+				Mode: aimv1alpha1.CachingModeDedicated,
+			},
+		},
+	}
+	profileSpec := sampleProfileSpec()
+	profileSpec.ModelSources = []aimv1alpha1.AIMModelSource{{
+		ModelID:   "org/model",
+		SourceURI: "hf://org/model",
+	}}
+
+	obs := ServiceObservation{
+		ServiceFetchResult:  ServiceFetchResult{service: service},
+		profileName:         testProfileA,
+		profileScope:        aimv1alpha1.AIMResolutionScopeNamespace,
+		resolvedProfileSpec: profileSpec,
+	}
+
+	cache := planProfileCache(service, obs)
+	if cache == nil {
+		t.Fatalf("expected profile cache to be planned for Dedicated service")
+	}
+	if cache.Spec.Mode != aimv1alpha2.ProfileCacheModeDedicated {
+		t.Fatalf("Dedicated AIMService caching must produce a Dedicated AIMProfileCache, got %q", cache.Spec.Mode)
+	}
+
+	// And the planned cache name must match what the dedicated lookup
+	// pathway expects, so a follow-up reconcile finds the exact same
+	// cache without listing.
+	expected, err := GenerateProfileCacheName(testProfileA, "ns", testServiceName, "service-uid-123", aimv1alpha1.CachingModeDedicated, aimv1alpha1.AIMResolutionScopeNamespace)
+	if err != nil {
+		t.Fatalf("generate expected name: %v", err)
+	}
+	if cache.Name != expected {
+		t.Fatalf("Dedicated cache name does not match deterministic-lookup formula: got %q, want %q", cache.Name, expected)
 	}
 }

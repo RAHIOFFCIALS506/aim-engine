@@ -1,0 +1,197 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/kyverno/chainsaw/main/.schemas/json/test-chainsaw-v1alpha1.json
+#
+# AIMService v1alpha2 E2E Test: AIMModel → AIMProfile (via discovery) → AIMService → HTTP
+#
+# Closes the AIMModel v1alpha2 coverage gap by driving the entire chain off
+# a single AIMModel, with no hand-applied AIMProfile / AIMServiceTemplate /
+# AIMProfileSet. The operator's image-discovery pipeline is the source of
+# truth: it inspects the OCI labels of the configured image and synthesizes
+# one AIMProfile per supported profile entry. We then point a v1alpha2
+# AIMService at the resulting AIMProfile and validate that the inference
+# endpoint responds correctly.
+#
+# Image: docker.io/silogenai/aim-cpu-qwen-qwen3-0-6b:0.12.0-rc1
+#   Same lightweight CPU model used by profile-cache-cpu-live, runs on any
+#   node labelled feature.node.kubernetes.io/aim-accelerator.EPYC_ZEN5
+#   by the AcceleratorDetector.
+#
+# Requires:
+# - GPU cluster (we lean on Longhorn / real downloads).
+# - AcceleratorDetector labelling nodes with aim-accelerator.EPYC_ZEN5.
+# - Docker Hub pull secret (dockerhub-regcred) - provisioned by
+#   ../../../_shared/ensure-pull-secret.sh (local manifest / cluster / warn).
+# - HuggingFace token (huggingface-creds) - provisioned by
+#   ../../../_shared/ensure-hf-secret.sh (local manifest at
+#   ~/.config/aim-engine/huggingface-creds.yaml or HF_TOKEN_SECRET_FILE / a
+#   cluster secret). The image's embedded profile YAML references this secret
+#   via caching.env, so the discovered AIMProfile inherits the same env wiring.
+#
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: v1alpha2-profile-via-model-cpu-live
+  labels:
+    requires: gpu
+    # Same env prereq as profile-cache-cpu-live: a Docker Hub pull secret
+    # (dockerhub-regcred) plus an HF token secret. Excluded from the default
+    # selectors; opt-in by pointing CHAINSAW_TEST_DIR here.
+    needs-secret: dockerhub_pull_secret
+spec:
+  description: >-
+    Full v1alpha2 chain: AIMModel discovery synthesizes an AIMProfile, an
+    AIMService consumes it, and /v1/chat/completions returns a real response.
+  timeouts:
+    assert: 600s
+  steps:
+    - name: Ensure dockerhub pull secret in the test namespace
+      try:
+        - script:
+            env:
+              - name: NAMESPACE
+                value: ($namespace)
+            content: bash ../../../_shared/ensure-pull-secret.sh
+
+    - name: Ensure HF token secret in the test namespace
+      try:
+        - script:
+            env:
+              - name: NAMESPACE
+                value: ($namespace)
+            content: bash ../../../_shared/ensure-hf-secret.sh
+
+    - name: Create runtime config with routing
+      try:
+        - apply:
+            file: runtime-config.yaml
+
+    - name: Create the v1alpha2 AIMModel (native discovery)
+      try:
+        - apply:
+            file: model.yaml
+
+    - name: Wait for the model to publish a Ready managed profile
+      description: |
+        Discovery runs as a Job inside the test namespace, parses the image's
+        embedded profile YAML, and synthesizes one AIMProfile per supported
+        entry. We require at least one to reach Ready - that is the profile
+        the AIMService will consume.
+      try:
+        - assert:
+            timeout: 300s
+            resource:
+              apiVersion: aim.eai.amd.com/v1alpha2
+              kind: AIMModel
+              metadata:
+                name: via-model-cpu
+              status:
+                aimId: Qwen/Qwen3-0.6B
+                (discoveryCacheRef.name != ""): true
+                (managedProfiles.ready >= `1`): true
+                (conditions[?type == 'Ready']):
+                  - status: "True"
+
+    - name: Assert the discovered AIMProfile is a CPU profile
+      description: |
+        Discovery of a CPU image must synthesize CPU profiles. The profile
+        name carries a content hash (e.g.
+        via-model-cpu-vllm-epyc-zen5-bf16-tp1-throughput-99f36b73), so we
+        match by the aim.eai.amd.com/model-name annotation (as the resolve
+        step below does) and assert the resolved accelerator type is cpu.
+      try:
+        - assert:
+            timeout: 60s
+            resource:
+              apiVersion: aim.eai.amd.com/v1alpha2
+              kind: AIMProfile
+              metadata:
+                namespace: ($namespace)
+                annotations:
+                  aim.eai.amd.com/model-name: via-model-cpu
+              spec:
+                acceleratorType: cpu
+
+    - name: Resolve the discovered AIMProfile name and create the AIMService
+      description: |
+        Discovery-produced AIMProfiles are annotated with
+        aim.eai.amd.com/model-name=<model>. We pick the first Ready one in
+        the test namespace and apply an AIMService that targets it. We
+        always query v1alpha2 explicitly to avoid the storage-version
+        conversion stripping fields when kubectl picks v1alpha1.
+      try:
+        - script:
+            timeout: 60s
+            env:
+              - name: NAMESPACE
+                value: ($namespace)
+            content: |
+              set -eu
+
+              PROFILE_GV=aimprofiles.v1alpha2.aim.eai.amd.com
+
+              DERIVED=$(kubectl get "$PROFILE_GV" -n "$NAMESPACE" -o json \
+                | jq -r '
+                    .items[]
+                      | select(.metadata.annotations["aim.eai.amd.com/model-name"] == "via-model-cpu")
+                      | select(.status.status == "Ready")
+                      | .metadata.name' \
+                | head -1)
+              if [ -z "$DERIVED" ]; then
+                echo "ERROR: no Ready AIMProfile owned by via-model-cpu found in $NAMESPACE"
+                kubectl get "$PROFILE_GV" -n "$NAMESPACE" -o yaml
+                exit 1
+              fi
+              echo "Derived profile: $DERIVED"
+
+              cat <<EOF | kubectl apply -n "$NAMESPACE" -f -
+              apiVersion: aim.eai.amd.com/v1alpha2
+              kind: AIMService
+              metadata:
+                name: test-via-model-cpu
+              spec:
+                runtimeConfigName: v1alpha2-via-model-cpu-live
+                profile:
+                  name: $DERIVED
+                replicas: 1
+              EOF
+
+    - name: Wait for the AIMService to reach Running
+      try:
+        - assert:
+            timeout: 15m
+            resource:
+              apiVersion: aim.eai.amd.com/v1alpha1
+              kind: AIMService
+              metadata:
+                name: test-via-model-cpu
+              status:
+                status: Running
+                resolvedProfile:
+                  scope: Namespace
+      catch:
+        - describe:
+            apiVersion: aim.eai.amd.com/v1alpha2
+            kind: AIMService
+        - describe:
+            apiVersion: aim.eai.amd.com/v1alpha2
+            kind: AIMProfileCache
+        - describe:
+            apiVersion: aim.eai.amd.com/v1alpha1
+            kind: AIMArtifact
+        - describe:
+            apiVersion: serving.kserve.io/v1beta1
+            kind: InferenceService
+        - get:
+            apiVersion: v1
+            kind: Pod
+        - podLogs:
+            selector: serving.kserve.io/inferenceservice=test-via-model-cpu
+            tail: 80
+
+    - name: Verify chat completions endpoint works
+      try:
+        - script:
+            timeout: 6m
+            env:
+              - name: HTTP_BASE_PATH
+                value: (join('', ['/integration/v1alpha2-via-model-cpu-live/', $namespace, '/test-via-model-cpu/v1']))
+            content: bash ../_shared/validate-http.sh

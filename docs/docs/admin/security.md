@@ -39,7 +39,7 @@ When `rbacHelpers.enable` is `true` (default), the chart creates admin/editor/vi
 | `{crd}-editor` | Create, update, delete |
 | `{crd}-viewer` | Read-only |
 
-Available for: `aimservice`, `aimmodel`, `aimclustermodel`, `aimartifact`, `aimtemplatecache`, `aimservicetemplate`, `aimclusterservicetemplate`, `aimruntimeconfig`, `aimclusterruntimeconfig`.
+Available for: `aimservice`, `aimmodel`, `aimclustermodel`, `aimartifact`, `aimtemplatecache`, `aimprofile`, `aimclusterprofile`, `aimprofileset`, `aimclusterprofileset`, `aimprofilecache`, `aimservicetemplate`, `aimclusterservicetemplate`, `aimruntimeconfig`, `aimclusterruntimeconfig`.
 
 ### Example: Team RBAC
 
@@ -57,6 +57,14 @@ kubectl create clusterrolebinding team-a-models \
   --clusterrole=aimclustermodel-viewer \
   --group=team-a
 ```
+
+## Inference Route Hostnames
+
+AIM Engine exposes inference services through Gateway API `HTTPRoute` resources. A route with no hostname attaches to **every** listener on its parent Gateway. On a Gateway that fronts multiple hostnames (for example `workloads.*`, `api.*`, and `ui.*`), an unpinned route is therefore reachable on listeners that may not enforce the same authentication, which can expose a model endpoint without auth.
+
+To prevent this, pin routes to the intended hostname via `spec.routing.hostnames` (or a runtime config default). When the parent Gateway has more than one listener, a hostname is **required**: a routing-enabled service without one is refused (no `HTTPRoute` is created) and reports `ConfigValid=False` / `RouteHostnameRequired`. See [Routing and Ingress](../guides/routing-and-ingress.md#hostnames).
+
+Authentication itself is enforced at the gateway layer (for example via `cluster-auth/*` annotations propagated onto the route); hostname pinning ensures the route only attaches to the listener where that enforcement applies.
 
 ## TLS
 

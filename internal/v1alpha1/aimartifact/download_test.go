@@ -222,6 +222,22 @@ func TestBuildDownloadJobIncludesFilter(t *testing.T) {
 	}
 }
 
+func TestBuildDownloadJobHasActiveDeadline(t *testing.T) {
+	mc := &aimv1alpha1.AIMArtifact{
+		ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default"},
+		Spec:       aimv1alpha1.AIMArtifactSpec{SourceURI: "hf://org/model"},
+	}
+
+	job := buildDownloadJob(mc, nil, 1000)
+
+	if job.Spec.ActiveDeadlineSeconds == nil {
+		t.Fatal("download job missing ActiveDeadlineSeconds (hard backstop for a wedged filesystem)")
+	}
+	if got, want := *job.Spec.ActiveDeadlineSeconds, int64(24*60*60); got != want {
+		t.Errorf("ActiveDeadlineSeconds = %d, want %d (24h)", got, want)
+	}
+}
+
 func TestBothJobsGetSameFilterEnvVars(t *testing.T) {
 	mc := &aimv1alpha1.AIMArtifact{
 		ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default"},
@@ -238,6 +254,31 @@ func TestBothJobsGetSameFilterEnvVars(t *testing.T) {
 		if checkEnv[key] != downloadEnv[key] {
 			t.Errorf("env %s differs: check-size=%q download=%q", key, checkEnv[key], downloadEnv[key])
 		}
+	}
+}
+
+func TestPullPolicyForImage(t *testing.T) {
+	tests := []struct {
+		name  string
+		image string
+		want  corev1.PullPolicy
+	}{
+		{name: "empty defaults to always", image: "", want: corev1.PullAlways},
+		{name: "tagless reference defaults to always", image: "ghcr.io/example/downloader", want: corev1.PullAlways},
+		{name: "explicit :latest is always", image: "ghcr.io/example/downloader:latest", want: corev1.PullAlways},
+		{name: "semver tag is if-not-present", image: "ghcr.io/example/downloader:v0.2.2", want: corev1.PullIfNotPresent},
+		{name: "non-latest moving tag is if-not-present", image: "ghcr.io/example/downloader:main", want: corev1.PullIfNotPresent},
+		{name: "digest reference is if-not-present", image: "ghcr.io/example/downloader@sha256:c0ffee", want: corev1.PullIfNotPresent},
+		{name: "port-qualified registry with semver", image: "registry.local:5000/example/downloader:v1.2.3", want: corev1.PullIfNotPresent},
+		{name: "port-qualified registry without tag is always", image: "registry.local:5000/example/downloader", want: corev1.PullAlways},
+		{name: "port-qualified registry with :latest is always", image: "registry.local:5000/example/downloader:latest", want: corev1.PullAlways},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := pullPolicyForImage(tt.image); got != tt.want {
+				t.Errorf("pullPolicyForImage(%q) = %q, want %q", tt.image, got, tt.want)
+			}
+		})
 	}
 }
 

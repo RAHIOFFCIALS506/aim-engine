@@ -1,0 +1,115 @@
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: v1alpha2-aimmodel-custom-copy
+spec:
+  description: |
+    Verifies that a profileCopy v1alpha2 AIMModel synthesizes a child AIMProfileSet,
+    which derives only matching direct profiles and applies selector plus override
+    semantics on the copied AIMProfile.
+  timeouts:
+    assert: 90s
+  steps:
+    - name: Seed the source namespace profile
+      try:
+        - apply:
+            file: source-profile.yaml
+        - assert:
+            timeout: 60s
+            resource:
+              apiVersion: aim.eai.amd.com/v1alpha2
+              kind: AIMProfile
+              metadata:
+                name: custom-copy-source
+              status:
+                status: Ready
+                version: 0.2.0
+
+    - name: Create the profileCopy AIMModel
+      try:
+        - apply:
+            file: model.yaml
+
+    - name: Assert the synthesized AIMProfileSet exists
+      try:
+        # Identify the synthesized set by the source-model label rather than its
+        # hashed name; the model owns exactly one set in this namespace.
+        - assert:
+            timeout: 60s
+            resource:
+              apiVersion: aim.eai.amd.com/v1alpha2
+              kind: AIMProfileSet
+              metadata:
+                labels:
+                  aim.eai.amd.com/source-model: custom-copy-model
+                  aim.eai.amd.com/source-model-scope: namespace
+              spec:
+                selector:
+                  aimId: custom-org/custom-model
+                  modelId: copied-org/copied-model
+                versionPolicy: pinned
+                version: 0.2.0
+
+    - name: Assert the copied AIMProfile preserves direct-derivative fields
+      try:
+        # The derived profile is the only copy owned by this model; match it by
+        # provenance labels instead of its hashed name.
+        - assert:
+            timeout: 60s
+            resource:
+              apiVersion: aim.eai.amd.com/v1alpha2
+              kind: AIMProfile
+              metadata:
+                labels:
+                  aim.eai.amd.com/profile-role: deployable
+                  aim.eai.amd.com/profile-origin: derived
+                  aim.eai.amd.com/source-model: custom-copy-model
+              spec:
+                aimId: custom-org/custom-model
+                modelId: custom-org/custom-copy-model
+                profileId: cpu-latency
+                primary: true
+                manualSelectionOnly: true
+                # The derived image rebases source-profile.yaml's base-image
+                # annotation (`aim-base:0.1.10`): RebaseRegistry grafts the source
+                # image's registry+org (docker.io/amdenterpriseai, from spec.image)
+                # onto the base-image name, and NormalizeBaseImageTag truncates the
+                # SemVer tag to the MAJOR.MINOR rolling tag aim-base publishes (0.1).
+                image: docker.io/amdenterpriseai/aim-base:0.1
+                modelSources:
+                  - modelId: custom-org/custom-copy-model
+                    sourceUri: s3://models/custom-copy-model
+                containerEnv:
+                  - name: KEEP
+                    value: "1"
+                  - name: OVERRIDE
+                    value: new
+                  - name: ADDED
+                    value: "2"
+                engineEnv:
+                  KEEP: "1"
+                  OVERRIDE: new
+                  ADDED: "2"
+                engineArgs:
+                  tensor-parallel-size: 4
+                  max-model-len: 8192
+              status:
+                status: Ready
+
+    - name: Assert AIMModel status summarizes child profile-set counts only
+      try:
+        - assert:
+            timeout: 60s
+            resource:
+              apiVersion: aim.eai.amd.com/v1alpha2
+              kind: AIMModel
+              metadata:
+                name: custom-copy-model
+              status:
+                status: Ready
+                aimId: custom-org/custom-model
+                # Synthesized set name carries an internal hash; assert presence.
+                (profileSetRef.name != ''): true
+                managedProfiles:
+                  total: 1
+                  ready: 1

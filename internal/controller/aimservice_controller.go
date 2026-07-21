@@ -28,6 +28,7 @@ import (
 
 	servingv1beta1 "github.com/kserve/kserve/pkg/apis/serving/v1beta1"
 	autoscalingv2 "k8s.io/api/autoscaling/v2"
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -104,6 +105,8 @@ type AIMServiceReconciler struct {
 // +kubebuilder:rbac:groups=aim.eai.amd.com,resources=aimclusterruntimeconfigs,verbs=get;list;watch
 // +kubebuilder:rbac:groups=serving.kserve.io,resources=inferenceservices,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=gateway.networking.k8s.io,resources=httproutes,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=gateway.networking.k8s.io,resources=gateways,verbs=get;list;watch
+// +kubebuilder:rbac:groups=keda.sh,resources=scaledobjects,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=persistentvolumeclaims,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=nodes,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch
@@ -111,6 +114,7 @@ type AIMServiceReconciler struct {
 // +kubebuilder:rbac:groups="",resources=events,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=namespaces,verbs=get;list;watch
 // +kubebuilder:rbac:groups=autoscaling,resources=horizontalpodautoscalers,verbs=get;list;watch
+// +kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;watch;create;update;patch;delete
 
 func (r *AIMServiceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
@@ -197,13 +201,44 @@ func (r *AIMServiceReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		return ctrl.Result{Requeue: true}, nil
 	}
 
-	// Dispatch based on which reference the user supplied. Mutual
-	// exclusivity between spec.profile and spec.template is enforced by
-	// CEL validation on the AIMService type.
-	if service.Spec.Profile != nil {
+	// Dispatch onto the v1alpha1 template pipeline or the v1alpha2 profile
+	// pipeline. The two API versions share a single storage schema (no
+	// conversion webhook, strategy: None), so we route on the *spec shape*
+	// the user authored rather than on apiVersion, which the API server
+	// rewrites per request.
+	//
+	// Default rule: spec.profile-shaped services use the v1alpha2 profile
+	// pipeline; everything else (spec.template-shaped, spec.model-shaped,
+	// including image and custom-model variants the v1alpha2 resolver does
+	// not implement yet) uses the v1alpha1 template pipeline.
+	//
+	// Escape hatch: AnnotationReconcilerPipeline forces a specific pipeline,
+	// e.g. for v1alpha2 callers who want the model→profile resolver shortcut
+	// when authoring with spec.model.name, or for the rare case where the
+	// owner of a profile-shaped service wants the legacy pipeline.
+	pipeline := selectPipeline(&service)
+	if pipeline == constants.ReconcilerPipelineProfile {
 		return r.profilePipeline.Run(ctx, &service)
 	}
 	return r.templatePipeline.Run(ctx, &service)
+}
+
+// selectPipeline returns ReconcilerPipelineProfile or
+// ReconcilerPipelineTemplate based on (1) the explicit
+// AnnotationReconcilerPipeline override when set to a recognised value,
+// otherwise (2) the spec shape the user authored. Unknown annotation
+// values fall through to spec-shape dispatch.
+func selectPipeline(service *aimv1alpha1.AIMService) string {
+	if override, ok := service.GetAnnotations()[constants.AnnotationReconcilerPipeline]; ok {
+		switch override {
+		case constants.ReconcilerPipelineTemplate, constants.ReconcilerPipelineProfile:
+			return override
+		}
+	}
+	if service.Spec.Profile != nil {
+		return constants.ReconcilerPipelineProfile
+	}
+	return constants.ReconcilerPipelineTemplate
 }
 
 // SetupWithManager sets up the controller with the Manager.
@@ -242,7 +277,8 @@ func (r *AIMServiceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	}
 
 	r.profileReconciler = &profileservice.ProfileServiceReconciler{
-		Scheme: r.Scheme,
+		Scheme:   r.Scheme,
+		Recorder: recorder,
 	}
 	r.profilePipeline = controllerutils.Pipeline[
 		*aimv1alpha1.AIMService,
@@ -276,7 +312,8 @@ func (r *AIMServiceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Owns(&servingv1beta1.InferenceService{}).
 		Owns(&gatewayapiv1.HTTPRoute{}).
 		Owns(&corev1.PersistentVolumeClaim{}).
-		Owns(&corev1.ConfigMap{})
+		Owns(&corev1.ConfigMap{}).
+		Owns(&batchv1.Job{})
 
 	b, err := aimservice.RegisterWatches(ctx, mgr, b, c)
 	if err != nil {
@@ -301,8 +338,34 @@ func (r *AIMServiceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 			handler.EnqueueRequestsFromMapFunc(r.findServicesForHPA),
 			builder.WithPredicates(hpaReplicaChangePredicate()),
 		).
+		Watches(
+			&gatewayapiv1.Gateway{},
+			handler.EnqueueRequestsFromMapFunc(r.findServicesForGateway),
+		).
 		Named(serviceName).
 		Complete(r)
+}
+
+// findServicesForGateway enqueues every AIMService when a Gateway changes.
+// The host-pinning guard depends on the parent gateway's listener count, so a
+// listener added or removed must re-evaluate services that route through it.
+// Gateways change rarely and the gatewayRef can be supplied indirectly via
+// runtime config (which is not indexed per service), so a cluster-wide enqueue
+// is the simplest correct trigger.
+func (r *AIMServiceReconciler) findServicesForGateway(ctx context.Context, _ client.Object) []reconcile.Request {
+	var services aimv1alpha1.AIMServiceList
+	if err := r.List(ctx, &services); err != nil {
+		return nil
+	}
+
+	requests := make([]reconcile.Request, 0, len(services.Items))
+	for i := range services.Items {
+		svc := &services.Items[i]
+		requests = append(requests, reconcile.Request{
+			NamespacedName: types.NamespacedName{Name: svc.Name, Namespace: svc.Namespace},
+		})
+	}
+	return requests
 }
 
 func (r *AIMServiceReconciler) findServicesForInferenceServicePod(ctx context.Context, obj client.Object) []reconcile.Request {

@@ -26,6 +26,7 @@ import (
 	"context"
 	"testing"
 
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 
@@ -73,7 +74,7 @@ func makeArtifact(name, sourceURI, modelID string, status constants.AIMStatus, s
 	return a
 }
 
-func makeProfile(name string, modelSources []aimv1alpha2.AIMModelSource) *aimv1alpha2.AIMProfile {
+func makeProfile(name string, modelSources []aimv1alpha1.AIMModelSource) *aimv1alpha2.AIMProfile {
 	return &aimv1alpha2.AIMProfile{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default"},
 		Spec: aimv1alpha2.AIMProfileSpec{
@@ -89,7 +90,7 @@ func makeProfile(name string, modelSources []aimv1alpha2.AIMModelSource) *aimv1a
 func TestComposeState_MatchesArtifactBySourceURI(t *testing.T) {
 	r := &ProfileCacheReconciler{}
 	pc := makeProfileCache("pc1", "my-profile", aimv1alpha1.AIMResolutionScopeNamespace, aimv1alpha2.ProfileCacheModeShared, "")
-	profile := makeProfile("my-profile", []aimv1alpha2.AIMModelSource{
+	profile := makeProfile("my-profile", []aimv1alpha1.AIMModelSource{
 		{ModelID: "org/model-a", SourceURI: "hf://org/model-a"},
 	})
 
@@ -118,10 +119,85 @@ func TestComposeState_MatchesArtifactBySourceURI(t *testing.T) {
 	}
 }
 
+// TestComposeState_RequiresAdapterDiskSkipsDisklessArtifact verifies that a
+// cache which must serve adapters does not adopt an otherwise-matching artifact
+// that lacks an adapter disk — it falls through to MissingCaches so PlanResources
+// creates a disk-bearing one.
+func TestComposeState_RequiresAdapterDiskSkipsDisklessArtifact(t *testing.T) {
+	r := &ProfileCacheReconciler{}
+	pc := makeProfileCache("pc1", "my-profile", aimv1alpha1.AIMResolutionScopeNamespace, aimv1alpha2.ProfileCacheModeShared, "")
+	pc.Spec.RequiresAdapterDisk = true
+	profile := makeProfile("my-profile", []aimv1alpha1.AIMModelSource{
+		{ModelID: "org/model-a", SourceURI: "hf://org/model-a"},
+	})
+
+	disklessArtifact := makeArtifact("artifact-a", "hf://org/model-a", "org/model-a", constants.AIMStatusReady, "")
+
+	fetch := ProfileCacheFetchResult{
+		profileCache: pc,
+		profile:      controllerutils.FetchResult[*aimv1alpha2.AIMProfile]{Value: profile},
+		artifacts: controllerutils.FetchResult[*aimv1alpha1.AIMArtifactList]{
+			Value: &aimv1alpha1.AIMArtifactList{Items: []aimv1alpha1.AIMArtifact{disklessArtifact}},
+		},
+	}
+
+	obs := r.ComposeState(context.Background(), controllerutils.ReconcileContext[*aimv1alpha2.AIMProfileCache]{Object: pc}, fetch)
+	if len(obs.BestArtifacts) != 0 {
+		t.Errorf("expected diskless artifact to be skipped, got %d best artifacts", len(obs.BestArtifacts))
+	}
+	if len(obs.MissingCaches) != 1 {
+		t.Fatalf("expected 1 missing cache, got %d", len(obs.MissingCaches))
+	}
+
+	// PlanResources must stamp an adapter disk onto the created artifact.
+	plan := r.PlanResources(context.Background(), controllerutils.ReconcileContext[*aimv1alpha2.AIMProfileCache]{Object: pc}, obs)
+	var created *aimv1alpha1.AIMArtifact
+	planned := append(plan.GetToApply(), plan.GetToApplyWithoutOwnerRef()...)
+	for _, obj := range planned {
+		if a, ok := obj.(*aimv1alpha1.AIMArtifact); ok {
+			created = a
+			break
+		}
+	}
+	if created == nil {
+		t.Fatal("expected a created AIMArtifact in the plan")
+	}
+	if created.Spec.AdapterDisk == nil {
+		t.Error("expected created artifact to carry an adapterDisk")
+	}
+}
+
+// TestComposeState_RequiresAdapterDiskAdoptsDiskArtifact verifies that an
+// existing artifact WITH an adapter disk is adopted normally.
+func TestComposeState_RequiresAdapterDiskAdoptsDiskArtifact(t *testing.T) {
+	r := &ProfileCacheReconciler{}
+	pc := makeProfileCache("pc1", "my-profile", aimv1alpha1.AIMResolutionScopeNamespace, aimv1alpha2.ProfileCacheModeShared, "")
+	pc.Spec.RequiresAdapterDisk = true
+	profile := makeProfile("my-profile", []aimv1alpha1.AIMModelSource{
+		{ModelID: "org/model-a", SourceURI: "hf://org/model-a"},
+	})
+
+	diskArtifact := makeArtifact("artifact-a", "hf://org/model-a", "org/model-a", constants.AIMStatusReady, "")
+	diskArtifact.Spec.AdapterDisk = &aimv1alpha1.AIMAdapterDisk{}
+
+	fetch := ProfileCacheFetchResult{
+		profileCache: pc,
+		profile:      controllerutils.FetchResult[*aimv1alpha2.AIMProfile]{Value: profile},
+		artifacts: controllerutils.FetchResult[*aimv1alpha1.AIMArtifactList]{
+			Value: &aimv1alpha1.AIMArtifactList{Items: []aimv1alpha1.AIMArtifact{diskArtifact}},
+		},
+	}
+
+	obs := r.ComposeState(context.Background(), controllerutils.ReconcileContext[*aimv1alpha2.AIMProfileCache]{Object: pc}, fetch)
+	if len(obs.BestArtifacts) != 1 || obs.BestArtifacts["org/model-a"].Name != "artifact-a" {
+		t.Fatalf("expected disk-bearing artifact-a to be adopted, got %#v", obs.BestArtifacts)
+	}
+}
+
 func TestComposeState_MissingArtifact(t *testing.T) {
 	r := &ProfileCacheReconciler{}
 	pc := makeProfileCache("pc1", "my-profile", aimv1alpha1.AIMResolutionScopeNamespace, aimv1alpha2.ProfileCacheModeShared, "")
-	profile := makeProfile("my-profile", []aimv1alpha2.AIMModelSource{
+	profile := makeProfile("my-profile", []aimv1alpha1.AIMModelSource{
 		{ModelID: "org/model-a", SourceURI: "hf://org/model-a"},
 	})
 
@@ -151,7 +227,7 @@ func TestComposeState_MissingArtifact(t *testing.T) {
 func TestComposeState_SharedModeSkipsOwnedArtifacts(t *testing.T) {
 	r := &ProfileCacheReconciler{}
 	pc := makeProfileCache("pc1", "my-profile", aimv1alpha1.AIMResolutionScopeNamespace, aimv1alpha2.ProfileCacheModeShared, "")
-	profile := makeProfile("my-profile", []aimv1alpha2.AIMModelSource{
+	profile := makeProfile("my-profile", []aimv1alpha1.AIMModelSource{
 		{ModelID: "org/model-a", SourceURI: "hf://org/model-a"},
 	})
 
@@ -181,7 +257,7 @@ func TestComposeState_SharedModeSkipsOwnedArtifacts(t *testing.T) {
 func TestComposeState_DedicatedModeOnlyUsesOwnedArtifacts(t *testing.T) {
 	r := &ProfileCacheReconciler{}
 	pc := makeProfileCache("pc1", "my-profile", aimv1alpha1.AIMResolutionScopeNamespace, aimv1alpha2.ProfileCacheModeDedicated, "")
-	profile := makeProfile("my-profile", []aimv1alpha2.AIMModelSource{
+	profile := makeProfile("my-profile", []aimv1alpha1.AIMModelSource{
 		{ModelID: "org/model-a", SourceURI: "hf://org/model-a"},
 	})
 
@@ -211,7 +287,7 @@ func TestComposeState_DedicatedModeOnlyUsesOwnedArtifacts(t *testing.T) {
 func TestComposeState_StorageClassFiltering(t *testing.T) {
 	r := &ProfileCacheReconciler{}
 	pc := makeProfileCache("pc1", "my-profile", aimv1alpha1.AIMResolutionScopeNamespace, aimv1alpha2.ProfileCacheModeShared, "fast-ssd")
-	profile := makeProfile("my-profile", []aimv1alpha2.AIMModelSource{
+	profile := makeProfile("my-profile", []aimv1alpha1.AIMModelSource{
 		{ModelID: "org/model-a", SourceURI: "hf://org/model-a"},
 	})
 
@@ -241,7 +317,7 @@ func TestComposeState_StorageClassFiltering(t *testing.T) {
 func TestComposeState_SelectsBestStatus(t *testing.T) {
 	r := &ProfileCacheReconciler{}
 	pc := makeProfileCache("pc1", "my-profile", aimv1alpha1.AIMResolutionScopeNamespace, aimv1alpha2.ProfileCacheModeShared, "")
-	profile := makeProfile("my-profile", []aimv1alpha2.AIMModelSource{
+	profile := makeProfile("my-profile", []aimv1alpha1.AIMModelSource{
 		{ModelID: "org/model-a", SourceURI: "hf://org/model-a"},
 	})
 
@@ -302,7 +378,7 @@ func TestComposeState_ClusterProfile(t *testing.T) {
 			AIMProfileSpecCommon: aimv1alpha2.AIMProfileSpecCommon{
 				AimId: "test/model",
 				Image: "test:latest",
-				ModelSources: []aimv1alpha2.AIMModelSource{
+				ModelSources: []aimv1alpha1.AIMModelSource{
 					{ModelID: "org/model-b", SourceURI: "hf://org/model-b"},
 				},
 			},
@@ -359,7 +435,7 @@ func TestComposeState_EmptyModelSources(t *testing.T) {
 func TestComposeState_SkipsEmptyStatusArtifacts(t *testing.T) {
 	r := &ProfileCacheReconciler{}
 	pc := makeProfileCache("pc1", "my-profile", aimv1alpha1.AIMResolutionScopeNamespace, aimv1alpha2.ProfileCacheModeShared, "")
-	profile := makeProfile("my-profile", []aimv1alpha2.AIMModelSource{
+	profile := makeProfile("my-profile", []aimv1alpha1.AIMModelSource{
 		{ModelID: "org/model-a", SourceURI: "hf://org/model-a"},
 	})
 
@@ -391,7 +467,7 @@ func TestPlanResources_CreatesArtifactsForMissing(t *testing.T) {
 
 	obs := ProfileCacheObservation{
 		ProfileCacheFetchResult: ProfileCacheFetchResult{profileCache: pc},
-		MissingCaches: []aimv1alpha2.AIMModelSource{
+		MissingCaches: []aimv1alpha1.AIMModelSource{
 			{ModelID: "org/model-a", SourceURI: "hf://org/model-a"},
 			{ModelID: "org/model-b", SourceURI: "hf://org/model-b"},
 		},
@@ -407,13 +483,47 @@ func TestPlanResources_CreatesArtifactsForMissing(t *testing.T) {
 	}
 }
 
+// TestPlanResources_PropagatesEnvAndRuntimeConfigRef verifies the cache's
+// download-auth env and runtime config reference are stamped onto the
+// AIMArtifact it creates, so the credential and the named runtime config both
+// reach the download Job (matching the v1alpha1 template-cache behavior).
+func TestPlanResources_PropagatesEnvAndRuntimeConfigRef(t *testing.T) {
+	r := &ProfileCacheReconciler{}
+	pc := makeProfileCache("pc1", "my-profile", aimv1alpha1.AIMResolutionScopeCluster, aimv1alpha2.ProfileCacheModeShared, "")
+	pc.Spec.Env = []corev1.EnvVar{{Name: "HF_TOKEN", Value: "tok"}}
+	pc.Spec.RuntimeConfigRef = aimv1alpha1.RuntimeConfigRef{Name: "fast"}
+
+	obs := ProfileCacheObservation{
+		ProfileCacheFetchResult: ProfileCacheFetchResult{profileCache: pc},
+		MissingCaches: []aimv1alpha1.AIMModelSource{
+			{ModelID: "org/model-a", SourceURI: "hf://org/model-a"},
+		},
+	}
+
+	result := r.PlanResources(context.Background(), controllerutils.ReconcileContext[*aimv1alpha2.AIMProfileCache]{Object: pc}, obs)
+	planned := result.GetToApplyWithoutOwnerRef()
+	if len(planned) != 1 {
+		t.Fatalf("expected 1 artifact, got %d", len(planned))
+	}
+	art, ok := planned[0].(*aimv1alpha1.AIMArtifact)
+	if !ok {
+		t.Fatalf("expected an AIMArtifact, got %T", planned[0])
+	}
+	if art.Spec.Name != "fast" {
+		t.Errorf("expected runtimeConfigRef to propagate onto artifact, got %q", art.Spec.Name)
+	}
+	if len(art.Spec.Env) != 1 || art.Spec.Env[0].Name != "HF_TOKEN" {
+		t.Errorf("expected cache env to propagate onto artifact, got %+v", art.Spec.Env)
+	}
+}
+
 func TestPlanResources_DedicatedModeUsesApply(t *testing.T) {
 	r := &ProfileCacheReconciler{}
 	pc := makeProfileCache("pc1", "my-profile", aimv1alpha1.AIMResolutionScopeNamespace, aimv1alpha2.ProfileCacheModeDedicated, "")
 
 	obs := ProfileCacheObservation{
 		ProfileCacheFetchResult: ProfileCacheFetchResult{profileCache: pc},
-		MissingCaches: []aimv1alpha2.AIMModelSource{
+		MissingCaches: []aimv1alpha1.AIMModelSource{
 			{ModelID: "org/model-a", SourceURI: "hf://org/model-a"},
 		},
 	}

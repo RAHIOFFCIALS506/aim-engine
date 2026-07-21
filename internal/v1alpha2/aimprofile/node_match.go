@@ -24,12 +24,14 @@ package aimprofile
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 
-	aimv1alpha2 "github.com/amd-enterprise-ai/aim-engine/api/v1alpha2"
+	aimv1alpha1 "github.com/amd-enterprise-ai/aim-engine/api/v1alpha1"
+	"github.com/amd-enterprise-ai/aim-engine/internal/aimimage"
 	"github.com/amd-enterprise-ai/aim-engine/internal/constants"
 )
 
@@ -42,6 +44,24 @@ const (
 	// the operator uses an Exists selector on the key for node affinity. A
 	// single node may have multiple labels (model, architecture, family).
 	AcceleratorLabelPrefix = "feature.node.kubernetes.io/aim-accelerator."
+
+	// PartitioningSchemeLabelPrefix is the single partition axis published by
+	// the AcceleratorDetector. Keys are either the `default` sentinel or a
+	// literal `<Compute>-<Memory>` scheme:
+	//   feature.node.kubernetes.io/aim-accelerator.partitioning-scheme.default=8
+	//   feature.node.kubernetes.io/aim-accelerator.partitioning-scheme.CPX-NPS4=64
+	// Like the model labels, values are informational; the resolver matches on
+	// key existence via Exists / DoesNotExist.
+	PartitioningSchemeLabelPrefix = AcceleratorLabelPrefix + "partitioning-scheme."
+
+	// PartitioningSchemeDefault is the hardware-agnostic sentinel key suffix
+	// stamped on canonical-unpartitioned and non-partitionable nodes.
+	PartitioningSchemeDefault = "default"
+
+	// PartitioningModeUnpartitioned selects unpartitioned hardware (the CRD default).
+	PartitioningModeUnpartitioned = "unpartitioned"
+	// PartitioningModePartitioned selects any actively-partitioned mode.
+	PartitioningModePartitioned = "partitioned"
 )
 
 // NodeMatchResult holds the result of matching a profile against cluster nodes.
@@ -56,9 +76,18 @@ type NodeMatchResult struct {
 //	gpu → constants.DefaultGPUResourceName (amd.com/gpu)
 //	cpu → corev1.ResourceCPU
 //
+// For EPYC CPU profiles (acceleratorModel starts with "EPYC"), memory is derived from
+// the engine env var VLLM_CPU_KVCACHE_SPACE (doubled) to enable Guaranteed QoS pods.
+//
 // If spec.resources already contains the derived resource name, the explicit value wins.
 // Returns nil only when both accelerator count is zero and resources is nil.
-func ResolveResources(accelType aimv1alpha2.AcceleratorType, accelCount int32, resources *corev1.ResourceRequirements) *corev1.ResourceRequirements {
+func ResolveResources(
+	accelType aimv1alpha1.AcceleratorType,
+	accelCount int32,
+	resources *corev1.ResourceRequirements,
+	acceleratorModel string,
+	engineEnv map[string]string,
+) *corev1.ResourceRequirements {
 	derivedName, derivedQty := acceleratorDeviceRequest(accelType, accelCount)
 
 	if derivedName == "" && resources == nil {
@@ -85,12 +114,11 @@ func ResolveResources(accelType aimv1alpha2.AcceleratorType, accelCount int32, r
 		if _, exists := resolved.Requests[derivedName]; !exists {
 			resolved.Requests[derivedName] = derivedQty
 		}
-		// GPU (and other extended/device resources) are non-overcommitable, so
-		// Kubernetes requires Limits to be set for them on the Pod spec and
-		// enforces requests==limits. Mirror the derived request into Limits when
-		// the accelerator is a device type; CPU is overcommitable and can be
-		// left unlimited.
-		if accelType == aimv1alpha2.AcceleratorTypeGPU {
+		// Mirror requests into limits for both GPU and CPU accelerator types.
+		// GPU device resources are non-overcommitable (K8s enforces requests==limits).
+		// CPU limits are set to enable Guaranteed QoS on EPYC pods (memory
+		// limits are added separately below for EPYC profiles).
+		if accelType == aimv1alpha1.AcceleratorTypeGPU || accelType == aimv1alpha1.AcceleratorTypeCPU {
 			if resolved.Limits == nil {
 				resolved.Limits = make(corev1.ResourceList)
 			}
@@ -100,34 +128,75 @@ func ResolveResources(accelType aimv1alpha2.AcceleratorType, accelCount int32, r
 		}
 	}
 
+	// EPYC CPU profiles: derive memory from VLLM_CPU_KVCACHE_SPACE to enable
+	// Guaranteed QoS (requests==limits for both CPU and memory). Explicit
+	// spec.resources memory takes precedence.
+	if accelType == aimv1alpha1.AcceleratorTypeCPU && strings.HasPrefix(acceleratorModel, "EPYC") {
+		if _, exists := resolved.Requests[corev1.ResourceMemory]; !exists {
+			memGi := deriveEPYCMemoryGi(engineEnv)
+			memQty := resource.MustParse(fmt.Sprintf("%dGi", memGi))
+			resolved.Requests[corev1.ResourceMemory] = memQty
+			if resolved.Limits == nil {
+				resolved.Limits = make(corev1.ResourceList)
+			}
+			resolved.Limits[corev1.ResourceMemory] = memQty
+		}
+	}
+
 	return resolved
+}
+
+const defaultEPYCMemoryGi int64 = 120
+
+// deriveEPYCMemoryGi computes memory in GiB for EPYC CPU profiles by
+// doubling VLLM_CPU_KVCACHE_SPACE (the KV-cache reservation already
+// accounts for roughly half of useful runtime memory). Falls back to
+// defaultEPYCMemoryGi when the env var is absent or unparseable.
+func deriveEPYCMemoryGi(engineEnv map[string]string) int64 {
+	if v, ok := engineEnv["VLLM_CPU_KVCACHE_SPACE"]; ok {
+		if gi, err := strconv.ParseInt(v, 10, 64); err == nil && gi > 0 {
+			return gi * 2
+		}
+	}
+	return defaultEPYCMemoryGi
 }
 
 // acceleratorDeviceRequest returns the K8s resource name and quantity derived from the
 // accelerator type and count. Returns empty name when no device request can be derived.
-func acceleratorDeviceRequest(accelType aimv1alpha2.AcceleratorType, accelCount int32) (corev1.ResourceName, resource.Quantity) {
+//
+// MIXED-MODE SEAM: under resource_naming_strategy: single (the only supported
+// strategy today) every GPU/partition is advertised as amd.com/gpu, so partition
+// mode does NOT affect the resource name — it only scopes node affinity (see
+// partitionNodeSelectorRequirement). The future mixed/multiple follow-up would
+// branch here on the resolved partition mode to request a mode-specific resource
+// (e.g. amd.com/cpx_nps4). Do not add that branch yet.
+func acceleratorDeviceRequest(accelType aimv1alpha1.AcceleratorType, accelCount int32) (corev1.ResourceName, resource.Quantity) {
 	if accelCount <= 0 {
 		return "", resource.Quantity{}
 	}
 
 	switch accelType {
-	case aimv1alpha2.AcceleratorTypeGPU:
+	case aimv1alpha1.AcceleratorTypeGPU:
 		return corev1.ResourceName(constants.DefaultGPUResourceName), *resource.NewQuantity(int64(accelCount), resource.DecimalSI)
-	case aimv1alpha2.AcceleratorTypeCPU:
+	case aimv1alpha1.AcceleratorTypeCPU:
 		return corev1.ResourceCPU, *resource.NewQuantity(int64(accelCount), resource.DecimalSI)
 	default:
 		return "", resource.Quantity{}
 	}
 }
 
-// MatchNodes checks how many nodes in the list satisfy both the accelerator label
-// requirements and the resolved resource capacity requirements of a profile.
-func MatchNodes(nodes []corev1.Node, accelModel string, resolvedResources *corev1.ResourceRequirements) NodeMatchResult {
-	affinity := BuildNodeAffinity(accelModel)
+// MatchNodes checks how many nodes in the list satisfy the accelerator label
+// requirements (model +, for GPU profiles, partition), and the resolved
+// resource capacity requirements of a profile.
+func MatchNodes(nodes []corev1.Node, accelType aimv1alpha1.AcceleratorType, accelModel, partitioningMode string, resolvedResources *corev1.ResourceRequirements) NodeMatchResult {
+	affinity := BuildNodeAffinity(accelType, accelModel, partitioningMode)
+	partitionReq := partitionNodeSelectorRequirement(accelType, partitioningMode)
 
 	var count int32
 	for i := range nodes {
-		if nodeMatchesAccelerator(&nodes[i], accelModel) && nodeHasResourceCapacity(&nodes[i], resolvedResources) {
+		if nodeMatchesAccelerator(&nodes[i], accelModel) &&
+			nodeMatchesPartitioning(&nodes[i], partitionReq) &&
+			nodeHasResourceCapacity(&nodes[i], resolvedResources) {
 			count++
 		}
 	}
@@ -138,24 +207,93 @@ func MatchNodes(nodes []corev1.Node, accelModel string, resolvedResources *corev
 	}
 }
 
-// BuildNodeAffinity constructs a corev1.NodeAffinity from the accelerator model.
-// Returns nil if no accelerator model is specified.
-func BuildNodeAffinity(accelModel string) *corev1.NodeAffinity {
+// BuildNodeAffinity constructs a corev1.NodeAffinity from the accelerator model
+// and (for GPU profiles) the partitioning mode. The terms are AND-ed into a
+// single NodeSelectorTerm so the resulting affinity is "model AND partition".
+// Returns nil when no accelerator model is specified.
+func BuildNodeAffinity(accelType aimv1alpha1.AcceleratorType, accelModel, partitioningMode string) *corev1.NodeAffinity {
 	if accelModel == "" {
 		return nil
+	}
+
+	exprs := []corev1.NodeSelectorRequirement{
+		{
+			Key:      AcceleratorLabelPrefix + accelModel,
+			Operator: corev1.NodeSelectorOpExists,
+		},
+	}
+	if req := partitionNodeSelectorRequirement(accelType, partitioningMode); req != nil {
+		exprs = append(exprs, *req)
 	}
 
 	return &corev1.NodeAffinity{
 		RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{
 			NodeSelectorTerms: []corev1.NodeSelectorTerm{
-				{MatchExpressions: []corev1.NodeSelectorRequirement{
-					{
-						Key:      AcceleratorLabelPrefix + accelModel,
-						Operator: corev1.NodeSelectorOpExists,
-					},
-				}},
+				{MatchExpressions: exprs},
 			},
 		},
+	}
+}
+
+// partitionNodeSelectorRequirement is the single seam that maps an
+// acceleratorPartitioningMode to a node-affinity term over the
+// partitioning-scheme label axis. Partitioning is a GPU-only concept, so the
+// term is emitted only for GPU profiles; CPU and untyped profiles get no
+// partition constraint (returns nil). The mapping is uniform and string-blind:
+//
+//	"" / "unpartitioned" -> partitioning-scheme.default Exists
+//	"partitioned"        -> partitioning-scheme.default DoesNotExist
+//	"<value>"            -> partitioning-scheme.<value> Exists
+//
+// MIXED-MODE SEAM: this is the one place partition mode becomes a *label*
+// affinity term. The future resource_naming_strategy: mixed/multiple follow-up
+// (a partition requested via a mode-specific RESOURCE name such as
+// amd.com/cpx_nps4 instead of, or in addition to, this label) replaces or
+// augments exactly this function plus acceleratorDeviceRequest below. No other
+// caller needs to change, and the partitioning-scheme.<C>-<M> value shape is
+// already 1:1 with the device plugin's mode-specific resource names. Do NOT add
+// a strategy switch here yet — single is the only supported strategy.
+func partitionNodeSelectorRequirement(accelType aimv1alpha1.AcceleratorType, partitioningMode string) *corev1.NodeSelectorRequirement {
+	if accelType != aimv1alpha1.AcceleratorTypeGPU {
+		return nil
+	}
+	switch mode := canonicalizePartitioningMode(partitioningMode); mode {
+	case "", PartitioningModeUnpartitioned:
+		return &corev1.NodeSelectorRequirement{
+			Key:      PartitioningSchemeLabelPrefix + PartitioningSchemeDefault,
+			Operator: corev1.NodeSelectorOpExists,
+		}
+	case PartitioningModePartitioned:
+		return &corev1.NodeSelectorRequirement{
+			Key:      PartitioningSchemeLabelPrefix + PartitioningSchemeDefault,
+			Operator: corev1.NodeSelectorOpDoesNotExist,
+		}
+	default:
+		return &corev1.NodeSelectorRequirement{
+			Key:      PartitioningSchemeLabelPrefix + mode,
+			Operator: corev1.NodeSelectorOpExists,
+		}
+	}
+}
+
+// canonicalizePartitioningMode normalizes a user-entered partitioning mode so
+// matching is case-insensitive. The reserved sentinels collapse to their
+// canonical lowercase form ("unpartitioned"/"partitioned"); every other value
+// is a scheme and is upper-cased to line up with the partition labels the
+// AcceleratorDetector publishes — amd-smi axis values are always emitted
+// upper-case (see config/accelerator-detector/scripts/detect-and-label.py
+// `_clean_axis`). Without this, a profile written as "cpx-nps4" would build
+// affinity on partitioning-scheme.cpx-nps4 and silently match zero nodes.
+func canonicalizePartitioningMode(mode string) string {
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case "":
+		return ""
+	case PartitioningModeUnpartitioned:
+		return PartitioningModeUnpartitioned
+	case PartitioningModePartitioned:
+		return PartitioningModePartitioned
+	default:
+		return strings.ToUpper(strings.TrimSpace(mode))
 	}
 }
 
@@ -169,8 +307,35 @@ func nodeMatchesAccelerator(node *corev1.Node, accelModel string) bool {
 	return exists
 }
 
+// nodeMatchesPartitioning evaluates the partition term (already resolved by
+// partitionNodeSelectorRequirement) against a node's labels, mirroring its
+// Exists / DoesNotExist semantics. A nil requirement (non-GPU profile) matches
+// every node.
+func nodeMatchesPartitioning(node *corev1.Node, req *corev1.NodeSelectorRequirement) bool {
+	if req == nil {
+		return true
+	}
+	_, exists := node.Labels[req.Key]
+	if req.Operator == corev1.NodeSelectorOpDoesNotExist {
+		return !exists
+	}
+	return exists
+}
+
 // nodeHasResourceCapacity checks if a node's allocatable resources can satisfy the
 // profile's resource requests. Returns true if resources is nil (no resource constraints).
+//
+// Capacity is enforced only when the requested resource is actually reported in
+// node.Status.Allocatable. If the resource is absent (e.g. on a kind cluster
+// where no device plugin advertises amd.com/gpu, or during an NFD-vs-device-plugin
+// race window at cluster startup), the accelerator label is treated as the
+// authoritative signal that the hardware exists and the node is counted as a
+// match. The kubelet still enforces real capacity at pod admission time, so a
+// lying label can never produce a successfully-running pod — it just shifts the
+// failure surface from profile-Ready to pod-Pending. This mirrors v1alpha1's
+// label-only availability check (see aimservicetemplate.GPUHealthFromResources)
+// and lets v1alpha2 profiles with realistic acceleratorModel values stay Ready
+// on kind clusters that only carry labels, not device-plugin capacity.
 func nodeHasResourceCapacity(node *corev1.Node, resources *corev1.ResourceRequirements) bool {
 	if resources == nil || len(resources.Requests) == 0 {
 		return true
@@ -178,7 +343,7 @@ func nodeHasResourceCapacity(node *corev1.Node, resources *corev1.ResourceRequir
 	for resourceName, requested := range resources.Requests {
 		allocatable, exists := node.Status.Allocatable[resourceName]
 		if !exists {
-			return false
+			continue
 		}
 		if allocatable.Cmp(requested) < 0 {
 			return false
@@ -201,19 +366,21 @@ func FormatHardwareSummary(accelModel string, accelCount int32) string {
 	return accelModel
 }
 
-// ExtractVersionFromImage extracts a version tag from a container image reference.
-// Returns the part after the last colon, or empty string if no tag is present.
-// Examples: "registry/image:0.8.5" → "0.8.5", "registry/image" → "".
+// ExtractVersionFromImage extracts a version tag from a container image
+// reference. Returns the part after the last colon, or empty string if
+// no tag is present.
+//
+// Thin wrapper around aimimage.ExtractTag so the v1alpha2 profile
+// pipeline and the v1alpha1/v1alpha2 model pipelines share one
+// implementation that's correct on tricky inputs (registry ports,
+// digest references). Examples:
+//
+//	"registry/image:0.8.5"        → "0.8.5"
+//	"registry/image"              → ""
+//	"registry/image@sha256:abcd"  → ""
+//	"registry.local:5000/image"   → ""
 func ExtractVersionFromImage(image string) string {
-	if strings.Contains(image, "@sha256:") {
-		return ""
-	}
-	lastSlash := strings.LastIndex(image, "/")
-	lastColon := strings.LastIndex(image, ":")
-	if lastColon > lastSlash {
-		return image[lastColon+1:]
-	}
-	return ""
+	return aimimage.ExtractTag(image)
 }
 
 // HasAcceleratorRequirement returns true if the profile requires specific accelerator hardware.

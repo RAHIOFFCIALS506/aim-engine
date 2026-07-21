@@ -47,6 +47,13 @@ func effectiveSourceURI(mc *aimv1alpha1.AIMArtifact) string {
 	return mc.Spec.SourceURI
 }
 
+// ResolveDownloadImage exposes the download-image resolution to other packages
+// (e.g. the AIMService adapter staging Jobs) so they share the same image
+// precedence: artifact spec > runtime config > build-time default.
+func ResolveDownloadImage(mc *aimv1alpha1.AIMArtifact, runtimeConfigSpec *aimv1alpha1.AIMRuntimeConfigCommon) string {
+	return resolveDownloadImage(mc, runtimeConfigSpec)
+}
+
 // resolveDownloadImage picks the container image for download and size-check
 // jobs. Precedence: artifact spec > runtime config > build-time default.
 func resolveDownloadImage(mc *aimv1alpha1.AIMArtifact, runtimeConfigSpec *aimv1alpha1.AIMRuntimeConfigCommon) string {
@@ -57,6 +64,20 @@ func resolveDownloadImage(mc *aimv1alpha1.AIMArtifact, runtimeConfigSpec *aimv1a
 		return runtimeConfigSpec.Artifact.ModelDownloadImage
 	}
 	return aimv1alpha1.DefaultDownloadImage
+}
+
+// PullPolicyForImage exposes pullPolicyForImage to other packages building Jobs
+// that use the downloader image (e.g. AIMService adapter staging).
+func PullPolicyForImage(image string) corev1.PullPolicy {
+	return pullPolicyForImage(image)
+}
+
+// pullPolicyForImage delegates to utils.PullPolicyForImage; see that helper for
+// the tag-aware heuristic (versioned tag -> IfNotPresent, :latest/tagless ->
+// Always, digest -> IfNotPresent). Kept as a thin local alias for the Job
+// builders in this package.
+func pullPolicyForImage(image string) corev1.PullPolicy {
+	return utils.PullPolicyForImage(image)
 }
 
 func buildRoleBinding(mc *aimv1alpha1.AIMArtifact) *rbacv1.RoleBinding {
@@ -81,6 +102,13 @@ func buildRoleBinding(mc *aimv1alpha1.AIMArtifact) *rbacv1.RoleBinding {
 
 // defaultDownloadFilter excludes subdirectory files when no explicit filter is configured.
 var defaultDownloadFilter = &aimv1alpha1.AIMDownloadFilter{Exclude: []string{"*/*"}}
+
+// downloadJobActiveDeadlineSeconds is a hard 24h wall-clock backstop on the
+// whole download Job (all pod retries). It covers the one case the progress
+// monitor can't: a wedged filesystem where the monitor is paused and can't
+// measure progress. On expiry the Job fails and is recreated (bytes persist on
+// the PVC; HF/S3 resume). Intentionally coarse and non-configurable for now.
+const downloadJobActiveDeadlineSeconds = int64(24 * 60 * 60)
 
 // resolveDownloadFilter returns the effective download filter.
 // Precedence: artifact spec > runtime config storage > default (exclude subdirs).
@@ -137,6 +165,9 @@ func buildDownloadJob(mc *aimv1alpha1.AIMArtifact, runtimeConfigSpec *aimv1alpha
 		{Name: "ARTIFACT_NAME", Value: mc.Name},
 		{Name: "ARTIFACT_NAMESPACE", Value: mc.Namespace},
 		{Name: "STALL_TIMEOUT", Value: "120"},
+		// Upper bound (seconds) for a single progress-monitor size measurement.
+		// Generous so slow-but-healthy storage isn't mistaken for a stuck fs.
+		{Name: "DU_TIMEOUT", Value: "300"},
 		{Name: "TARGET_DIR", Value: mountPath},
 	}
 	defaultEnv = append(defaultEnv, downloadFilterEnvVars(resolveDownloadFilter(mc, runtimeConfigSpec))...)
@@ -160,7 +191,8 @@ func buildDownloadJob(mc *aimv1alpha1.AIMArtifact, runtimeConfigSpec *aimv1alpha
 		},
 		Spec: batchv1.JobSpec{
 			BackoffLimit:            ptr.To(int32(2)),
-			TTLSecondsAfterFinished: ptr.To(int32(60 * 10)), // Cleanup after 10min to allow status observation
+			ActiveDeadlineSeconds:   ptr.To(downloadJobActiveDeadlineSeconds), // see const doc
+			TTLSecondsAfterFinished: ptr.To(int32(60 * 10)),                   // Cleanup after 10min to allow status observation
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{
 					Labels: map[string]string{
@@ -190,7 +222,7 @@ func buildDownloadJob(mc *aimv1alpha1.AIMArtifact, runtimeConfigSpec *aimv1alpha
 						{
 							Name:            "model-download",
 							Image:           downloadImage,
-							ImagePullPolicy: corev1.PullIfNotPresent,
+							ImagePullPolicy: pullPolicyForImage(downloadImage),
 							SecurityContext: &corev1.SecurityContext{
 								RunAsUser:  ptr.To(int64(1000)),
 								RunAsGroup: ptr.To(int64(1000)),
@@ -265,7 +297,7 @@ func buildCheckSizeJob(mc *aimv1alpha1.AIMArtifact, runtimeConfigSpec *aimv1alph
 						{
 							Name:            "check-size",
 							Image:           downloadImage,
-							ImagePullPolicy: corev1.PullIfNotPresent,
+							ImagePullPolicy: pullPolicyForImage(downloadImage),
 							Command:         []string{"/check-size.sh"},
 							Args:            []string{sourceURI},
 							Env:             envVars,

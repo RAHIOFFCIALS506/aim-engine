@@ -82,6 +82,17 @@ type AIMStorageConfig struct {
 	// Set to an empty object (downloadFilter: {}) to explicitly allow all files.
 	// +optional
 	DownloadFilter *AIMDownloadFilter `json:"downloadFilter,omitempty"`
+
+	// AdapterDiskStorageClassName is the storage class for the shared
+	// ReadWriteMany adapter disk. It must be RWX-capable (e.g. longhorn, NFS) and
+	// is resolved before the (typically RWO) DefaultStorageClassName.
+	// +optional
+	AdapterDiskStorageClassName *string `json:"adapterDiskStorageClassName,omitempty"`
+
+	// AdapterDiskSize is the cluster default size for the shared adapter disk PVC
+	// (built-in default when unset). An artifact's adapterDisk.size wins over it.
+	// +optional
+	AdapterDiskSize *resource.Quantity `json:"adapterDiskSize,omitempty"`
 }
 
 // AIMServiceRuntimeConfig contains runtime configuration fields that apply to services.
@@ -267,6 +278,23 @@ type AIMRuntimeRoutingConfig struct {
 	// with a validation error.
 	// +optional
 	GatewayRef *gatewayapiv1.ParentReference `json:"gatewayRef,omitempty"`
+
+	// Hostnames pins generated HTTPRoutes to these hostnames so a route only
+	// attaches to the matching Gateway listener instead of every listener on
+	// the parent gateway. Without a hostname, an HTTPRoute matches all of the
+	// parent gateway's listener hostnames, which can expose a service on
+	// listeners that do not enforce the intended authentication.
+	//
+	// This field is required when the parent gateway exposes more than one
+	// listener: in that case a service with routing enabled but no hostnames
+	// configured will not get an HTTPRoute and reports ConfigValid=False with
+	// reason RouteHostnameRequired. When the parent gateway has a single
+	// listener, leaving this empty preserves the existing behavior (the route
+	// inherits that listener's hostnames).
+	//
+	// Individual services can override this list via spec.routing.hostnames.
+	// +optional
+	Hostnames []gatewayapiv1.Hostname `json:"hostnames,omitempty"`
 
 	// PathTemplate defines the HTTP path template for routes, evaluated using JSONPath expressions.
 	// The template is rendered against the AIMService object to generate unique paths.

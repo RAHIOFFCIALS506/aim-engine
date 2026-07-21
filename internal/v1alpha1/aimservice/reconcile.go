@@ -26,6 +26,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	servingv1beta1 "github.com/kserve/kserve/pkg/apis/serving/v1beta1"
 	autoscalingv2 "k8s.io/api/autoscaling/v2"
@@ -37,6 +38,7 @@ import (
 	gatewayapiv1 "sigs.k8s.io/gateway-api/apis/v1"
 
 	aimv1alpha1 "github.com/amd-enterprise-ai/aim-engine/api/v1alpha1"
+	"github.com/amd-enterprise-ai/aim-engine/internal/aimadapter"
 	"github.com/amd-enterprise-ai/aim-engine/internal/constants"
 	controllerutils "github.com/amd-enterprise-ai/aim-engine/internal/controller/utils"
 	"github.com/amd-enterprise-ai/aim-engine/internal/v1alpha1/aimruntimeconfig"
@@ -80,7 +82,13 @@ type ServiceFetchResult struct {
 	inferenceServicePods   *controllerutils.FetchResult[*corev1.PodList]
 	hpa                    controllerutils.FetchResult[*autoscalingv2.HorizontalPodAutoscaler]
 	httpRoute              controllerutils.FetchResult[*gatewayapiv1.HTTPRoute]
+	gateway                controllerutils.FetchResult[*gatewayapiv1.Gateway]
 	templateCache          controllerutils.FetchResult[*aimv1alpha1.AIMTemplateCache]
+
+	// adapterDeps holds the per-adapter artifacts, staging Jobs, and resolved
+	// base-model artifact for spec.adapters. Populated only when the service
+	// declares adapters. See internal/aimadapter.
+	adapterDeps aimadapter.Dependencies
 }
 
 // FetchRemoteState fetches all resources needed for AIMService reconciliation.
@@ -128,6 +136,10 @@ func (r *ServiceReconciler) FetchRemoteState(
 	// 2. Fetch HTTPRoute if routing might be enabled (we own this, always check)
 	result.httpRoute = fetchHTTPRoute(ctx, c, service, result.mergedRuntimeConfig.Value)
 
+	// 2b. Fetch the parent Gateway so the host-pinning guard can see how many
+	// listeners it exposes (a multi-listener gateway requires a hostname pin).
+	result.gateway = fetchGateway(ctx, c, service, result.mergedRuntimeConfig.Value)
+
 	// 3. Fetch TemplateCache (always fetch - cascades health from Artifact/PVC)
 	// artifact status is resolved through TemplateCache.Status.Artifacts
 	result.templateCache = fetchTemplateCache(ctx, c, service)
@@ -153,6 +165,16 @@ func (r *ServiceReconciler) FetchRemoteState(
 		)
 	} else {
 		logger.V(1).Info("Transient error fetching InferenceService, skipping upstream fetch to avoid accidental changes")
+	}
+
+	// Adapter staging dependencies (spec.adapters). The parent model artifact is
+	// resolved via the template cache's resolved artifacts (keyed on the
+	// template's first model id); the remaining staging mechanics are shared via
+	// internal/aimadapter.
+	if aimadapter.IsActive(service) {
+		parentName, parentErr := resolveAdapterParentName(result)
+		result.adapterDeps = aimadapter.Fetch(ctx, c, service, parentName)
+		result.adapterDeps.ParentResolutionErr = parentErr
 	}
 
 	return result
@@ -190,11 +212,13 @@ func (obs ServiceObservation) GetComponentHealth(ctx context.Context, clientset 
 		health = append(health, obs.getInferenceServiceHealth())
 	}
 
-	// InferenceService pod health (downstream) - for ImagePull errors, pending states, etc.
-	if obs.inferenceServicePods != nil {
-		health = append(health, obs.inferenceServicePods.ToComponentHealthWithContext(
-			ctx, clientset, "InferenceServicePods", controllerutils.GetPodsHealth,
-		))
+	// InferenceService pod health (downstream). Under scale-to-zero an
+	// empty pod list is the desired state, so we report Ready instead of
+	// the default "no pods is a failure" verdict.
+	if podsHealth, ok := inferenceServicePodsHealth(
+		ctx, clientset, obs.service, obs.hpa, obs.inferenceServicePods,
+	); ok {
+		health = append(health, podsHealth)
 	}
 
 	// Cache health (if caching is enabled)
@@ -205,6 +229,32 @@ func (obs ServiceObservation) GetComponentHealth(ctx context.Context, clientset 
 
 	// HPA health (if autoscaling is configured)
 	health = append(health, obs.getHPAHealth())
+
+	// Adapter staging health (if the service declares adapters)
+	if aimadapter.IsActive(obs.service) {
+		health = append(health, aimadapter.Health(obs.adapterState, len(obs.service.Spec.Adapters)))
+	}
+
+	// Scale-from-zero requires routing; surface the invalid combination as
+	// ConfigValid=False instead of letting the service idle to a state it can
+	// never wake from.
+	if cfg := ScaleToZeroRoutingComponentHealth(obs.service, obs.mergedRuntimeConfig.Value); cfg.Component != "" {
+		health = append(health, cfg)
+	}
+
+	// Routing on a multi-listener gateway requires a hostname pin; otherwise
+	// the route attaches to every listener and can bypass authentication.
+	// Surface as ConfigValid=False (the route is also not created).
+	if cfg := RoutingHostnameComponentHealth(obs.service, obs.mergedRuntimeConfig.Value, obs.gateway); cfg.Component != "" {
+		health = append(health, cfg)
+	}
+
+	// Autoscaling configured but no trigger resolves -> ConfigValid=False,
+	// rather than stamping autoscalerClass=external with no ScaledObject to
+	// enforce the declared bounds.
+	if cfg := AutoscalingTriggerComponentHealth(obs.service); cfg.Component != "" {
+		health = append(health, cfg)
+	}
 
 	return health
 }
@@ -523,12 +573,25 @@ func (obs ServiceObservation) getHTTPRouteHealth() controllerutils.ComponentHeal
 }
 
 func (obs ServiceObservation) getHPAHealth() controllerutils.ComponentHealth {
+	return hpaComponentHealth(obs.service, obs.hpa, obs.observedPodCount(), obs.isInferenceServiceReady())
+}
+
+// hpaComponentHealth is the pipeline-agnostic HPA health verdict shared by the
+// template (v1alpha1) and profile (v1alpha2) pipelines. It takes the observed
+// predictor pod count and the InferenceService readiness as explicit inputs so
+// callers that model their observations differently can reuse the identical
+// scale-to-zero semantics. HPAComponentHealth (exports.go) is the exported
+// wrapper.
+func hpaComponentHealth(
+	service *aimv1alpha1.AIMService,
+	hpa controllerutils.FetchResult[*autoscalingv2.HorizontalPodAutoscaler],
+	podCount int,
+	isvcReady bool,
+) controllerutils.ComponentHealth {
 	health := controllerutils.ComponentHealth{
 		Component:      "HPA",
 		DependencyType: controllerutils.DependencyTypeDownstream,
 	}
-
-	service := obs.service
 
 	// Check if autoscaling is configured (HPA is expected)
 	hasAutoscaling := service.Spec.AutoScaling != nil ||
@@ -541,8 +604,8 @@ func (obs ServiceObservation) getHPAHealth() controllerutils.ComponentHealth {
 	}
 
 	// Autoscaling is configured - check if HPA exists
-	if obs.hpa.Error != nil {
-		if obs.hpa.IsNotFound() {
+	if hpa.Error != nil {
+		if hpa.IsNotFound() {
 			// HPA doesn't exist yet - KEDA may still be creating it
 			// This is expected during initial deployment, don't fail
 			health.State = constants.AIMStatusProgressing
@@ -553,13 +616,13 @@ func (obs ServiceObservation) getHPAHealth() controllerutils.ComponentHealth {
 		// Other fetch error
 		health.State = constants.AIMStatusFailed
 		health.Reason = "HPAFetchError"
-		health.Message = obs.hpa.Error.Error()
-		health.Errors = []error{obs.hpa.Error}
+		health.Message = hpa.Error.Error()
+		health.Errors = []error{hpa.Error}
 		return health
 	}
 
 	// HPA not found (no error but nil value)
-	if obs.hpa.Value == nil {
+	if hpa.Value == nil {
 		health.State = constants.AIMStatusProgressing
 		health.Reason = "HPANotFound"
 		health.Message = "Waiting for KEDA to create HorizontalPodAutoscaler"
@@ -567,17 +630,60 @@ func (obs ServiceObservation) getHPAHealth() controllerutils.ComponentHealth {
 	}
 
 	// HPA exists - check its conditions for operational status
-	hpa := obs.hpa.Value
-
-	// Check if InferenceService is ready (used to contextualize HPA condition failures)
-	isvcReady := obs.isInferenceServiceReady()
+	h := hpa.Value
 
 	// Get HPA conditions
-	ableToScale := getHPACondition(hpa, autoscalingv2.AbleToScale)
-	scalingActive := getHPACondition(hpa, autoscalingv2.ScalingActive)
+	ableToScale := getHPACondition(h, autoscalingv2.AbleToScale)
+	scalingActive := getHPACondition(h, autoscalingv2.ScalingActive)
 
 	// Check ScalingActive condition - indicates if HPA can get metrics and calculate replicas
 	if scalingActive == nil || scalingActive.Status != corev1.ConditionTrue {
+		// Under scale-to-zero the HPA's ScalingActive signal is about
+		// *waking* a sleeping deployment, not about *certifying* a
+		// serving one. The activation metric series may legitimately
+		// be empty (no traffic yet, user metric not produced by the
+		// workload, gateway scrape not run, etc.) for the entire
+		// lifetime of a healthy idle service. Pod / ISVC health is the
+		// source of truth for liveness here, so we never escalate the
+		// HPA to Failed *or* gate readiness on ScalingActive under
+		// scale-to-zero. Genuine HPA-side breakage still surfaces via
+		// the AbleToScale branch below (ScaleTargetNotReady) and via
+		// the HPA-missing branch above (HPANotFound).
+		//
+		// Three buckets under scale-to-zero, all of which are Ready
+		// from the HPA component's perspective:
+		//   1. KEDA's authoritative idle reason (ScalingDisabled) -> ScaledToZero.
+		//   2. No replicas running, no authoritative signal yet     -> ScaledToZero.
+		//   3. Replicas running                                     -> HPAOperational.
+		if isScaleToZero(service) {
+			// isScaleToZeroIdle is the shared idle predicate (also used by
+			// scaledToZeroNow) so the HPA verdict and the InferenceServicePods
+			// verdict never disagree under scale-to-zero.
+			if isScaleToZeroIdle(scalingActive, podCount) {
+				health.State = constants.AIMStatusReady
+				health.Reason = aimv1alpha1.AIMServiceReasonScaledToZero
+				switch {
+				case scalingActive != nil && scalingActive.Reason == hpaReasonScalingDisabled:
+					health.Message = "Service is idle: KEDA has scaled the deployment to zero replicas; will scale up when the configured trigger becomes active"
+				case scalingActive == nil:
+					health.Message = "Scale-to-zero: deployment is idle (no replicas running) and the HPA has not yet emitted a ScalingActive condition"
+				default:
+					health.Message = fmt.Sprintf("Scale-to-zero: deployment is idle (no replicas running); activation metric series not yet available (%s)", scalingActive.Reason)
+				}
+				return health
+			}
+			// Pods running: service is operational regardless of the
+			// HPA's metric state. Reason stays HPAOperational so the
+			// framework reads HPAReady=True.
+			health.State = constants.AIMStatusReady
+			health.Reason = "HPAOperational"
+			if scalingActive == nil {
+				health.Message = "Scale-to-zero: replicas running; HPA has not yet emitted a ScalingActive condition (does not gate readiness)"
+			} else {
+				health.Message = fmt.Sprintf("Scale-to-zero: replicas running; HPA ScalingActive=%s/%s (does not gate readiness)", scalingActive.Status, scalingActive.Reason)
+			}
+			return health
+		}
 		if !isvcReady {
 			// Expected during startup - ISVC pods not ready yet, so metrics aren't available
 			health.State = constants.AIMStatusProgressing
@@ -612,13 +718,62 @@ func (obs ServiceObservation) getHPAHealth() controllerutils.ComponentHealth {
 	return health
 }
 
+// inferenceServicePodsHealth reports the InferenceServicePods component health.
+// Under scale-to-zero an empty pod list is the desired state, so it reports
+// Ready (ScaledToZero) instead of the default "no pods is a failure" verdict;
+// otherwise it defers to the standard pod health inspector. Returns ok=false
+// when there is nothing to report (pods were never fetched). Pipeline-agnostic
+// so the profile pipeline produces identical pod health.
+func inferenceServicePodsHealth(
+	ctx context.Context,
+	clientset kubernetes.Interface,
+	service *aimv1alpha1.AIMService,
+	hpa controllerutils.FetchResult[*autoscalingv2.HorizontalPodAutoscaler],
+	pods *controllerutils.FetchResult[*corev1.PodList],
+) (controllerutils.ComponentHealth, bool) {
+	if pods == nil {
+		return controllerutils.ComponentHealth{}, false
+	}
+
+	if scaledToZeroNow(service, hpa, podItemCount(pods)) &&
+		pods.OK() && pods.Value != nil && len(pods.Value.Items) == 0 {
+		return controllerutils.ComponentHealth{
+			Component:      "InferenceServicePods",
+			State:          constants.AIMStatusReady,
+			Reason:         aimv1alpha1.AIMServiceReasonScaledToZero,
+			Message:        "Service is idle: KEDA has scaled the deployment to zero replicas; pods will be created on activity",
+			DependencyType: controllerutils.DependencyTypeDownstream,
+		}, true
+	}
+
+	// Predictor pods are a downstream resource the AIMService owns (controller →
+	// InferenceService → Deployment → pod), not a user-referenced upstream. The
+	// shared pod inspector classifies an unpullable image as a
+	// MissingUpstreamDependency, which the state engine treats as a blocking
+	// config error (ConfigValid=False, ShouldApply=false) — wrongly halting
+	// unrelated convergence such as adapter subtree GC. Demote it to a downstream
+	// dependency so a bad predictor image degrades readiness without blocking
+	// apply.
+	return controllerutils.DemoteUpstreamDependencyErrors(pods.ToComponentHealthWithContext(
+		ctx, clientset, "InferenceServicePods", controllerutils.GetPodsHealth,
+	)), true
+}
+
 // isInferenceServiceReady checks if the InferenceService has Ready=True condition.
 func (obs ServiceObservation) isInferenceServiceReady() bool {
-	if obs.inferenceService.Error != nil || obs.inferenceService.Value == nil {
+	return inferenceServiceReady(obs.inferenceService)
+}
+
+// inferenceServiceReady reports whether the fetched InferenceService has
+// Ready=True. Pipeline-agnostic so the profile pipeline can contextualize HPA
+// health identically.
+func inferenceServiceReady(
+	isvc controllerutils.FetchResult[*servingv1beta1.InferenceService],
+) bool {
+	if isvc.Error != nil || isvc.Value == nil {
 		return false
 	}
-	isvc := obs.inferenceService.Value
-	for _, cond := range isvc.Status.Conditions {
+	for _, cond := range isvc.Value.Status.Conditions {
 		if cond.Type == "Ready" && cond.Status == "True" {
 			return true
 		}
@@ -634,6 +789,89 @@ func getHPACondition(hpa *autoscalingv2.HorizontalPodAutoscaler, condType autosc
 		}
 	}
 	return nil
+}
+
+// hpaReasonScalingDisabled is the reason emitted by the K8s HPA on
+// ScalingActive=False when the target has zero replicas (KEDA drives the
+// Deployment directly under scale-to-zero). Not exported by client-go.
+const hpaReasonScalingDisabled = "ScalingDisabled"
+
+// isScaleToZero reports whether the user opted into scale-to-zero.
+func isScaleToZero(service *aimv1alpha1.AIMService) bool {
+	if service == nil || service.Spec.MinReplicas == nil {
+		return false
+	}
+	return *service.Spec.MinReplicas == 0
+}
+
+// observedPodCount returns the number of predictor pods observed in the
+// last fetch. Returns 0 when pods were not fetched or the fetch failed;
+// callers that need to distinguish "no pods" from "unknown" should
+// inspect obs.inferenceServicePods directly. Used by getHPAHealth to
+// discriminate idle vs. 0->1 warmup under scale-to-zero.
+func (obs ServiceObservation) observedPodCount() int {
+	return podItemCount(obs.inferenceServicePods)
+}
+
+// podItemCount returns the number of pods in a (possibly nil) pod-list fetch
+// result, treating a missing or failed fetch as zero. Pipeline-agnostic so the
+// profile pipeline can derive the same idle verdict.
+func podItemCount(pods *controllerutils.FetchResult[*corev1.PodList]) int {
+	if pods == nil || !pods.OK() || pods.Value == nil {
+		return 0
+	}
+	return len(pods.Value.Items)
+}
+
+// isScaledToZero reports whether the service is currently idled under
+// scale-to-zero. Thin wrapper over scaledToZeroNow using this observation's
+// fetched HPA and pod count.
+func (obs ServiceObservation) isScaledToZero() bool {
+	return scaledToZeroNow(obs.service, obs.hpa, obs.observedPodCount())
+}
+
+// scaledToZeroNow reports whether the service is currently idled under
+// scale-to-zero -- scale-to-zero is enabled, the HPA is observable, it is not
+// actively scaling a running deployment (ScalingActive!=True), and the shared
+// isScaleToZeroIdle predicate considers it idle. Used to treat empty pod lists
+// as the healthy desired state. Pipeline-agnostic (shared with v1alpha2).
+func scaledToZeroNow(
+	service *aimv1alpha1.AIMService,
+	hpa controllerutils.FetchResult[*autoscalingv2.HorizontalPodAutoscaler],
+	podCount int,
+) bool {
+	if !isScaleToZero(service) {
+		return false
+	}
+	if hpa.Value == nil {
+		return false
+	}
+	scalingActive := getHPACondition(hpa.Value, autoscalingv2.ScalingActive)
+	// ScalingActive=True means the HPA is actively managing a running
+	// deployment -- not idle.
+	if scalingActive != nil && scalingActive.Status == corev1.ConditionTrue {
+		return false
+	}
+	return isScaleToZeroIdle(scalingActive, podCount)
+}
+
+// isScaleToZeroIdle reports whether a scale-to-zero service is currently idle
+// (scaled, or being scaled, to zero replicas). It is the single idle predicate
+// shared by getHPAHealth and scaledToZeroNow so the HPA verdict and the
+// InferenceServicePods verdict can never disagree.
+//
+// Callers must have already established that scale-to-zero is enabled and that
+// ScalingActive is not True. scalingActive is the HPA's ScalingActive
+// condition and may be nil if the HPA has not emitted it yet.
+func isScaleToZeroIdle(scalingActive *autoscalingv2.HorizontalPodAutoscalerCondition, podCount int) bool {
+	// KEDA's authoritative idle reason: idle regardless of the observed pods.
+	if scalingActive != nil && scalingActive.Reason == hpaReasonScalingDisabled {
+		return true
+	}
+	// ScalingActive absent (not emitted yet) or False with a non-authoritative
+	// reason (e.g. the activation metric series is not available yet): idle iff
+	// no predictor pods are running.
+	return podCount == 0
 }
 
 func (obs ServiceObservation) getCacheHealth() controllerutils.ComponentHealth {
@@ -738,6 +976,10 @@ type ServiceObservation struct {
 	// runtimeStatus captures the computed runtime status including replica counts and resource usage.
 	// Derived in ComposeState from the InferenceService and pods.
 	runtimeStatus *aimv1alpha1.AIMServiceRuntimeStatus
+
+	// adapterState is the computed adapter staging state (spec.adapters),
+	// produced in ComposeState by the shared internal/aimadapter engine.
+	adapterState aimadapter.State
 }
 
 // ComposeState creates the observation from fetched data, deriving semantic state.
@@ -784,6 +1026,12 @@ func (r *ServiceReconciler) ComposeState(
 	// Compute runtime status from InferenceService and pods
 	obs.runtimeStatus = ComputeRuntimeStatus(fetch.service, fetch.hpa)
 
+	// Validate and interpret declared adapters (spec.adapters), and keep computing
+	// while removed adapters are still being reclaimed (status carries Deleting).
+	if aimadapter.IsActive(fetch.service) {
+		obs.adapterState = aimadapter.Compose(fetch.service, fetch.adapterDeps)
+	}
+
 	return obs
 }
 
@@ -815,9 +1063,20 @@ func (r *ServiceReconciler) PlanResources(
 		planResult.Apply(route)
 	}
 
-	// Get resolved template info
+	// Resolve template up front so planScaledObject can read the merged
+	// predictor resources for the memory-aware cooldown. Template-dependent
+	// planning below still gates on AIMStatusReady.
 	templateName, templateNamespace, templateSpec, templateStatus := obs.getResolvedTemplate()
 	_ = templateNamespace // Used for future enhancements
+
+	// 1c. Plan the KEDA ScaledObject. effectiveResources may be nil while
+	// the template is still resolving; planScaledObject falls back to a
+	// flat cooldown and the next reconcile re-plans idempotently.
+	effectiveResources := resolveEffectiveResources(service, templateSpec, templateStatus)
+	if so := planScaledObject(ctx, service, effectiveResources); so != nil {
+		planResult.Apply(so)
+	}
+
 	if templateName == "" {
 		logger.V(1).Info("no template resolved, skipping template-dependent resource planning")
 		return planResult
@@ -869,9 +1128,56 @@ func (r *ServiceReconciler) PlanResources(
 		planResult.Apply(cm)
 	}
 
-	// 5. Plan InferenceService
+	// 4b. Adapter staging (spec.adapters). Adapters load dynamically, so the ISVC
+	// is never gated on downloads: we ensure the per-service subtree exists and
+	// stage adapters asynchronously (the aim-runtime hot-loads each as it lands).
+	// ISVC *creation* is gated only on the subtree being mountable (config valid
+	// + adapter disk resolved + subtree dir present); a config error keeps the
+	// ISVC from being created and surfaces via the Adapters component health.
+	// Once the ISVC exists, adapter add/remove never blocks its updates.
+	// Run the adapter engine while adapters are declared OR still being reclaimed
+	// (a removal — including dropping the last adapter — drives its prune Job to
+	// completion via status-carried Deleting entries).
+	if aimadapter.IsActive(service) {
+		aimadapter.Plan(&planResult, service, obs.adapterDeps, obs.adapterState, obs.mergedRuntimeConfig.Value)
+	}
+	// ISVC creation is gated whenever the service needs the adapter disk —
+	// adapters declared, or dynamic mode (which mounts even at zero adapters) —
+	// because the read-only subPath mount requires the subtree directory to exist
+	// before the pod starts (the aim-runtime errors on a missing subPath). This
+	// gate is on the subtree being mountable, never on downloads.
+	isvcExists := obs.inferenceService.OK() && obs.inferenceService.Value != nil
+	if service.Spec.AdaptersEnabled() {
+		if !isvcExists && !obs.adapterState.Ready {
+			logger.V(1).Info("Adapter subtree not mountable yet; deferring ISVC creation",
+				"configErr", obs.adapterState.ConfigErr,
+				"adapterDiskPVC", obs.adapterState.AdapterDiskPVC,
+				"subtreeReady", obs.adapterState.SubtreeReady)
+			return planResult
+		}
+	}
+
+	// 5. Plan InferenceService. When the service needs the adapter disk, mount the
+	// service's adapter subtree read-only at /adapters — present even at zero
+	// adapters in dynamic mode, so add/remove never restarts the pod.
 	if isvc := planInferenceService(ctx, service, templateName, templateSpec, templateStatus, obs); isvc != nil {
-		planResult.Apply(isvc)
+		switch {
+		case aimadapter.PreserveExistingMount(service, obs.adapterState) && isvcExists:
+			// Preserve-on-unknown: the adapter disk PVC didn't resolve this cycle.
+			// Re-applying would drop the adapter mount and restart the running
+			// predictor, so leave the existing ISVC untouched and retry.
+			logger.V(1).Info("Adapter disk PVC unresolved; preserving running ISVC adapter wiring")
+			if planResult.RequeueAfter == 0 {
+				planResult.RequeueAfter = 5 * time.Second
+			}
+		default:
+			if service.Spec.AdaptersEnabled() {
+				if isvcObj, ok := isvc.(*servingv1beta1.InferenceService); ok {
+					aimadapter.AddVolumeMount(isvcObj, service, obs.adapterState.AdapterDiskPVC)
+				}
+			}
+			planResult.Apply(isvc)
+		}
 	}
 
 	return planResult
@@ -973,5 +1279,10 @@ func (r *ServiceReconciler) DecorateStatus(
 	// Set runtime status (replica counts and resource usage)
 	if obs.runtimeStatus != nil {
 		status.Runtime = obs.runtimeStatus
+	}
+
+	// Mirror adapter staging state (spec.adapters) and any in-flight removals.
+	if aimadapter.IsActive(obs.service) {
+		aimadapter.DecorateStatus(status, obs.adapterState)
 	}
 }

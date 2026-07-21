@@ -30,8 +30,9 @@ kubectl get aimservice <name> -n <namespace> -o jsonpath='{.status.conditions}' 
 
 | Blocked Component | Likely Cause |
 |------------------|-------------|
+| Profile (v1alpha2) | No profile matched `spec.profile` / `spec.model.name` / `spec.model.image` — verify the profile exists or that the model produces deployable profiles |
 | Model | Model not found — check `model.name` spelling or `model.image` accessibility |
-| Template | No matching template — verify templates exist and are `Ready` |
+| Template (v1alpha1) | No matching template — verify templates exist and are `Ready` |
 | RuntimeConfig | Runtime config not found or invalid |
 
 ### Service Stuck in "Starting"
@@ -60,7 +61,35 @@ Common causes:
 - **Insufficient resources** — Not enough GPU, memory, or CPU available
 - **PVC not binding** — Storage class doesn't support RWX, or insufficient capacity
 
-### Template Selection Fails
+### Profile Resolution Fails (v1alpha2)
+
+**`ProfileReady=False` with reason `ProfileNotFound`:**
+
+```bash
+# List profiles in the namespace and cluster-scoped
+kubectl get aimprofile -n <namespace>
+kubectl get aimclusterprofile
+
+# Filter to profiles produced by a specific model
+kubectl get aimprofile -n <namespace> \
+  -l aim.eai.amd.com/source-model=<model-name> \
+  -o custom-columns=NAME:.metadata.name,DEPLOYABLE:.status.deployable,READY:.status.ready
+```
+
+Profiles may be filtered out because:
+
+- `status.deployable=false` (base profile — only usable as a derivation source, not as a service target).
+- `status.ready=false` (discovery / derivation hasn't completed yet).
+- The required accelerator is not present in the cluster.
+- `spec.profile.selector` over-narrowed and matched zero profiles.
+
+For `spec.model.image` with the `aim.eai.amd.com/reconciler-pipeline: profile` annotation, the resolver auto-creates a dedicated `AIMModel`; check that the auto-model itself has `deployable > 0`:
+
+```bash
+kubectl get aimmodel -n <namespace> -l aim.eai.amd.com/origin=auto-generated
+```
+
+### Template Selection Fails (v1alpha1, legacy pipeline)
 
 **"No templates found":**
 
@@ -86,7 +115,10 @@ Multiple templates scored equally. Resolve by specifying `template.name` explici
 ### Cache or Artifact Failures
 
 ```bash
-# Check template cache
+# Check profile cache (v1alpha2)
+kubectl get aimprofilecache -n <namespace>
+
+# Or template cache (v1alpha1)
 kubectl get aimtemplatecache -n <namespace>
 
 # Check artifacts
@@ -120,6 +152,24 @@ Common causes:
 - Gateway doesn't exist or isn't ready
 - `routing.enabled` is not set (check runtime config)
 - Gateway namespace mismatch in `gatewayRef`
+
+### Scale-to-Zero Service Rejected (`RoutingRequiredForScaleToZero`)
+
+A service with `spec.minReplicas: 0` reports `ConfigValid=False` and never creates its runtime:
+
+```bash
+kubectl get aimservice <name> -o jsonpath='{.status.conditions}' | jq
+kubectl get events --field-selector reason=RoutingRequiredForScaleToZero -n <namespace>
+```
+
+Cause: scale-from-zero needs routing enabled — the 0->1 activation trigger reads gateway-side Envoy metrics that only exist once an `HTTPRoute` is created. With routing disabled the service could never wake, so AIM Engine rejects the spec.
+
+Fix one of:
+
+- Enable routing on the service (`spec.routing.enabled: true` with a `gatewayRef`), or set a cluster-wide default (`runtimeConfig.routing.enabled`). See [Routing and Ingress](../guides/routing-and-ingress.md).
+- Set `minReplicas >= 1` if you don't want scale-to-zero.
+
+See [ScaleToZeroConfig](../reference/conditions.md#scaletozeroconfig) for the full condition reference.
 
 ## Operator Logs
 

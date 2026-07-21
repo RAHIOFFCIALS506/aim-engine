@@ -1,17 +1,89 @@
 # Image URL to use all building/pushing image targets
 TAG ?= $(shell git describe --tags --abbrev=0 2>/dev/null || echo "latest")
 GIT_ORG ?= $(shell git remote get-url origin 2>/dev/null | sed -n 's|.*github\.com[:/]\([^/]*\)/.*|\1|p')
-IMG ?= ghcr.io/$(GIT_ORG)/aim-engine:$(TAG)
-ARTIFACT_DOWNLOADER_IMG ?= ghcr.io/silogen/aim-artifact-downloader:$(TAG)
+# Default operator image repo for local-dev builds. Fork-aware: silogen pushes
+# to docker.io/silogenai (private), everyone else (notably amd-enterprise-ai)
+# uses the public docker.io/amdenterpriseai mirror. CI always overrides via IMG.
+ifeq ($(GIT_ORG),silogen)
+IMG_REPO ?= docker.io/silogenai/aim-engine
+else
+IMG_REPO ?= docker.io/amdenterpriseai/aim-engine
+endif
+IMG ?= $(IMG_REPO):$(TAG)
+# Default to the public docker.io/amdenterpriseai mirror so non-CI builds
+# (and the amd-enterprise-ai public release flow) produce a binary whose
+# compiled-in artifact-downloader default is publicly pullable. Silogen-private
+# CI overrides this to docker.io/silogenai/aim-artifact-downloader at build time.
+ARTIFACT_DOWNLOADER_IMG ?= docker.io/amdenterpriseai/aim-artifact-downloader:$(TAG)
 LDFLAGS ?= -X 'github.com/amd-enterprise-ai/aim-engine/api/v1alpha1.DefaultDownloadImage=$(ARTIFACT_DOWNLOADER_IMG)'
+
+# AIM_DUMMY_TAG pins the aim-dummy test image referenced by every e2e fixture
+# (BYO base-image, custom-model, discovery, etc.). AIM_DUMMY_IMAGE is the
+# fully-qualified public ref the fixtures hardcode: in kind we build it from
+# images/aim-dummy/ and `kind load` it under this exact ref so kubelet's
+# IfNotPresent finds it locally and never pulls; on cloud/GPU envs the same ref
+# resolves to the public docker.io/amdenterpriseai mirror. Bumping the tag here
+# also requires updating the AIM_DUMMY_TAG env var in
+# .github/workflows/test-e2e.yml and .github/workflows/compile-release.yaml so
+# dev / CI stay in sync.
+AIM_DUMMY_TAG ?= 0.2.0
+AIM_DUMMY_IMAGE ?= docker.io/amdenterpriseai/aim-dummy:$(AIM_DUMMY_TAG)
+
+# --- ttl.sh ephemeral-registry fallback (pre-publish dev / CI loop) ----------
+# AIMModel discovery reads a model image's OCI labels *inside the operator* via
+# go-containerregistry remote.Get (see internal/v1alpha1/aimmodel/inspector.go).
+# `kind load` only satisfies kubelet pod pulls, NOT that in-operator registry
+# read, so discovery against a not-yet-public ref (e.g. the new
+# docker.io/amdenterpriseai mirror before it's published) fails with
+# UNAUTHORIZED -> AIMModel Degraded. Publishing to the public mirror is slow and
+# gated, which is impractical when iterating on operator logic. `make
+# test-chainsaw-kind-ttl` instead builds aim-dummy, pushes it to ttl.sh
+# (anonymous, public, ephemeral), and runs the kind suite against a throwaway
+# copy of tests/e2e whose hardcoded aim-dummy ref is rewritten to the ttl.sh
+# ref. Content-addressed so unchanged source re-uses the same push. Recursively
+# expanded (=) so the find/hash only runs when a ttl target is invoked.
+#
+# The TAG is preserved per fixture: the operator derives
+# AIMProfile/AIMServiceTemplate .status.version from the image tag (see image
+# discovery), and some fixtures assert version == their tag (e.g. 0.2.0).
+# Fixtures may reference multiple tags (e.g. 0.2.0 and 0.2.1) because aim-dummy
+# is backwards- but not always forward-compatible: tests written against an
+# older tag still pass on newer content, but newer-tag tests need newer content.
+# We therefore build images/aim-dummy ONCE (always the latest, backwards-compat
+# source) and push it under EVERY tag the fixtures reference, all into the same
+# content-addressed repo. The rewrite only swaps the repo prefix and keeps the
+# tag, so tag-derived version assertions still hold. Uniqueness/TTL lives in the
+# repo NAME via the source hash, not the tag. ttl.sh accepts a non-duration tag
+# and applies its default TTL (24h).
+TTL_REGISTRY ?= ttl.sh
+AIM_DUMMY_SRC_HASH = $(shell find images/aim-dummy -type f -exec sha256sum {} \; | sort | sha256sum | cut -c1-16)
+TTL_AIM_DUMMY_REPO ?= $(TTL_REGISTRY)/aim-engine-e2e-aim-dummy-$(AIM_DUMMY_SRC_HASH)
+TTL_AIM_DUMMY_IMAGE ?= $(TTL_AIM_DUMMY_REPO):$(AIM_DUMMY_TAG)
 
 # Helm chart configuration
 CHART_NAME ?= aim-engine-chart
 CRDS_CHART_NAME ?= aim-engine-crds-chart
 CHART_VERSION ?= $(shell git describe --tags --abbrev=0 2>/dev/null | sed 's/^v//' || echo "0.1.0")
 APP_VERSION ?= $(TAG)
-CHART_OCI_REGISTRY ?= ghcr.io
-CHART_OCI_OWNER ?= $(GIT_ORG)
+# Image baked into the packaged chart's values.yaml. CI always overrides via
+# CHART_IMAGE_REPO. For local-dev runs of `make helm-package`, silogen builds
+# reference docker.io/silogenai (the private dev mirror); everything else
+# (notably the amd-enterprise-ai official fork) references the public
+# docker.io/amdenterpriseai org that end users actually pull from.
+ifeq ($(GIT_ORG),silogen)
+CHART_IMAGE_REPO ?= docker.io/silogenai/aim-engine
+else
+CHART_IMAGE_REPO ?= docker.io/amdenterpriseai/aim-engine
+endif
+CHART_IMAGE_TAG  ?= $(TAG)
+# OCI registry receiving the packaged Helm + CRDs charts. Same fork-aware
+# split as CHART_IMAGE_REPO; CI overrides via CHART_OCI_REPO env.
+CHART_OCI_REGISTRY ?= registry-1.docker.io
+ifeq ($(GIT_ORG),silogen)
+CHART_OCI_OWNER ?= silogenai
+else
+CHART_OCI_OWNER ?= amdenterpriseai
+endif
 CHART_OCI_REPO ?= oci://$(CHART_OCI_REGISTRY)/$(CHART_OCI_OWNER)
 
 # Cluster environment configuration
@@ -121,6 +193,11 @@ kind-create: manifests ## Create kind cluster with all dependencies for local de
 	@# Install core dependencies (cert-manager, kgateway, kserve)
 	@echo "Installing core dependencies..."
 	@helmfile sync -f hack/dependencies/helmfile.yaml.gotmpl
+	@# Install scale-from-zero activation prereq (kgateway-metrics-collector).
+	@# Cluster-wide OpenTelemetryCollector that scrapes Envoy from kgateway
+	@# data-plane pods and forwards the request counter to keda-otel-scaler;
+	@# required for AIMServices with spec.minReplicas: 0 to ever activate.
+	@$(MAKE) install-scale-from-zero-prereq
 	@# Install kind-specific dependencies (NFS server + csi-driver-nfs)
 	@echo "Installing kind-specific dependencies..."
 	@helmfile sync -f hack/kind/helmfile.yaml.gotmpl
@@ -132,12 +209,13 @@ kind-create: manifests ## Create kind cluster with all dependencies for local de
 	@$(MAKE) seaweedfs-init-bucket
 	@$(MAKE) seaweedfs-default-config
 	@$(MAKE) cache-warm
-	@# Pre-load test images for faster e2e tests
-	@echo "Pre-loading test images..."
-	@for tag in 0.1.8 0.1.9 0.1.10; do \
-		docker pull ghcr.io/silogen/aim-dummy:$$tag 2>/dev/null || true; \
-		kind load docker-image ghcr.io/silogen/aim-dummy:$$tag --name aim-engine 2>/dev/null || true; \
-	done
+	@# Build the aim-dummy test image locally and load it under the exact public
+	@# ref the e2e fixtures reference, so kind serves it via IfNotPresent without
+	@# pulling from docker.io.
+	@echo "Building aim-dummy test image ($(AIM_DUMMY_IMAGE))..."
+	@docker build -t $(AIM_DUMMY_IMAGE) images/aim-dummy
+	@echo "Loading aim-dummy image into kind..."
+	@kind load docker-image $(AIM_DUMMY_IMAGE) --name aim-engine 2>/dev/null || true
 	@echo ""
 	@echo "=== Kind cluster setup complete ==="
 	@echo "Run 'make watch' to start the operator with live reload."
@@ -154,12 +232,29 @@ seaweedfs-default-config: ## Apply default AIMClusterRuntimeConfig with S3 cache
 	@echo "Applying default AIMClusterRuntimeConfig..."
 	@kubectl apply -f hack/default-cluster-runtime-config.yaml
 
+.PHONY: install-scale-from-zero-prereq
+install-scale-from-zero-prereq: ## Install kgateway-metrics-collector (scale-from-zero activation prereq).
+	@echo "Installing scale-from-zero prereq (kgateway-metrics-collector)..."
+	@kubectl apply -f config/prereqs/scale-from-zero/kgateway-metrics-collector.yaml
+	@echo "Waiting for kgateway-metrics-collector deployment..."
+	@kubectl -n keda rollout status deploy/kgateway-metrics-collector --timeout=180s
+
 .PHONY: cache-warm
 cache-warm: ## Pre-warm the S3 artifact cache with test models.
 	@echo "Pre-warming S3 artifact cache..."
 	@kubectl delete job cache-warm -n aim-system --ignore-not-found
 	@kubectl apply -f hack/cache-warm-job.yaml
-	@kubectl wait --for=condition=complete job/cache-warm -n aim-system --timeout=10m
+	@if ! kubectl wait --for=condition=complete job/cache-warm -n aim-system --timeout=10m; then \
+		echo "::group::cache-warm job failed - diagnostics"; \
+		echo "=== job ==="; kubectl get job cache-warm -n aim-system -o wide || true; \
+		echo "=== pods ==="; kubectl get pods -n aim-system -l job-name=cache-warm -o wide || true; \
+		echo "=== describe pods ==="; kubectl describe pods -n aim-system -l job-name=cache-warm || true; \
+		echo "=== downloader (initContainer) logs ==="; kubectl logs -n aim-system -l job-name=cache-warm -c downloader --tail=300 --prefix || true; \
+		echo "=== uploader logs ==="; kubectl logs -n aim-system -l job-name=cache-warm -c uploader --tail=200 --prefix || true; \
+		echo "=== recent aim-system events ==="; kubectl get events -n aim-system --sort-by=.lastTimestamp | tail -40 || true; \
+		echo "::endgroup::"; \
+		exit 1; \
+	fi
 	@echo "S3 cache warm complete."
 
 .PHONY: kind-delete
@@ -180,17 +275,29 @@ cleanup-test-e2e: ## Tear down the Kind cluster used for e2e tests
 # Config and selector are applied automatically based on ENV
 CHAINSAW_TEST_DIR := tests/e2e
 CHAINSAW_REPORT_DIR := .tmp/chainsaw-reports
+# Per-failed-test debug bundles (pod logs, describe, events) written by the
+# config-level chainsaw `catch`. Exported as an absolute path because chainsaw
+# runs catch scripts from each test's own directory. CI uploads it as an artifact.
+CHAINSAW_DEBUG_DIR := .tmp/chainsaw-debug
 CHAINSAW_CONFIG_DIR := tests/chainsaw/config
 
-# Kind environment: exclude tests requiring GPU, longhorn storage, or external
-# network. `tier notin (manual)` excludes expensive / operator-gated tests that
-# shouldn't run by default (e.g. multi-hundred-GiB live model downloads).
-CHAINSAW_SELECTOR_KIND := requires notin (gpu,longhorn,hf_token,nfd),tier notin (manual)
+# needs-secret tags tests with environmental credential prerequisites
+# (HF token in aim-system, Docker Hub pull secret for docker.io/silogenai, etc.)
+# that aren't universally provisioned. Excluded from both default selectors;
+# opt-in by overriding the selector or pointing CHAINSAW_TEST_DIR at the
+# specific test directory.
+CHAINSAW_NEEDS_SECRET_EXCLUDE := needs-secret notin (hf_token,dockerhub_pull_secret)
 
-# GPU environment: exclude tests that only work on Kind (mocked node labels).
-# `tier notin (manual)` excludes expensive tests — run those explicitly by
-# pointing CHAINSAW_TEST_DIR at the specific test directory.
-CHAINSAW_SELECTOR_GPU := requires notin (kind,hf_token,nfd),tier notin (manual)
+# Kind environment: exclude tests requiring GPU, longhorn storage, external
+# network, or an HF token. Expensive / operator-gated tests (e.g. multi-hundred-
+# GiB live model downloads) gate themselves via one of these `requires` values
+# (e.g. requires=hf_token) rather than a separate tier axis.
+CHAINSAW_SELECTOR_KIND := requires notin (gpu,longhorn,hf_token,nfd),$(CHAINSAW_NEEDS_SECRET_EXCLUDE)
+
+# GPU environment: exclude tests that only work on Kind (mocked node labels) or
+# need an HF token. GPU tests are otherwise fully end-to-end. Run an excluded
+# test explicitly by invoking chainsaw directly against its dir without a selector.
+CHAINSAW_SELECTOR_GPU := requires notin (kind,hf_token,nfd),$(CHAINSAW_NEEDS_SECRET_EXCLUDE)
 
 # Select appropriate config based on ENV and CI detection
 # CI is detected via CI env var (set by GitHub Actions, GitLab CI, etc.)
@@ -207,8 +314,8 @@ test-chainsaw: ## Run chainsaw e2e tests (selector based on ENV). Pass CHAINSAW_
 	@echo "Environment: $(ENV) (context: $(CURRENT_CONTEXT))"
 	@echo "Config: $(CHAINSAW_ENV_CONFIG)"
 	@echo "Selector: $(if $(filter gpu,$(ENV)),$(CHAINSAW_SELECTOR_GPU),$(CHAINSAW_SELECTOR_KIND))"
-	@mkdir -p $(CHAINSAW_REPORT_DIR)
-	@PATH="$(CURDIR)/hack:$(PATH)" chainsaw test --full-name --test-dir $(CHAINSAW_TEST_DIR) \
+	@mkdir -p $(CHAINSAW_REPORT_DIR) $(CHAINSAW_DEBUG_DIR)
+	@CHAINSAW_DEBUG_DIR="$(CURDIR)/$(CHAINSAW_DEBUG_DIR)" PATH="$(CURDIR)/hack:$(PATH)" chainsaw test --full-name --test-dir $(CHAINSAW_TEST_DIR) \
 		--config $(CHAINSAW_ENV_CONFIG) \
 		$(CHAINSAW_ENV_SELECTOR) \
 		--report-format JSON --report-name chainsaw-report --report-path $(CHAINSAW_REPORT_DIR) \
@@ -218,9 +325,76 @@ test-chainsaw: ## Run chainsaw e2e tests (selector based on ENV). Pass CHAINSAW_
 test-chainsaw-kind: ## Run chainsaw e2e tests for KIND environment
 	$(MAKE) test-chainsaw ENV=kind
 
+.PHONY: aim-dummy-ttl-push
+aim-dummy-ttl-push: ## Build aim-dummy once and push it to ephemeral ttl.sh refs under every tag the fixtures reference (also loads it into the local docker daemon).
+	@set -euo pipefail; \
+	tags=$$(grep -rhoE 'docker\.io/amdenterpriseai/aim-dummy:[A-Za-z0-9._-]+' "$(CHAINSAW_TEST_DIR)" | sed 's|^.*:||' | sort -u); \
+	if [ -z "$$tags" ]; then echo "ERROR: no aim-dummy refs found under $(CHAINSAW_TEST_DIR)"; exit 1; fi; \
+	echo "Building aim-dummy -> $(TTL_AIM_DUMMY_REPO) (source hash $(AIM_DUMMY_SRC_HASH))"; \
+	echo "Fixture tags -> $$(echo $$tags | tr '\n' ' ')"; \
+	first=$$(printf '%s\n' $$tags | head -n1); \
+	: "--load works with both the default 'docker' driver and the"; \
+	: "'docker-container' driver that setup-buildx-action installs in CI, so the"; \
+	: "image lands in the local daemon for the subsequent push + kind load."; \
+	docker buildx build --provenance=false --sbom=false --load -t "$(TTL_AIM_DUMMY_REPO):$$first" images/aim-dummy; \
+	for t in $$tags; do \
+		[ "$$t" = "$$first" ] || docker tag "$(TTL_AIM_DUMMY_REPO):$$first" "$(TTL_AIM_DUMMY_REPO):$$t"; \
+		docker push "$(TTL_AIM_DUMMY_REPO):$$t"; \
+	done
+
+.PHONY: test-chainsaw-kind-ttl
+test-chainsaw-kind-ttl: aim-dummy-ttl-push ## Run kind e2e against an ephemeral ttl.sh aim-dummy (use while amdenterpriseai images aren't public yet).
+	@set -euo pipefail; \
+	ttl_dir="$(CHAINSAW_TEST_DIR)-ttl"; \
+	echo "Loading $(TTL_AIM_DUMMY_REPO) tags into kind cluster '$(KIND_CLUSTER)' (best-effort; pods otherwise pull from public ttl.sh)"; \
+	for t in $$(grep -rhoE 'docker\.io/amdenterpriseai/aim-dummy:[A-Za-z0-9._-]+' "$(CHAINSAW_TEST_DIR)" | sed 's|^.*:||' | sort -u); do \
+		kind load docker-image "$(TTL_AIM_DUMMY_REPO):$$t" --name $(KIND_CLUSTER) 2>/dev/null || true; \
+	done; \
+	rm -rf "$$ttl_dir"; cp -r "$(CHAINSAW_TEST_DIR)" "$$ttl_dir"; \
+	trap 'rm -rf "$$ttl_dir"' EXIT; \
+	echo "Rewriting docker.io/amdenterpriseai/aim-dummy:<tag> -> $(TTL_AIM_DUMMY_REPO):<tag> across $$ttl_dir"; \
+	matches=$$(grep -rlF "docker.io/amdenterpriseai/aim-dummy:" "$$ttl_dir" || true); \
+	if [ -z "$$matches" ]; then echo "ERROR: no fixtures under $$ttl_dir reference docker.io/amdenterpriseai/aim-dummy:"; exit 1; fi; \
+	echo "$$matches" | xargs sed -i "s|docker.io/amdenterpriseai/aim-dummy:|$(TTL_AIM_DUMMY_REPO):|g"; \
+	: "Cascade: derivation tests assert a derived image that RebaseRegistry grafts"; \
+	: "onto the *source* image's registry+org. With the ttl source ref the prefix"; \
+	: "collapses to '$(TTL_REGISTRY)', so rewrite the docker.io/amdenterpriseai aim-base"; \
+	: "assertions to match (tag preserved). No-op for the real-CI docker.io ref."; \
+	: "EXCLUDE image-discovery-happy-path: its status.baseImage is the literal"; \
+	: "AIM_BASE_IMAGE_REF env baked into aim-dummy (NOT rebased), so it stays"; \
+	: "docker.io/amdenterpriseai/aim-base:dummy regardless of the source registry."; \
+	base_matches=$$(grep -rlF "docker.io/amdenterpriseai/aim-base:" "$$ttl_dir" | grep -vE '/image-discovery-happy-path(-ttl)?/' || true); \
+	if [ -n "$$base_matches" ]; then \
+		echo "$$base_matches" | xargs sed -i "s|docker.io/amdenterpriseai/aim-base:|$(TTL_REGISTRY)/aim-base:|g"; \
+	fi; \
+	$(MAKE) test-chainsaw ENV=kind CHAINSAW_TEST_DIR="$$ttl_dir"
+
 .PHONY: test-chainsaw-gpu
 test-chainsaw-gpu: ## Run chainsaw e2e tests for GPU environment
 	$(MAKE) test-chainsaw ENV=gpu
+
+.PHONY: test-chainsaw-gpu-ttl
+test-chainsaw-gpu-ttl: aim-dummy-ttl-push ## Run GPU e2e against an ephemeral ttl.sh aim-dummy (use while amdenterpriseai images aren't public yet). GPU nodes pull the image from public ttl.sh; the operator reads its OCI labels from there too.
+	@set -euo pipefail; \
+	ttl_dir="$(CHAINSAW_TEST_DIR)-ttl"; \
+	rm -rf "$$ttl_dir"; cp -r "$(CHAINSAW_TEST_DIR)" "$$ttl_dir"; \
+	trap 'rm -rf "$$ttl_dir"' EXIT; \
+	echo "Rewriting docker.io/amdenterpriseai/aim-dummy:<tag> -> $(TTL_AIM_DUMMY_REPO):<tag> across $$ttl_dir"; \
+	matches=$$(grep -rlF "docker.io/amdenterpriseai/aim-dummy:" "$$ttl_dir" || true); \
+	if [ -z "$$matches" ]; then echo "ERROR: no fixtures under $$ttl_dir reference docker.io/amdenterpriseai/aim-dummy:"; exit 1; fi; \
+	echo "$$matches" | xargs sed -i "s|docker.io/amdenterpriseai/aim-dummy:|$(TTL_AIM_DUMMY_REPO):|g"; \
+	: "Cascade: derivation tests assert a derived image that RebaseRegistry grafts"; \
+	: "onto the *source* image's registry+org. With the ttl source ref the prefix"; \
+	: "collapses to '$(TTL_REGISTRY)', so rewrite the docker.io/amdenterpriseai aim-base"; \
+	: "assertions to match (tag preserved). No-op for the real docker.io ref."; \
+	: "EXCLUDE image-discovery-happy-path: its status.baseImage is the literal"; \
+	: "AIM_BASE_IMAGE_REF env baked into aim-dummy (NOT rebased), so it stays"; \
+	: "docker.io/amdenterpriseai/aim-base:dummy regardless of the source registry."; \
+	base_matches=$$(grep -rlF "docker.io/amdenterpriseai/aim-base:" "$$ttl_dir" | grep -vE '/image-discovery-happy-path(-ttl)?/' || true); \
+	if [ -n "$$base_matches" ]; then \
+		echo "$$base_matches" | xargs sed -i "s|docker.io/amdenterpriseai/aim-base:|$(TTL_REGISTRY)/aim-base:|g"; \
+	fi; \
+	$(MAKE) test-chainsaw ENV=gpu CHAINSAW_TEST_DIR="$$ttl_dir"
 
 # Focus test configuration - per-branch local config
 BRANCH_NAME := $(shell git rev-parse --abbrev-ref HEAD | tr '/' '-')
@@ -287,6 +461,11 @@ vcluster-create: ## Create personal vcluster, install dependencies, and connect.
 	vcluster create $(VCLUSTER_NAME) --namespace $(VCLUSTER_NAME) -f hack/dependencies/vcluster.yaml
 	@echo "Installing dependencies..."
 	helmfile sync -f hack/dependencies/helmfile.yaml.gotmpl
+	@# Install scale-from-zero activation prereq (kgateway-metrics-collector).
+	@# Cluster-wide OpenTelemetryCollector that scrapes Envoy from kgateway
+	@# data-plane pods and forwards the request counter to keda-otel-scaler;
+	@# required for AIMServices with spec.minReplicas: 0 to ever activate.
+	@$(MAKE) install-scale-from-zero-prereq
 	@echo "Creating aim-system namespace..."
 	@kubectl create namespace aim-system --dry-run=client -o yaml | kubectl apply -f -
 	@echo "Installing CRDs..."
@@ -323,11 +502,11 @@ build: manifests generate fmt vet ## Build manager binary.
 
 .PHONY: run
 run: manifests generate fmt vet ## Run a controller from your host.
-	go run ./cmd/main.go
+	go run -ldflags "$(LDFLAGS)" ./cmd/main.go
 
 .PHONY: run-debug
 run-debug: manifests generate fmt vet ## Run a controller with debug logging enabled.
-	go run ./cmd/main.go --zap-log-level=debug
+	go run -ldflags "$(LDFLAGS)" ./cmd/main.go --zap-log-level=debug
 
 .PHONY: watch
 watch: manifests generate install ## Run controller with live reload on file changes.
@@ -355,7 +534,10 @@ wait-ready: ## Wait for operator readiness probe to succeed.
 # More info: https://docs.docker.com/develop/develop-images/build_enhancements/
 .PHONY: docker-build
 docker-build: ## Build docker image with the manager.
-	$(CONTAINER_TOOL) build --build-arg VERSION=$(TAG) -t ${IMG} .
+	$(CONTAINER_TOOL) build \
+		--build-arg VERSION=$(TAG) \
+		--build-arg ARTIFACT_DOWNLOADER_IMG=$(ARTIFACT_DOWNLOADER_IMG) \
+		-t ${IMG} .
 
 .PHONY: docker-push
 docker-push: ## Push docker image with the manager.
@@ -374,12 +556,39 @@ docker-buildx: ## Build and push docker image for the manager for cross-platform
 	sed -e '1 s/\(^FROM\)/FROM --platform=\$$\{BUILDPLATFORM\}/; t' -e ' 1,// s//FROM --platform=\$$\{BUILDPLATFORM\}/' Dockerfile > Dockerfile.cross
 	- $(CONTAINER_TOOL) buildx create --name aim-engine-builder
 	$(CONTAINER_TOOL) buildx use aim-engine-builder
-	- $(CONTAINER_TOOL) buildx build --push --platform=$(PLATFORMS) --tag ${IMG} -f Dockerfile.cross .
+	- $(CONTAINER_TOOL) buildx build --push \
+		--platform=$(PLATFORMS) \
+		--build-arg VERSION=$(TAG) \
+		--build-arg ARTIFACT_DOWNLOADER_IMG=$(ARTIFACT_DOWNLOADER_IMG) \
+		--tag ${IMG} -f Dockerfile.cross .
 	- $(CONTAINER_TOOL) buildx rm aim-engine-builder
 	rm Dockerfile.cross
 
+.PHONY: sync-detector-images
+sync-detector-images: ## Sync accelerator-detector image refs in config/accelerator-detector/kustomization.yaml from config/helm/values.yaml.
+	@# Keeps the kustomize image transformers in lockstep with the Helm chart's
+	@# acceleratorDetector.{gpu,cpu}.image values. Without this, install.yaml
+	@# ships with placeholder accelerator-detector-{gpu,cpu}:latest refs that
+	@# don't resolve anywhere. Wired into build-installer (release builds) and
+	@# the sync-detector-images pre-commit hook (drift detection).
+	@command -v yq >/dev/null 2>&1 || { echo "yq is not installed"; exit 1; }
+	@DETECTOR_GPU_REPO="$$(yq '.acceleratorDetector.gpu.image.repository' config/helm/values.yaml)"; \
+	 DETECTOR_GPU_TAG="$$(yq '.acceleratorDetector.gpu.image.tag' config/helm/values.yaml)"; \
+	 DETECTOR_CPU_REPO="$$(yq '.acceleratorDetector.cpu.image.repository' config/helm/values.yaml)"; \
+	 DETECTOR_CPU_TAG="$$(yq '.acceleratorDetector.cpu.image.tag' config/helm/values.yaml)"; \
+	 for v in "$${DETECTOR_GPU_REPO}" "$${DETECTOR_GPU_TAG}" "$${DETECTOR_CPU_REPO}" "$${DETECTOR_CPU_TAG}"; do \
+	   if [ -z "$${v}" ] || [ "$${v}" = "null" ]; then \
+	     echo "ERROR: missing acceleratorDetector image value in config/helm/values.yaml"; exit 1; \
+	   fi; \
+	 done; \
+	 echo "  - GPU detector image: $${DETECTOR_GPU_REPO}:$${DETECTOR_GPU_TAG}"; \
+	 echo "  - CPU detector image: $${DETECTOR_CPU_REPO}:$${DETECTOR_CPU_TAG}"; \
+	 cd config/accelerator-detector && \
+	   kustomize edit set image accelerator-detector-gpu="$${DETECTOR_GPU_REPO}:$${DETECTOR_GPU_TAG}" && \
+	   kustomize edit set image accelerator-detector-cpu="$${DETECTOR_CPU_REPO}:$${DETECTOR_CPU_TAG}"
+
 .PHONY: build-installer
-build-installer: manifests generate ## Generate a consolidated YAML with CRDs and deployment.
+build-installer: manifests generate sync-detector-images ## Generate a consolidated YAML with CRDs and deployment.
 	mkdir -p dist
 	cd config/manager && kustomize edit set image controller=${IMG}
 	kustomize build config/default > dist/install.yaml
@@ -401,7 +610,11 @@ crds: manifests ## Generate consolidated CRDs file for distribution.
 .PHONY: helm-package
 helm-package: helm ## Package the Helm chart into a .tgz file.
 	@command -v helm >/dev/null 2>&1 || { echo "Helm is not installed"; exit 1; }
+	@command -v yq >/dev/null 2>&1 || { echo "yq is not installed"; exit 1; }
 	@echo "Packaging Helm chart with version $(CHART_VERSION) and app version $(APP_VERSION)"
+	@echo "  - Setting manager.image.repository=$(CHART_IMAGE_REPO), manager.image.tag=$(CHART_IMAGE_TAG)"
+	@CHART_IMAGE_REPO='$(CHART_IMAGE_REPO)' CHART_IMAGE_TAG='$(CHART_IMAGE_TAG)' \
+		yq -i '.manager.image.repository = strenv(CHART_IMAGE_REPO) | .manager.image.tag = strenv(CHART_IMAGE_TAG)' dist/chart/values.yaml
 	@sed -i.bak 's/^name:.*/name: $(CHART_NAME)/' dist/chart/Chart.yaml
 	@sed -i.bak 's/^version:.*/version: $(CHART_VERSION)/' dist/chart/Chart.yaml
 	@sed -i.bak 's/^appVersion:.*/appVersion: "$(APP_VERSION)"/' dist/chart/Chart.yaml
@@ -488,10 +701,46 @@ generate-helm-docs: ## Generate Helm chart values reference from config/helm/val
 .PHONY: generate-docs
 generate-docs: generate-crd-docs generate-helm-docs ## Generate all documentation (CRD API reference + Helm values).
 
+# ---------------------------------------------------------------------------
+# Documentation (Sphinx + D2)
+# ---------------------------------------------------------------------------
 DOCS_PORT ?= 8000
+DOCS_BUILD := docs/docs/_build/html
+DIAGRAM_SRC_DIR := docs/diagrams
+DIAGRAM_OUT_DIR := docs/docs/assets/diagrams
 
-.PHONY: docs-serve
-docs-serve:
+.PHONY: diagrams
+diagrams: ## Render D2 diagram sources (docs/diagrams/*.d2) to committed SVGs.
+	@mkdir -p $(DIAGRAM_OUT_DIR)
+	@for f in $(DIAGRAM_SRC_DIR)/*.d2; do \
+		base=$$(basename $$f .d2); \
+		case $$base in _*) continue ;; esac; \
+		echo "d2: $$f -> $$base.svg + $$base-dark.svg"; \
+		d2 fmt $$f >/dev/null; \
+		d2 $$f $(DIAGRAM_OUT_DIR)/$$base.svg || exit 1; \
+		d2 --theme 200 $$f $(DIAGRAM_OUT_DIR)/$$base-dark.svg || exit 1; \
+	done
+
+.PHONY: diagrams-watch
+diagrams-watch: ## Live-preview one diagram: make diagrams-watch DIAGRAM=architecture-overview
+	@if [ -z "$(DIAGRAM)" ]; then \
+		echo "Usage: make diagrams-watch DIAGRAM=<name>  (a file in $(DIAGRAM_SRC_DIR) without .d2)"; \
+		echo "Available diagrams:"; \
+		ls $(DIAGRAM_SRC_DIR)/*.d2 | sed 's#.*/##; s#\.d2$$##; /^_/d' | sed 's/^/  /'; \
+		exit 1; \
+	fi
+	d2 --watch $(DIAGRAM_SRC_DIR)/$(DIAGRAM).d2 $(DIAGRAM_OUT_DIR)/$(DIAGRAM).svg
+
+.PHONY: diagrams-check
+diagrams-check: diagrams ## Fail if committed SVGs drift from their D2 sources (used by CI / pre-commit).
+	@if [ -n "$$(git status --porcelain -- $(DIAGRAM_OUT_DIR))" ]; then \
+		echo "ERROR: rendered diagrams are out of date or uncommitted. Run 'make diagrams' and commit the result."; \
+		git --no-pager status --porcelain -- $(DIAGRAM_OUT_DIR); \
+		exit 1; \
+	fi
+
+.PHONY: docs-deps
+docs-deps:
 	@cd docs && \
 	if [ ! -d ".venv" ]; then \
 		echo "Creating virtual environment in docs/.venv..."; \
@@ -499,9 +748,19 @@ docs-serve:
 	fi && \
 	. .venv/bin/activate && \
 	echo "Installing dependencies..." && \
-	pip install -q -r requirements.txt && \
+	pip install -q -r requirements.txt
+
+.PHONY: docs-serve
+docs-serve: docs-deps ## Live-reloading Sphinx dev server (rebuilds on save; pair with diagrams-watch).
+	@cd docs && . .venv/bin/activate && \
 	WSL_IP=$$(hostname -I | awk '{print $$1}') && \
-	echo "Starting MkDocs dev server..." && \
+	echo "Starting Sphinx dev server..." && \
 	echo "  http://localhost:$(DOCS_PORT)/" && \
 	echo "  http://$$WSL_IP:$(DOCS_PORT)/" && \
-	mkdocs serve -a 0.0.0.0:$(DOCS_PORT)
+	sphinx-autobuild docs docs/_build/html --host 0.0.0.0 --port $(DOCS_PORT)
+
+.PHONY: docs-build
+docs-build: docs-deps ## Build the docs site, treating warnings (broken refs, etc.) as errors.
+	@cd docs && . .venv/bin/activate && \
+	sphinx-build -b html -W --keep-going docs docs/_build/html
+	@echo "Docs built to $(DOCS_BUILD)"
