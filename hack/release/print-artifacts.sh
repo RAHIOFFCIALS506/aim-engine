@@ -57,7 +57,6 @@ append_int_test_artifacts() {
 	if [[ -n "${INT_TEST_IMAGE_TAG}" ]]; then
 		artifact_lines+=("${operator_image_repo}:${INT_TEST_IMAGE_TAG}")
 	fi
-	artifact_lines+=("${image_repo}/aim-artifact-downloader:${VERSION}")
 }
 
 append_release_artifacts
@@ -84,7 +83,9 @@ encoded_refs="$(base64 -w0 < "${RELEASE_ARTIFACTS_FILE}")"
 	echo "echo '${encoded_refs}' | base64 -d"
 	echo '```'
 	echo ""
-	echo "### Plain list (may show \`***\` in the log viewer)"
+	echo "### Plain list (may show \`***\` for org/registry in the log viewer)"
+	echo "Private org/registry: silogenai"
+	echo "Public org/registry: amdenterpriseai"
 	echo ""
 	echo '```'
 	printf '%s\n' "${artifact_lines[@]}"
