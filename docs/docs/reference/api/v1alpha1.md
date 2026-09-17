@@ -542,6 +542,7 @@ _Appears in:_
 | `routing` _[AIMRuntimeRoutingConfig](#aimruntimeroutingconfig)_ | Routing controls HTTP routing configuration for this service.<br />When set, these values override namespace/cluster runtime config defaults. |  | Optional: \{\} <br /> |
 | `scaleFromZero` _[AIMScaleFromZeroConfig](#aimscalefromzeroconfig)_ | ScaleFromZero configures the activation metric query for this service.<br />When set, these values override namespace/cluster runtime config defaults. |  | Optional: \{\} <br /> |
 | `env` _[EnvVar](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.32/#envvar-v1-core) array_ | Env specifies environment variables for inference containers.<br />When set on AIMService, these take highest precedence in the merge hierarchy.<br />When set on RuntimeConfig, these provide namespace/cluster-level defaults.<br />Merge order (highest to lowest): Service.Env > Template.Env > RuntimeConfig.Env > Profile.Env |  | Optional: \{\} <br /> |
+| `additionalCABundleRef` _[AdditionalCABundleReference](#additionalcabundlereference)_ | AdditionalCABundleRef selects PEM CA certificates that AIM Engine adds to<br />its standard public trust roots for outbound TLS from inference,<br />artifact-download, size-check, and adapter-staging containers.<br />The ConfigMap is resolved in each workload namespace. When configured on<br />an AIMClusterRuntimeConfig, each consuming namespace needs a ConfigMap<br />with the same name and key to receive the additional trust.<br />AIM Engine checks the reference directly during reconciliation and omits<br />the projection when the ConfigMap or key is absent. Certificate parsing<br />occurs only in a workload init container. CA changes are consumed when<br />workloads are recreated; the ConfigMap is not watched for rotation. |  | Optional: \{\} <br /> |
 | `model` _[AIMModelConfig](#aimmodelconfig)_ | Model controls model creation and discovery defaults.<br />This field only applies to RuntimeConfig/ClusterRuntimeConfig and is not available for services. |  | Optional: \{\} <br /> |
 | `artifact` _[AIMArtifactConfig](#aimartifactconfig)_ | Artifact controls artifact-level defaults such as eviction policy.<br />This field only applies to RuntimeConfig/ClusterRuntimeConfig and is not available for services. |  | Optional: \{\} <br /> |
 | `artifactCache` _[ArtifactCacheConfig](#artifactcacheconfig)_ | DEPRECATED: The embedded Hugging Face-to-S3 artifact cache has been<br />removed. This field is retained temporarily for API compatibility and is<br />no longer honored by the controller. Use direct s3:// model sources with<br />Artifact.S3 connection settings instead. |  | Optional: \{\} <br /> |
@@ -1595,6 +1596,7 @@ _Appears in:_
 | `routing` _[AIMRuntimeRoutingConfig](#aimruntimeroutingconfig)_ | Routing controls HTTP routing configuration for this service.<br />When set, these values override namespace/cluster runtime config defaults. |  | Optional: \{\} <br /> |
 | `scaleFromZero` _[AIMScaleFromZeroConfig](#aimscalefromzeroconfig)_ | ScaleFromZero configures the activation metric query for this service.<br />When set, these values override namespace/cluster runtime config defaults. |  | Optional: \{\} <br /> |
 | `env` _[EnvVar](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.32/#envvar-v1-core) array_ | Env specifies environment variables for inference containers.<br />When set on AIMService, these take highest precedence in the merge hierarchy.<br />When set on RuntimeConfig, these provide namespace/cluster-level defaults.<br />Merge order (highest to lowest): Service.Env > Template.Env > RuntimeConfig.Env > Profile.Env |  | Optional: \{\} <br /> |
+| `additionalCABundleRef` _[AdditionalCABundleReference](#additionalcabundlereference)_ | AdditionalCABundleRef selects PEM CA certificates that AIM Engine adds to<br />its standard public trust roots for outbound TLS from inference,<br />artifact-download, size-check, and adapter-staging containers.<br />The ConfigMap is resolved in each workload namespace. When configured on<br />an AIMClusterRuntimeConfig, each consuming namespace needs a ConfigMap<br />with the same name and key to receive the additional trust.<br />AIM Engine checks the reference directly during reconciliation and omits<br />the projection when the ConfigMap or key is absent. Certificate parsing<br />occurs only in a workload init container. CA changes are consumed when<br />workloads are recreated; the ConfigMap is not watched for rotation. |  | Optional: \{\} <br /> |
 | `model` _[AIMModelConfig](#aimmodelconfig)_ | Model controls model creation and discovery defaults.<br />This field only applies to RuntimeConfig/ClusterRuntimeConfig and is not available for services. |  | Optional: \{\} <br /> |
 | `artifact` _[AIMArtifactConfig](#aimartifactconfig)_ | Artifact controls artifact-level defaults such as eviction policy.<br />This field only applies to RuntimeConfig/ClusterRuntimeConfig and is not available for services. |  | Optional: \{\} <br /> |
 | `artifactCache` _[ArtifactCacheConfig](#artifactcacheconfig)_ | DEPRECATED: The embedded Hugging Face-to-S3 artifact cache has been<br />removed. This field is retained temporarily for API compatibility and is<br />no longer honored by the controller. Use direct s3:// model sources with<br />Artifact.S3 connection settings instead. |  | Optional: \{\} <br /> |
@@ -1658,6 +1660,7 @@ _Appears in:_
 | `routing` _[AIMRuntimeRoutingConfig](#aimruntimeroutingconfig)_ | Routing controls HTTP routing configuration for this service.<br />When set, these values override namespace/cluster runtime config defaults. |  | Optional: \{\} <br /> |
 | `scaleFromZero` _[AIMScaleFromZeroConfig](#aimscalefromzeroconfig)_ | ScaleFromZero configures the activation metric query for this service.<br />When set, these values override namespace/cluster runtime config defaults. |  | Optional: \{\} <br /> |
 | `env` _[EnvVar](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.32/#envvar-v1-core) array_ | Env specifies environment variables for inference containers.<br />When set on AIMService, these take highest precedence in the merge hierarchy.<br />When set on RuntimeConfig, these provide namespace/cluster-level defaults.<br />Merge order (highest to lowest): Service.Env > Template.Env > RuntimeConfig.Env > Profile.Env |  | Optional: \{\} <br /> |
+| `additionalCABundleRef` _[AdditionalCABundleReference](#additionalcabundlereference)_ | AdditionalCABundleRef selects PEM CA certificates that AIM Engine adds to<br />its standard public trust roots for outbound TLS from inference,<br />artifact-download, size-check, and adapter-staging containers.<br />The ConfigMap is resolved in each workload namespace. When configured on<br />an AIMClusterRuntimeConfig, each consuming namespace needs a ConfigMap<br />with the same name and key to receive the additional trust.<br />AIM Engine checks the reference directly during reconciliation and omits<br />the projection when the ConfigMap or key is absent. Certificate parsing<br />occurs only in a workload init container. CA changes are consumed when<br />workloads are recreated; the ConfigMap is not watched for rotation. |  | Optional: \{\} <br /> |
 | `model` _[AIMModelConfig](#aimmodelconfig)_ | Model controls model creation and discovery defaults.<br />This field only applies to RuntimeConfig/ClusterRuntimeConfig and is not available for services. |  | Optional: \{\} <br /> |
 | `artifact` _[AIMArtifactConfig](#aimartifactconfig)_ | Artifact controls artifact-level defaults such as eviction policy.<br />This field only applies to RuntimeConfig/ClusterRuntimeConfig and is not available for services. |  | Optional: \{\} <br /> |
 | `artifactCache` _[ArtifactCacheConfig](#artifactcacheconfig)_ | DEPRECATED: The embedded Hugging Face-to-S3 artifact cache has been<br />removed. This field is retained temporarily for API compatibility and is<br />no longer honored by the controller. Use direct s3:// model sources with<br />Artifact.S3 connection settings instead. |  | Optional: \{\} <br /> |
@@ -2659,6 +2662,26 @@ _Appears in:_
 | --- | --- |
 | `amd` |  |
 | `nvidia` |  |
+
+
+#### AdditionalCABundleReference
+
+
+
+AdditionalCABundleReference identifies additional PEM CA certificates in a
+namespace-local ConfigMap.
+
+
+
+_Appears in:_
+- [AIMClusterRuntimeConfigSpec](#aimclusterruntimeconfigspec)
+- [AIMRuntimeConfigCommon](#aimruntimeconfigcommon)
+- [AIMRuntimeConfigSpec](#aimruntimeconfigspec)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `name` _string_ | Name is the ConfigMap name in the workload namespace. |  | MaxLength: 253 <br />MinLength: 1 <br />Pattern: `^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$` <br /> |
+| `key` _string_ | Key is the ConfigMap data key containing PEM CA certificates. |  | MaxLength: 253 <br />MinLength: 1 <br />Pattern: `^[-._a-zA-Z0-9]+$` <br /> |
 
 
 #### ArtifactCacheConfig

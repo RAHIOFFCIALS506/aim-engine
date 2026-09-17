@@ -86,6 +86,37 @@ spec:
                         320, or 512
                       rule: self in [1, 8, 16, 32, 64, 128, 256, 320, 512]
                 type: object
+              additionalCABundleRef:
+                description: |-
+                  AdditionalCABundleRef selects PEM CA certificates that AIM Engine adds to
+                  its standard public trust roots for outbound TLS from inference,
+                  artifact-download, size-check, and adapter-staging containers.
+
+                  The ConfigMap is resolved in each workload namespace. When configured on
+                  an AIMClusterRuntimeConfig, each consuming namespace needs a ConfigMap
+                  with the same name and key to receive the additional trust.
+
+                  AIM Engine checks the reference directly during reconciliation and omits
+                  the projection when the ConfigMap or key is absent. Certificate parsing
+                  occurs only in a workload init container. CA changes are consumed when
+                  workloads are recreated; the ConfigMap is not watched for rotation.
+                properties:
+                  key:
+                    description: Key is the ConfigMap data key containing PEM CA certificates.
+                    maxLength: 253
+                    minLength: 1
+                    pattern: ^[-._a-zA-Z0-9]+$
+                    type: string
+                  name:
+                    description: Name is the ConfigMap name in the workload namespace.
+                    maxLength: 253
+                    minLength: 1
+                    pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$
+                    type: string
+                required:
+                - key
+                - name
+                type: object
               artifact:
                 description: |-
                   Artifact controls artifact-level defaults such as eviction policy.

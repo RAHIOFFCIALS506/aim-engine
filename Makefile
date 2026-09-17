@@ -174,8 +174,13 @@ vet: ## Run go vet against code.
 	go vet ./...
 
 .PHONY: test
-test: manifests generate fmt vet ## Run tests.
+test: manifests generate fmt vet test-artifact-downloader ## Run tests.
 	go test $$(go list ./... | grep -v /e2e) -coverprofile cover.out
+
+.PHONY: test-artifact-downloader
+test-artifact-downloader: ## Run dependency-free artifact-downloader script tests.
+	PYTHONPATH=images/artifact-downloader python3 -m unittest discover \
+		-s images/artifact-downloader/tests -p 'test_combine_ca.py'
 
 # TODO(user): To use a different vendor for e2e tests, modify the setup under 'tests/e2e'.
 # The default setup assumes Kind is pre-installed and builds/loads the Manager Docker image locally.

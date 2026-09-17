@@ -72,6 +72,7 @@ jobs:
       - name: Run tests
         run: |
           set -o pipefail
+          make test-artifact-downloader
           # Self-heal for a corrupt Go build cache.
           if ! go test ./... 2>&1 | tee /tmp/go-test.log; then
             if grep -q "reference to nonexistent package" /tmp/go-test.log; then

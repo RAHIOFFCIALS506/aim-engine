@@ -42,6 +42,7 @@ import (
 	"github.com/amd-enterprise-ai/aim-engine/internal/aimadapter"
 	"github.com/amd-enterprise-ai/aim-engine/internal/constants"
 	controllerutils "github.com/amd-enterprise-ai/aim-engine/internal/controller/utils"
+	"github.com/amd-enterprise-ai/aim-engine/internal/trust"
 	"github.com/amd-enterprise-ai/aim-engine/internal/v1alpha1/aimruntimeconfig"
 	v1alpha1utils "github.com/amd-enterprise-ai/aim-engine/internal/v1alpha1/utils"
 )
@@ -50,6 +51,7 @@ import (
 type ServiceReconciler struct {
 	Clientset kubernetes.Interface
 	Scheme    *runtime.Scheme
+	APIReader client.Reader
 }
 
 func (r *ServiceReconciler) GetApplyOptions(obs ServiceObservation) controllerutils.ApplyOptions {
@@ -66,6 +68,7 @@ type ServiceFetchResult struct {
 
 	// Merged runtime config (provided by reconcile context)
 	mergedRuntimeConfig controllerutils.FetchResult[*aimv1alpha1.AIMRuntimeConfigCommon]
+	additionalCABundle  controllerutils.FetchResult[*corev1.ConfigMap]
 
 	// Model resolution result (includes existing model or signals creation needed)
 	modelResult ModelFetchResult
@@ -114,6 +117,16 @@ func (r *ServiceReconciler) FetchRemoteState(
 		service:             service,
 		mergedRuntimeConfig: aimruntimeconfig.FetchMergedRuntimeConfig(ctx, c, runtimeConfigRef.Name, service.Namespace),
 	}
+	bundleReader := client.Reader(c)
+	if r.APIReader != nil {
+		bundleReader = r.APIReader
+	}
+	result.additionalCABundle = trust.FetchAdditionalCABundle(
+		ctx,
+		bundleReader,
+		service.Namespace,
+		result.mergedRuntimeConfig.Value,
+	)
 
 	// 1. Fetch existing InferenceService first (gates other fetches)
 	result.inferenceService = fetchInferenceService(ctx, c, service)
@@ -203,6 +216,25 @@ func (obs ServiceObservation) GetComponentHealth(ctx context.Context, clientset 
 				return controllerutils.ComponentHealth{
 					State:  constants.AIMStatusReady,
 					Reason: "RuntimeConfigResolved",
+				}
+			},
+		))
+	}
+	if obs.mergedRuntimeConfig.Value != nil &&
+		obs.mergedRuntimeConfig.Value.AdditionalCABundleRef != nil {
+		health = append(health, obs.additionalCABundle.ToUpstreamComponentHealth(
+			"AdditionalCABundle",
+			func(bundle *corev1.ConfigMap) controllerutils.ComponentHealth {
+				if bundle == nil {
+					return controllerutils.ComponentHealth{
+						State:   constants.AIMStatusReady,
+						Reason:  "AdditionalCABundleSkipped",
+						Message: "Configured CA bundle was unavailable during reconciliation; using public roots only",
+					}
+				}
+				return controllerutils.ComponentHealth{
+					State:  constants.AIMStatusReady,
+					Reason: "AdditionalCABundleResolved",
 				}
 			},
 		))
@@ -1485,7 +1517,14 @@ func (r *ServiceReconciler) PlanResources(
 	// (a removal — including dropping the last adapter — drives its prune Job to
 	// completion via status-carried Deleting entries).
 	if aimadapter.IsActive(service) {
-		aimadapter.Plan(&planResult, service, obs.adapterDeps, obs.adapterState, obs.mergedRuntimeConfig.Value)
+		aimadapter.Plan(
+			&planResult,
+			service,
+			obs.adapterDeps,
+			obs.adapterState,
+			obs.mergedRuntimeConfig.Value,
+			obs.additionalCABundle.Value != nil,
+		)
 	}
 	// ISVC creation is gated whenever the service needs the adapter disk —
 	// adapters declared, or dynamic mode (which mounts even at zero adapters) —

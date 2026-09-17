@@ -48,6 +48,7 @@ import (
 	"github.com/amd-enterprise-ai/aim-engine/internal/aimadapter"
 	"github.com/amd-enterprise-ai/aim-engine/internal/constants"
 	controllerutils "github.com/amd-enterprise-ai/aim-engine/internal/controller/utils"
+	"github.com/amd-enterprise-ai/aim-engine/internal/trust"
 	"github.com/amd-enterprise-ai/aim-engine/internal/utils"
 	aimruntimeconfig "github.com/amd-enterprise-ai/aim-engine/internal/v1alpha1/aimruntimeconfig"
 	v1alpha1service "github.com/amd-enterprise-ai/aim-engine/internal/v1alpha1/aimservice"
@@ -68,8 +69,9 @@ const (
 // is the storage version; the profile-specific spec fields live on
 // aimv1alpha1.AIMService while the referenced profile is defined in v1alpha2.
 type ProfileServiceReconciler struct {
-	Scheme   *runtime.Scheme
-	Recorder record.EventRecorder
+	Scheme    *runtime.Scheme
+	Recorder  record.EventRecorder
+	APIReader client.Reader
 }
 
 // GetApplyOptions returns apply options derived from the merged
@@ -124,6 +126,7 @@ type ServiceFetchResult struct {
 	profileRuntimeConfigMap controllerutils.FetchResult[*corev1.ConfigMap]
 
 	mergedRuntimeConfig controllerutils.FetchResult[*aimv1alpha1.AIMRuntimeConfigCommon]
+	additionalCABundle  controllerutils.FetchResult[*corev1.ConfigMap]
 
 	// resourceMatchNodes are fetched only when spec.resources overrides an
 	// accelerator-backed profile. They let the service evaluate its effective
@@ -249,6 +252,25 @@ func (obs ServiceObservation) GetComponentHealth(ctx context.Context, clientset 
 				return controllerutils.ComponentHealth{
 					State:  constants.AIMStatusReady,
 					Reason: "RuntimeConfigResolved",
+				}
+			},
+		))
+	}
+	if obs.mergedRuntimeConfig.Value != nil &&
+		obs.mergedRuntimeConfig.Value.AdditionalCABundleRef != nil {
+		health = append(health, obs.additionalCABundle.ToUpstreamComponentHealth(
+			"AdditionalCABundle",
+			func(bundle *corev1.ConfigMap) controllerutils.ComponentHealth {
+				if bundle == nil {
+					return controllerutils.ComponentHealth{
+						State:   constants.AIMStatusReady,
+						Reason:  "AdditionalCABundleSkipped",
+						Message: "Configured CA bundle was unavailable during reconciliation; using public roots only",
+					}
+				}
+				return controllerutils.ComponentHealth{
+					State:  constants.AIMStatusReady,
+					Reason: "AdditionalCABundleResolved",
 				}
 			},
 		))
@@ -689,6 +711,16 @@ func (r *ProfileServiceReconciler) FetchRemoteState(
 	// default cluster-scoped AIMClusterRuntimeConfig when the ref is empty.
 	runtimeConfigRef := service.GetRuntimeConfigRef()
 	result.mergedRuntimeConfig = aimruntimeconfig.FetchMergedRuntimeConfig(ctx, c, runtimeConfigRef.Name, service.Namespace)
+	bundleReader := client.Reader(c)
+	if r.APIReader != nil {
+		bundleReader = r.APIReader
+	}
+	result.additionalCABundle = trust.FetchAdditionalCABundle(
+		ctx,
+		bundleReader,
+		service.Namespace,
+		result.mergedRuntimeConfig.Value,
+	)
 
 	// Fetch the HTTPRoute (only exists when routing is enabled on the service or
 	// AIMRuntimeConfig).
@@ -1216,7 +1248,14 @@ func (r *ProfileServiceReconciler) PlanResources(
 	// (a removal — including dropping the last adapter — drives its prune Job to
 	// completion via status-carried Deleting entries).
 	if aimadapter.IsActive(service) {
-		aimadapter.Plan(&planResult, service, obs.adapterDeps, obs.adapterState, obs.mergedRuntimeConfig.Value)
+		aimadapter.Plan(
+			&planResult,
+			service,
+			obs.adapterDeps,
+			obs.adapterState,
+			obs.mergedRuntimeConfig.Value,
+			obs.additionalCABundle.Value != nil,
+		)
 	}
 	// ISVC creation is gated whenever the service needs the adapter disk —
 	// adapters declared, or dynamic mode (which mounts even at zero adapters) —

@@ -67,15 +67,15 @@ func AnnotationProfileSetNamespace() string {
 
 type ProfileSetReconciler struct {
 	Scheme *runtime.Scheme
-	// APIReader is the uncached reader used to load a sourceRef catalog, which
-	// may be a user pre-populated ConfigMap absent from the label-scoped cache.
+	// APIReader is the uncached reader used to load a sourceRef catalog directly
+	// from the API server.
 	APIReader client.Reader
 }
 
 type ClusterProfileSetReconciler struct {
 	Scheme *runtime.Scheme
-	// APIReader is the uncached reader used to load a sourceRef catalog, which
-	// may be a user pre-populated ConfigMap absent from the label-scoped cache.
+	// APIReader is the uncached reader used to load a sourceRef catalog directly
+	// from the API server.
 	APIReader client.Reader
 }
 

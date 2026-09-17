@@ -263,6 +263,7 @@ func (r *AIMServiceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	r.templateReconciler = &aimservice.ServiceReconciler{
 		Clientset: r.Clientset,
 		Scheme:    r.Scheme,
+		APIReader: mgr.GetAPIReader(),
 	}
 	r.templatePipeline = controllerutils.Pipeline[
 		*aimv1alpha1.AIMService,
@@ -280,8 +281,9 @@ func (r *AIMServiceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	}
 
 	r.profileReconciler = &profileservice.ProfileServiceReconciler{
-		Scheme:   r.Scheme,
-		Recorder: recorder,
+		Scheme:    r.Scheme,
+		Recorder:  recorder,
+		APIReader: mgr.GetAPIReader(),
 	}
 	r.profilePipeline = controllerutils.Pipeline[
 		*aimv1alpha1.AIMService,
