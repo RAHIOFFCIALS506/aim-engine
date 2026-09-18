@@ -74,6 +74,8 @@ type AIMProfileSetReconciler struct {
 // +kubebuilder:rbac:groups=aim.eai.amd.com,resources=aimprofilesets/finalizers,verbs=update
 // +kubebuilder:rbac:groups=aim.eai.amd.com,resources=aimprofiles,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=aim.eai.amd.com,resources=aimclusterprofiles,verbs=get;list;watch
+// +kubebuilder:rbac:groups=aim.eai.amd.com,resources=aimmodels,verbs=get;list;watch
+// +kubebuilder:rbac:groups=aim.eai.amd.com,resources=aimclustermodels,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 
@@ -114,7 +116,11 @@ func (r *AIMProfileSetReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		if set.Spec.SourceRef == nil {
 			return nil
 		}
-		return singleValueIndex(profileSourceRefIndexValue(set.Namespace, set.Spec.SourceRef.Name))
+		return singleValueIndex(profileSourceRefIndexValue(
+			set.Spec.SourceRef.EffectiveKind(),
+			profileSourceNamespace(set.Spec.SourceRef.EffectiveKind(), set.Namespace),
+			set.Spec.SourceRef.Name,
+		))
 	}); err != nil {
 		return err
 	}
@@ -137,13 +143,30 @@ func (r *AIMProfileSetReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		if !ok {
 			return nil
 		}
-		return profileSetsForSourceRef(ctx, r.Client, profileSourceRefIndexValue(configMap.Namespace, configMap.Name))
+		requests := profileSetsForSourceRef(
+			ctx,
+			r.Client,
+			profileSourceRefIndexValue(aimv1alpha1.ProfileSourceKindConfigMap, configMap.Namespace, configMap.Name),
+		)
+		for _, indexValue := range modelSourceRefIndexValuesForCache(configMap) {
+			requests = append(requests, profileSetsForSourceRef(ctx, r.Client, indexValue)...)
+		}
+		return dedupeRequests(requests)
+	})
+	modelHandler := handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []reconcile.Request {
+		indexValue := modelSourceRefIndexValue(obj)
+		if indexValue == "" {
+			return nil
+		}
+		return profileSetsForSourceRef(ctx, r.Client, indexValue)
 	})
 
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&aimv1alpha2.AIMProfileSet{}).
 		Watches(&aimv1alpha2.AIMProfile{}, profileHandler).
 		Watches(&aimv1alpha2.AIMClusterProfile{}, profileHandler).
+		Watches(&aimv1alpha2.AIMModel{}, modelHandler).
+		Watches(&aimv1alpha2.AIMClusterModel{}, modelHandler).
 		Watches(
 			&corev1.ConfigMap{},
 			configMapHandler,
@@ -195,11 +218,59 @@ func profileSetsForSourceRef(ctx context.Context, c client.Client, indexValue st
 	}, "failed to list AIMProfileSets for sourceRef", "sourceRef", indexValue)
 }
 
-func profileSourceRefIndexValue(namespace, name string) string {
-	if namespace == "" || name == "" {
+func profileSourceRefIndexValue(kind aimv1alpha1.ProfileSourceKind, namespace, name string) string {
+	if name == "" {
 		return ""
 	}
-	return namespace + "/" + name
+	if kind == "" {
+		kind = aimv1alpha1.ProfileSourceKindConfigMap
+	}
+	return string(kind) + ":" + namespace + "/" + name
+}
+
+func profileSourceNamespace(kind aimv1alpha1.ProfileSourceKind, defaultNamespace string) string {
+	if kind == aimv1alpha1.ProfileSourceKindAIMClusterModel {
+		return ""
+	}
+	return defaultNamespace
+}
+
+func modelSourceRefIndexValue(obj client.Object) string {
+	switch model := obj.(type) {
+	case *aimv1alpha2.AIMModel:
+		return profileSourceRefIndexValue(aimv1alpha1.ProfileSourceKindAIMModel, model.Namespace, model.Name)
+	case *aimv1alpha2.AIMClusterModel:
+		return profileSourceRefIndexValue(aimv1alpha1.ProfileSourceKindAIMClusterModel, "", model.Name)
+	default:
+		return ""
+	}
+}
+
+func modelSourceRefIndexValuesForCache(configMap *corev1.ConfigMap) []string {
+	if configMap == nil {
+		return nil
+	}
+	values := make([]string, 0, 1)
+	for _, ref := range configMap.OwnerReferences {
+		if ref.Controller == nil || !*ref.Controller {
+			continue
+		}
+		switch ref.Kind {
+		case "AIMModel":
+			values = append(values, profileSourceRefIndexValue(
+				aimv1alpha1.ProfileSourceKindAIMModel,
+				configMap.Namespace,
+				ref.Name,
+			))
+		case "AIMClusterModel":
+			values = append(values, profileSourceRefIndexValue(
+				aimv1alpha1.ProfileSourceKindAIMClusterModel,
+				"",
+				ref.Name,
+			))
+		}
+	}
+	return values
 }
 
 func isDiscoveryCatalogConfigMap(obj client.Object) bool {

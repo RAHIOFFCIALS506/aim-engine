@@ -61,7 +61,7 @@ spec:
 
               The selector-non-empty rule accepts every documented narrowing field
               (including modelRef and origin) and lets sourceRef-only specs through:
-              when sourceRef is set, the discovery cache itself acts as the source
+              when sourceRef is set, the referenced catalog itself acts as the source
               scope and a separate selector is not required.
             properties:
               image:
@@ -714,13 +714,36 @@ spec:
                 type: string
               sourceRef:
                 description: |-
-                  SourceRef points to an alternate discovery cache source.
-                  When omitted, derivation uses visible AIMProfile and AIMClusterProfile objects.
-                  For AIMProfileSet, the referenced ConfigMap is read from the same namespace.
-                  For AIMClusterProfileSet, it is read from the operator namespace.
+                  SourceRef selects a cache-backed source. ConfigMap reads a discovery
+                  catalog directly. AIMModel and AIMClusterModel resolve the referenced
+                  model's current discovery cache, including entries that were not
+                  materialized as profile resources because their original hardware shape
+                  is unsupported by the cluster.
+
+                  When omitted, derivation uses visible AIMProfile and AIMClusterProfile
+                  objects. selector.modelRef is a filter for that real-profile-backed mode
+                  and cannot be combined with sourceRef.
                 properties:
+                  kind:
+                    default: ConfigMap
+                    description: |-
+                      Kind selects the source resource. ConfigMap reads the named discovery
+                      catalog directly. AIMModel and AIMClusterModel resolve the model's
+                      status.discoveryCacheRef, allowing selection from its complete image
+                      catalog including profiles that were not materialized for the current
+                      cluster hardware.
+                    enum:
+                    - ConfigMap
+                    - AIMModel
+                    - AIMClusterModel
+                    type: string
                   name:
-                    description: Name is the discovery cache ConfigMap name.
+                    description: |-
+                      Name is the source resource name. AIMModel references resolve in the
+                      AIMProfileSet namespace; AIMClusterModel references are cluster-scoped.
+                      ConfigMap references resolve in the AIMProfileSet namespace, or in the
+                      operator namespace for AIMClusterProfileSet.
+                    minLength: 1
                     type: string
                 required:
                 - name
@@ -747,6 +770,11 @@ spec:
                 || has(self.selector.acceleratorVendor) || has(self.selector.acceleratorType)
                 || has(self.selector.acceleratorCount) || has(self.selector.engineArgs)
                 || has(self.selector.modelRef) || has(self.selector.origin)
+            - message: selector.modelRef cannot be combined with sourceRef; sourceRef
+                already defines the source scope
+              optionalOldSelf: true
+              rule: '!has(self.sourceRef) || !has(self.selector.modelRef) || (oldSelf.hasValue()
+                && has(oldSelf.value().sourceRef) && has(oldSelf.value().selector.modelRef))'
             - message: version is required when versionPolicy is pinned
               rule: has(self.version) || (has(self.versionPolicy) && self.versionPolicy
                 != 'pinned')
@@ -898,6 +926,11 @@ spec:
                 type: string
             type: object
         type: object
+        x-kubernetes-validations:
+        - message: AIMClusterProfileSet cannot reference a namespace-scoped AIMModel;
+            use AIMClusterModel or ConfigMap
+          rule: '!has(self.spec.sourceRef) || !has(self.spec.sourceRef.kind) || self.spec.sourceRef.kind
+            != ''AIMModel'''
     served: true
     storage: true
     subresources:

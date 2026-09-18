@@ -1056,7 +1056,7 @@ _Appears in:_
 | Field | Description | Default | Validation |
 | --- | --- | --- | --- |
 | `selector` _[ProfileSelector](#profileselector)_ | Selector chooses which source profiles to derive from. Discovery of a<br />deployable AIM image stamps role=deployable; selector.role=base targets<br />the base profiles emitted by base-image discovery (custom-model<br />derivation source material). |  | Optional: \{\} <br /> |
-| `sourceRef` _[ProfileSourceRef](#profilesourceref)_ | SourceRef points to an alternate discovery cache source (a<br />pre-populated ConfigMap of profile YAMLs) instead of using the<br />visible AIMProfile / AIMClusterProfile objects. |  | Optional: \{\} <br /> |
+| `sourceRef` _[ProfileSourceRef](#profilesourceref)_ | SourceRef selects an alternate catalog source instead of using visible<br />AIMProfile / AIMClusterProfile objects. It may reference a ConfigMap of<br />profile YAMLs or an image-backed AIMModel / AIMClusterModel whose current<br />discovery cache supplies the catalog. Omit it when the parent AIMModel<br />also sets spec.image: the controller injects that model's own discovery<br />cache and the v1alpha2 API rejects an explicit sourceRef. |  | Optional: \{\} <br /> |
 
 
 #### AIMModelProfilesSpec
@@ -1171,9 +1171,9 @@ AIMModelSpec defines the desired state of AIMModel.
 
 Per-version constraints (v1alpha1 forbids derivedFrom and profiles;
 v1alpha2 forbids profileCopy/custom/customTemplates/top-level modelSources,
-requires image XOR profiles, and forbids profiles mixed with legacy scalar
-fields) live on the version-specific AIMModel / AIMClusterModel root types
-in the per-version *_types.go files.
+keeps modelId exclusive, and allows image-backed profile derivation) live on
+the version-specific AIMModel / AIMClusterModel root types in the per-version
+*_types.go files.
 
 
 
@@ -1183,14 +1183,14 @@ _Appears in:_
 
 | Field | Description | Default | Validation |
 | --- | --- | --- | --- |
-| `image` _string_ | Image is the container image URI for this AIM model.<br />This image is inspected by the operator to select runtime profiles used by templates.<br />Discovery behavior is controlled by the discovery field and runtime config's AutoDiscovery setting.<br />Required unless modelId, an eligible aimId-only flow, or a profile<br />derivation flow is set. |  | Optional: \{\} <br /> |
+| `image` _string_ | Image is the container image URI for this AIM model.<br />This image is inspected by the operator to discover runtime profiles.<br />When spec.profiles is also set, the image's complete discovery cache is<br />the implicit derivation source and only selected/overridden outputs are<br />materialised.<br />Discovery behavior is controlled by the discovery field and runtime config's AutoDiscovery setting.<br />Required unless modelId, an eligible aimId-only flow, or a profile<br />derivation flow is set. |  | Optional: \{\} <br /> |
 | `modelId` _string_ | ModelID is the canonical model identifier for generated-profile<br />onboarding. The controller combines it with RuntimeConfig profile<br />generation fallbacks and observed hardware to materialize profiles. |  | Pattern: `^[a-zA-Z0-9_-]+/[a-zA-Z0-9._-]+$` <br />Optional: \{\} <br /> |
 | `aimId` _string_ | AimId is the AIM product family identifier (e.g., "qwen/qwen3-32b").<br />When set together with modelSources, enables aimId-based template matching:<br />the controller finds official templates by aimId, filters by versionPolicy,<br />matches by modelId, and creates copies with the custom weight source. |  | Optional: \{\} <br /> |
 | `source` _[AIMModelSourceLocation](#aimmodelsourcelocation)_ | Source optionally overrides the default hf://<modelId> model source for<br />modelId-backed onboarding. |  | Optional: \{\} <br /> |
 | `accelerator` _[AIMModelAcceleratorRequest](#aimmodelacceleratorrequest)_ | Accelerator requests the hardware shape for modelId-backed onboarding —<br />how many accelerator units the model needs and, optionally, which vendor,<br />card model, or partitioning mode. Narrows which RuntimeConfig fallbacks<br />apply and is stamped onto the generated profile. Defaults to one unit of<br />whatever the matched fallback targets. |  | Optional: \{\} <br /> |
 | `profileCopy` _[AIMProfileSetSpec](#aimprofilesetspec)_ | ProfileCopy reuses the AIMProfileSet derivation shape so an AIMModel can<br />publish derivative AIMProfiles directly. The controller may synthesize a<br />child AIMProfileSet and fill SourceRef when image-backed discovery is<br />involved. Mutually exclusive with all deprecated v1alpha1 fields.<br />DEPRECATED on v1alpha2: use spec.profiles. v1alpha1 still accepts<br />ProfileCopy. v1alpha2 CRD CEL forbids ProfileCopy. |  | Optional: \{\} <br /> |
 | `derivedFrom` _[AIMProfileSetSpec](#aimprofilesetspec)_ | DerivedFrom is the legacy flat shape of v1alpha2's profile-derivation<br />onboarding surface. New objects must use spec.profiles instead; the<br />field is retained so existing v1alpha2 objects (and the v1alpha2<br />reconciler reading them) round-trip cleanly.<br />DEPRECATED: prefer spec.profiles.derivedFrom on v1alpha2. |  | Optional: \{\} <br /> |
-| `profiles` _[AIMModelProfilesSpec](#aimmodelprofilesspec)_ | Profiles is the v1alpha2 fine-tune / custom-model onboarding surface.<br />It groups the source descriptor (`profiles.derivedFrom.selector` /<br />`profiles.derivedFrom.sourceRef`), the version filter<br />(`profiles.versionPolicy` / `profiles.version`), and the modifications<br />applied to copies (`profiles.overrides`). When set, the AIMModel<br />reconciler synthesises a child AIMProfileSet from this block.<br />Mutually exclusive with spec.image (exactly one of the two is required<br />for v1alpha2 AIMModel). v1alpha1 rejects spec.profiles via per-version<br />CEL. |  | Optional: \{\} <br /> |
+| `profiles` _[AIMModelProfilesSpec](#aimmodelprofilesspec)_ | Profiles is the v1alpha2 fine-tune / custom-model onboarding surface.<br />It groups the source descriptor (`profiles.derivedFrom.selector` /<br />`profiles.derivedFrom.sourceRef`), the version filter<br />(`profiles.versionPolicy` / `profiles.version`), and the modifications<br />applied to copies (`profiles.overrides`). When set, the AIMModel<br />reconciler synthesises a child AIMProfileSet from this block.<br />When spec.image is also set, the child set is bound to this model's<br />discovery cache and can select catalog entries even when the source<br />profile was not materialised for the cluster's current hardware.<br />profiles.derivedFrom.sourceRef and selector.modelRef must then be omitted<br />because the image already supplies the source scope.<br />Mutually exclusive with spec.modelId. v1alpha1 rejects spec.profiles via<br />per-version CEL. |  | Optional: \{\} <br /> |
 | `discovery` _[AIMModelDiscoveryConfig](#aimmodeldiscoveryconfig)_ | Discovery controls discovery behavior for this model.<br />When unset, uses runtime config defaults. |  | Optional: \{\} <br /> |
 | `defaultServiceTemplate` _string_ | DefaultServiceTemplate specifies the default AIMServiceTemplate to use when creating services for this model.<br />When set, services that reference this model will use this template if no template is explicitly specified.<br />If this is not set, a template will be automatically selected. |  | Optional: \{\} <br /> |
 | `custom` _[AIMCustomModelSpec](#aimcustommodelspec)_ | Custom contains configuration for custom models (models with inline modelSources).<br />Only used when modelSources are specified; ignored for image-based models. |  | Optional: \{\} <br /> |
@@ -1406,7 +1406,7 @@ AIMProfileSetSpec defines the desired state of AIMProfileSet and is also reused 
 
 The selector-non-empty rule accepts every documented narrowing field
 (including modelRef and origin) and lets sourceRef-only specs through:
-when sourceRef is set, the discovery cache itself acts as the source
+when sourceRef is set, the referenced catalog itself acts as the source
 scope and a separate selector is not required.
 
 
@@ -1416,7 +1416,7 @@ _Appears in:_
 
 | Field | Description | Default | Validation |
 | --- | --- | --- | --- |
-| `sourceRef` _[ProfileSourceRef](#profilesourceref)_ | SourceRef points to an alternate discovery cache source.<br />When omitted, derivation uses visible AIMProfile and AIMClusterProfile objects.<br />For AIMProfileSet, the referenced ConfigMap is read from the same namespace.<br />For AIMClusterProfileSet, it is read from the operator namespace. |  | Optional: \{\} <br /> |
+| `sourceRef` _[ProfileSourceRef](#profilesourceref)_ | SourceRef selects a cache-backed source. ConfigMap reads a discovery<br />catalog directly. AIMModel and AIMClusterModel resolve the referenced<br />model's current discovery cache, including entries that were not<br />materialized as profile resources because their original hardware shape<br />is unsupported by the cluster.<br />When omitted, derivation uses visible AIMProfile and AIMClusterProfile<br />objects. selector.modelRef is a filter for that real-profile-backed mode<br />and cannot be combined with sourceRef. |  | Optional: \{\} <br /> |
 | `selector` _[ProfileSelector](#profileselector)_ | Selector chooses which source profiles to derive from. |  | Optional: \{\} <br /> |
 | `versionPolicy` _[ProfileVersionPolicy](#profileversionpolicy)_ | VersionPolicy controls how matching profiles are filtered by version. | pinned | Enum: [pinned latest all] <br />Optional: \{\} <br /> |
 | `version` _string_ | Version pins matching to a specific source profile version when VersionPolicy is pinned. |  | Optional: \{\} <br /> |
@@ -3198,11 +3198,32 @@ _Appears in:_
 | `namespace` _string_ | Namespace is the profile set namespace. |  |  |
 
 
+#### ProfileSourceKind
+
+_Underlying type:_ _string_
+
+ProfileSourceKind identifies the resource that supplies a v1alpha2 profile
+set's cache-backed source catalog. Deprecated v1alpha1 model profileCopy
+accepts only ConfigMap.
+
+_Validation:_
+- Enum: [ConfigMap AIMModel AIMClusterModel]
+
+_Appears in:_
+- [ProfileSourceRef](#profilesourceref)
+
+| Field | Description |
+| --- | --- |
+| `ConfigMap` | ProfileSourceKindConfigMap reads a discovery catalog directly from a<br />ConfigMap. This is the default for backwards compatibility with the<br />original sourceRef shape.<br /> |
+| `AIMModel` | ProfileSourceKindAIMModel resolves the referenced namespace-scoped<br />AIMModel's current discovery cache.<br /> |
+| `AIMClusterModel` | ProfileSourceKindAIMClusterModel resolves the referenced cluster-scoped<br />AIMClusterModel's current discovery cache.<br /> |
+
+
 #### ProfileSourceRef
 
 
 
-ProfileSourceRef identifies an alternate discovery cache source for derivation.
+ProfileSourceRef identifies an alternate source catalog for derivation.
 
 
 
@@ -3212,7 +3233,8 @@ _Appears in:_
 
 | Field | Description | Default | Validation |
 | --- | --- | --- | --- |
-| `name` _string_ | Name is the discovery cache ConfigMap name. |  |  |
+| `kind` _[ProfileSourceKind](#profilesourcekind)_ | Kind selects the source resource. ConfigMap reads the named discovery<br />catalog directly. AIMModel and AIMClusterModel resolve the model's<br />status.discoveryCacheRef, allowing selection from its complete image<br />catalog including profiles that were not materialized for the current<br />cluster hardware. | ConfigMap | Enum: [ConfigMap AIMModel AIMClusterModel] <br />Optional: \{\} <br /> |
+| `name` _string_ | Name is the source resource name. AIMModel references resolve in the<br />AIMProfileSet namespace; AIMClusterModel references are cluster-scoped.<br />ConfigMap references resolve in the AIMProfileSet namespace, or in the<br />operator namespace for AIMClusterProfileSet. |  | MinLength: 1 <br /> |
 
 
 #### ProfileVersionPolicy

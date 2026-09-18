@@ -104,6 +104,59 @@ func TestLegacyAutoCustomModelRegeneratesTemplateWithoutPersistingHydration(t *t
 	}
 }
 
+func TestLegacyAutoCustomModelRetiresStaleNativeProfileState(t *testing.T) {
+	service, model := newLegacyAutoCustomFixture(t)
+	childName, err := childProfileSetName(model.Name)
+	if err != nil {
+		t.Fatalf("childProfileSetName() error = %v", err)
+	}
+	child := &aimv1alpha2.AIMProfileSet{
+		ObjectMeta: metav1.ObjectMeta{Name: childName, Namespace: model.Namespace},
+	}
+	staleProfile := &aimv1alpha2.AIMProfile{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "stale-native-profile",
+			Namespace: model.Namespace,
+			Annotations: map[string]string{
+				annotationModelUID: string(model.UID),
+			},
+		},
+	}
+	reconciler, k8sClient := newLegacyAutoCustomReconciler(t, service, child, staleProfile)
+
+	fetch := reconciler.FetchRemoteState(
+		context.Background(),
+		k8sClient,
+		controllerutils.ReconcileContext[*aimv1alpha2.AIMModel]{Object: model},
+	)
+	obs := reconciler.ComposeState(
+		context.Background(),
+		controllerutils.ReconcileContext[*aimv1alpha2.AIMModel]{Object: model},
+		fetch,
+	)
+	plan := reconciler.PlanResources(
+		context.Background(),
+		controllerutils.ReconcileContext[*aimv1alpha2.AIMModel]{Object: model},
+		obs,
+	)
+
+	if !obs.pruneSafe {
+		t.Fatalf("valid compatibility model did not enable stale native cleanup: %#v", obs)
+	}
+	deleted := map[string]bool{}
+	for _, object := range plan.GetToDelete() {
+		deleted[client.ObjectKeyFromObject(object).String()] = true
+	}
+	for _, key := range []string{
+		client.ObjectKeyFromObject(staleProfile).String(),
+		client.ObjectKeyFromObject(child).String(),
+	} {
+		if !deleted[key] {
+			t.Fatalf("deletes = %#v, missing stale native object %s", plan.GetToDelete(), key)
+		}
+	}
+}
+
 func TestGrandfatheredLegacyAutoCustomModelRegeneratesTemplateWithoutRewrite(t *testing.T) {
 	service, model := newGrandfatheredLegacyAutoCustomFixture(t)
 	original := model.DeepCopy()
@@ -489,6 +542,16 @@ func newLegacyAutoCustomReconciler(
 		WithScheme(scheme).
 		WithObjects(objects...).
 		WithStatusSubresource(&aimv1alpha2.AIMModel{}).
+		WithIndex(
+			&aimv1alpha2.AIMProfile{},
+			ManagedModelUIDIndexKey,
+			func(object client.Object) []string {
+				if uid := object.GetAnnotations()[annotationModelUID]; uid != "" {
+					return []string{uid}
+				}
+				return nil
+			},
+		).
 		WithIndex(
 			&aimv1alpha1.AIMServiceTemplate{},
 			aimv1alpha1.ServiceTemplateModelNameIndexKey,

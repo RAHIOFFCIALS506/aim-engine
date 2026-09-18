@@ -40,6 +40,7 @@ import (
 	"github.com/amd-enterprise-ai/aim-engine/internal/constants"
 	controllerutils "github.com/amd-enterprise-ai/aim-engine/internal/controller/utils"
 	"github.com/amd-enterprise-ai/aim-engine/internal/utils"
+	"github.com/amd-enterprise-ai/aim-engine/internal/v1alpha2/aimmodel"
 	"github.com/amd-enterprise-ai/aim-engine/internal/v1alpha2/aimprofile"
 	"github.com/amd-enterprise-ai/aim-engine/internal/v1alpha2/profileyaml"
 )
@@ -154,7 +155,11 @@ func (r *ProfileSetReconciler) FetchRemoteState(
 	reconcileCtx controllerutils.ReconcileContext[*aimv1alpha2.AIMProfileSet],
 ) ProfileSetFetchResult {
 	set := reconcileCtx.Object
-	candidates, candidateErr := loadNamespaceCandidates(ctx, c, catalogReader(r.APIReader, c), set)
+	var candidates []profileSetCandidate
+	var candidateErr error
+	if validateProfileSetSourceScope(set.Spec) == nil {
+		candidates, candidateErr = loadNamespaceCandidates(ctx, c, catalogReader(r.APIReader, c), set)
+	}
 	managed, managedErr := listManagedNamespaceProfiles(ctx, c, set.Namespace, string(set.UID))
 	return ProfileSetFetchResult{
 		set:        set,
@@ -169,7 +174,11 @@ func (r *ClusterProfileSetReconciler) FetchRemoteState(
 	reconcileCtx controllerutils.ReconcileContext[*aimv1alpha2.AIMClusterProfileSet],
 ) ClusterProfileSetFetchResult {
 	set := reconcileCtx.Object
-	candidates, candidateErr := loadClusterCandidates(ctx, c, catalogReader(r.APIReader, c), set)
+	var candidates []profileSetCandidate
+	var candidateErr error
+	if validateProfileSetSourceScope(set.Spec) == nil {
+		candidates, candidateErr = loadClusterCandidates(ctx, c, catalogReader(r.APIReader, c), set)
+	}
 	managed, managedErr := listManagedClusterProfiles(ctx, c, string(set.UID))
 	return ClusterProfileSetFetchResult{
 		set:        set,
@@ -184,18 +193,25 @@ func (r *ProfileSetReconciler) ComposeState(
 	fetch ProfileSetFetchResult,
 ) ProfileSetObservation {
 	obs := ProfileSetObservation{}
-	if fetch.candidates.Error == nil {
+	obs.buildErr = validateProfileSetSourceScope(fetch.set.Spec)
+	if obs.buildErr == nil && fetch.candidates.Error == nil {
 		var selected []aimprofile.ProfileCopyCandidate
 		selected, obs.buildErr = resolveSelectedProfileSetCandidates(fetch.candidates.Value, profileCopyRequest(fetch.set.Spec))
 		if obs.buildErr == nil {
 			obs.desiredProfiles, obs.buildErr = buildDesiredNamespaceProfiles(fetch.set, selected)
+		}
+		if obs.buildErr == nil && fetch.managed.Error == nil {
+			obs.buildErr = stabilizeDerivedProfileNames(obs.desiredProfiles, fetch.managed.Value)
 		}
 	}
 	if fetch.managed.Error == nil {
 		obs.existingManaged = fetch.managed.Value
 		obs.managedProfiles, obs.existingDesiredCount = summarizeManagedProfiles(obs.desiredProfiles, fetch.managed.Value)
 	}
-	obs.pruneSafe = fetch.candidates.Error == nil && fetch.managed.Error == nil && obs.buildErr == nil
+	obs.pruneSafe = fetch.candidates.Error == nil &&
+		fetch.managed.Error == nil &&
+		obs.buildErr == nil &&
+		profileSetPruneReady(obs.desiredProfiles, obs.existingManaged)
 	obs.componentHealth = buildComponentHealth(collectErrors(fetch.candidates.Error, fetch.managed.Error), obs.buildErr, obs.managedProfiles, obs.existingDesiredCount)
 	return obs
 }
@@ -206,18 +222,25 @@ func (r *ClusterProfileSetReconciler) ComposeState(
 	fetch ClusterProfileSetFetchResult,
 ) ClusterProfileSetObservation {
 	obs := ClusterProfileSetObservation{}
-	if fetch.candidates.Error == nil {
+	obs.buildErr = validateProfileSetSourceScope(fetch.set.Spec)
+	if obs.buildErr == nil && fetch.candidates.Error == nil {
 		var selected []aimprofile.ProfileCopyCandidate
 		selected, obs.buildErr = resolveSelectedProfileSetCandidates(fetch.candidates.Value, profileCopyRequest(fetch.set.Spec))
 		if obs.buildErr == nil {
 			obs.desiredProfiles, obs.buildErr = buildDesiredClusterProfiles(fetch.set, selected)
+		}
+		if obs.buildErr == nil && fetch.managed.Error == nil {
+			obs.buildErr = stabilizeDerivedProfileNames(obs.desiredProfiles, fetch.managed.Value)
 		}
 	}
 	if fetch.managed.Error == nil {
 		obs.existingManaged = fetch.managed.Value
 		obs.managedProfiles, obs.existingDesiredCount = summarizeManagedProfiles(obs.desiredProfiles, fetch.managed.Value)
 	}
-	obs.pruneSafe = fetch.candidates.Error == nil && fetch.managed.Error == nil && obs.buildErr == nil
+	obs.pruneSafe = fetch.candidates.Error == nil &&
+		fetch.managed.Error == nil &&
+		obs.buildErr == nil &&
+		profileSetPruneReady(obs.desiredProfiles, obs.existingManaged)
 	obs.componentHealth = buildComponentHealth(collectErrors(fetch.candidates.Error, fetch.managed.Error), obs.buildErr, obs.managedProfiles, obs.existingDesiredCount)
 	return obs
 }
@@ -317,6 +340,12 @@ func buildDesiredNamespaceProfiles(set *aimv1alpha2.AIMProfileSet, candidates []
 		profile.Spec = aimv1alpha2.AIMProfileSpec{AIMProfileSpecCommon: copiedSpec}
 		profile.Spec.ImagePullSecrets = inheritedPullSecrets(set.Spec, source.Spec)
 		profile.Spec.ServiceAccountName = inheritedServiceAccount(set.Spec, source.Spec)
+		aimprofile.StampProfileProvenance(
+			profile,
+			aimprofile.ProfileRoleLabelValue(copiedSpec),
+			aimv1alpha1.ProfileOriginDerived,
+			namespaceProfileSetSourceModel(set),
+		)
 		desired = append(desired, desiredProfile{Object: profile})
 	}
 	return desired, nil
@@ -351,9 +380,56 @@ func buildDesiredClusterProfiles(set *aimv1alpha2.AIMClusterProfileSet, candidat
 		profile.Spec = aimv1alpha2.AIMClusterProfileSpec{AIMProfileSpecCommon: copiedSpec}
 		profile.Spec.ImagePullSecrets = inheritedPullSecrets(set.Spec, source.Spec)
 		profile.Spec.ServiceAccountName = inheritedServiceAccount(set.Spec, source.Spec)
+		aimprofile.StampProfileProvenance(
+			profile,
+			aimprofile.ProfileRoleLabelValue(copiedSpec),
+			aimv1alpha1.ProfileOriginDerived,
+			clusterProfileSetSourceModel(set),
+		)
 		desired = append(desired, desiredProfile{Object: profile})
 	}
 	return desired, nil
+}
+
+// namespaceProfileSetSourceModel returns the target-model identity propagated
+// onto a model-owned child profile set. A standalone set's sourceRef identifies
+// input, not ownership, so it deliberately does not stamp that source model
+// onto its outputs.
+func namespaceProfileSetSourceModel(set *aimv1alpha2.AIMProfileSet) *aimv1alpha2.ProfileSourceModel {
+	return sourceModelFromProfileSetLabels(set.Labels, set.Namespace)
+}
+
+func clusterProfileSetSourceModel(set *aimv1alpha2.AIMClusterProfileSet) *aimv1alpha2.ProfileSourceModel {
+	return sourceModelFromProfileSetLabels(set.Labels, "")
+}
+
+func validateProfileSetSourceScope(spec aimv1alpha1.AIMProfileSetSpec) error {
+	if spec.SourceRef == nil || spec.Selector.ModelRef == nil {
+		return nil
+	}
+	return controllerutils.NewInvalidSpecError(
+		"ConflictingProfileSources",
+		"spec.sourceRef cannot be combined with spec.selector.modelRef; sourceRef selects a catalog while modelRef filters already-materialized profiles",
+		nil,
+	)
+}
+
+func sourceModelFromProfileSetLabels(setLabels map[string]string, namespace string) *aimv1alpha2.ProfileSourceModel {
+	name := setLabels[constants.LabelKeySourceModel]
+	if name == "" {
+		return nil
+	}
+	if setLabels[constants.LabelKeySourceModelScope] == constants.LabelValueSourceModelScopeCluster {
+		return &aimv1alpha2.ProfileSourceModel{
+			Name: name,
+			Kind: aimv1alpha2.ProfileSourceModelKindAIMClusterModel,
+		}
+	}
+	return &aimv1alpha2.ProfileSourceModel{
+		Name:      name,
+		Kind:      aimv1alpha2.ProfileSourceModelKindAIMModel,
+		Namespace: namespace,
+	}
 }
 
 func profileCopyRequest(spec aimv1alpha1.AIMProfileSetSpec) aimprofile.ProfileCopyRequest {
@@ -370,9 +446,20 @@ func resolveSelectedProfileSetCandidates(
 	candidates []profileSetCandidate,
 	req aimprofile.ProfileCopyRequest,
 ) ([]aimprofile.ProfileCopyCandidate, error) {
-	plain := make([]aimprofile.ProfileCopyCandidate, len(candidates))
+	provenance, _, err := aimprofile.ProvenanceLabelSelector(req.Selector)
+	if err != nil {
+		return nil, controllerutils.NewInvalidSpecError("InvalidProfileSelection", err.Error(), err)
+	}
+
+	eligible := make([]profileSetCandidate, 0, len(candidates))
 	for i := range candidates {
-		plain[i] = candidates[i].ProfileCopyCandidate
+		if provenance == nil || provenance.Matches(labels.Set(candidates[i].labels)) {
+			eligible = append(eligible, candidates[i])
+		}
+	}
+	plain := make([]aimprofile.ProfileCopyCandidate, len(eligible))
+	for i := range eligible {
+		plain[i] = eligible[i].ProfileCopyCandidate
 	}
 
 	selectedIndexes, err := aimprofile.FilterProfileCopyCandidateIndexes(plain, req)
@@ -382,7 +469,7 @@ func resolveSelectedProfileSetCandidates(
 
 	resolved := make([]aimprofile.ProfileCopyCandidate, 0, len(selectedIndexes))
 	for _, index := range selectedIndexes {
-		candidate, err := candidates[index].resolved()
+		candidate, err := eligible[index].resolved()
 		if err != nil {
 			return nil, err
 		}
@@ -462,7 +549,16 @@ func summarizeManagedProfiles(desired []desiredProfile, existing []managedProfil
 		if !found {
 			continue
 		}
+		wantedSpec, wantedOK := profileSpecCommon(desired.Object)
+		currentSpec, currentOK := profileSpecCommon(profile.Object)
+		if !wantedOK || !currentOK || !aimprofile.ProfileSpecsEquivalent(currentSpec, wantedSpec) {
+			continue
+		}
 		existingDesiredCount++
+		if profile.Object.GetGeneration() > 0 &&
+			profile.Status.ObservedGeneration != profile.Object.GetGeneration() {
+			continue
+		}
 		switch profile.Status.Status {
 		case constants.AIMStatusReady:
 			result.Ready++
@@ -485,6 +581,69 @@ func profileSpecCommon(obj client.Object) (aimv1alpha2.AIMProfileSpecCommon, boo
 	default:
 		return aimv1alpha2.AIMProfileSpecCommon{}, false
 	}
+}
+
+// stabilizeDerivedProfileNames preserves the historical name for ordinary
+// derivations, but rolls to a deterministic alternate when that name is
+// occupied by an owned profile whose non-empty aimId cannot be updated in
+// place. Once the alternate exists for the requested identity, it remains the
+// desired name so the controller does not oscillate back after pruning the old
+// profile.
+func stabilizeDerivedProfileNames(desired []desiredProfile, existing []managedProfile) error {
+	if len(desired) == 0 || len(existing) == 0 {
+		return nil
+	}
+
+	existingByKey := make(map[string]managedProfile, len(existing))
+	for _, profile := range existing {
+		existingByKey[client.ObjectKeyFromObject(profile.Object).String()] = profile
+	}
+
+	for i := range desired {
+		wantedSpec, ok := profileSpecCommon(desired[i].Object)
+		if !ok {
+			return fmt.Errorf("cannot resolve immutable identity for unsupported desired profile type %T", desired[i].Object)
+		}
+		baseKey := client.ObjectKeyFromObject(desired[i].Object)
+		alternateName, err := utils.GenerateDerivedName(
+			[]string{baseKey.Name},
+			utils.WithHashSource(baseKey.Name, "aimId", wantedSpec.AimId),
+		)
+		if err != nil {
+			return fmt.Errorf("generate identity-safe derived profile name: %w", err)
+		}
+		alternateKey := client.ObjectKey{Namespace: baseKey.Namespace, Name: alternateName}
+
+		if alternate, found := existingByKey[alternateKey.String()]; found {
+			alternateSpec, recognized := profileSpecCommon(alternate.Object)
+			if !recognized {
+				return fmt.Errorf("cannot inspect identity-safe profile %s of type %T", alternateKey, alternate.Object)
+			}
+			if alternateSpec.AimId != "" && alternateSpec.AimId != wantedSpec.AimId {
+				return fmt.Errorf(
+					"identity-safe profile name %s is occupied by immutable aimId %q instead of %q",
+					alternateKey,
+					alternateSpec.AimId,
+					wantedSpec.AimId,
+				)
+			}
+			desired[i].Object.SetName(alternateName)
+			continue
+		}
+
+		current, found := existingByKey[baseKey.String()]
+		if !found {
+			continue
+		}
+		currentSpec, recognized := profileSpecCommon(current.Object)
+		if !recognized {
+			return fmt.Errorf("cannot inspect existing profile %s of type %T", baseKey, current.Object)
+		}
+		if currentSpec.AimId != "" && currentSpec.AimId != wantedSpec.AimId {
+			desired[i].Object.SetName(alternateName)
+		}
+	}
+	return nil
 }
 
 func buildComponentHealth(fetchErrs []error, buildErr error, managed aimv1alpha1.ManagedProfileCounts, existingDesiredCount int32) []controllerutils.ComponentHealth {
@@ -550,11 +709,36 @@ func buildComponentHealth(fetchErrs []error, buildErr error, managed aimv1alpha1
 
 func loadNamespaceCandidates(ctx context.Context, c client.Client, reader client.Reader, set *aimv1alpha2.AIMProfileSet) ([]profileSetCandidate, error) {
 	if set.Spec.SourceRef != nil {
-		_, catalog, err := aimprofile.LoadDiscoveryCatalog(ctx, reader, *set.Spec.SourceRef, set.Namespace)
-		if err != nil {
-			return nil, err
+		switch set.Spec.SourceRef.EffectiveKind() {
+		case aimv1alpha1.ProfileSourceKindConfigMap:
+			_, catalog, err := aimprofile.LoadDiscoveryCatalog(ctx, reader, *set.Spec.SourceRef, set.Namespace)
+			if err != nil {
+				return nil, err
+			}
+			return resolvedProfileSetCandidates(catalog.ToCandidates()), nil
+		case aimv1alpha1.ProfileSourceKindAIMModel:
+			var model aimv1alpha2.AIMModel
+			if err := reader.Get(ctx, client.ObjectKey{Name: set.Spec.SourceRef.Name, Namespace: set.Namespace}, &model); err != nil {
+				return nil, fmt.Errorf("load source AIMModel %s/%s: %w", set.Namespace, set.Spec.SourceRef.Name, err)
+			}
+			return loadModelCatalogCandidates(ctx, reader, &model.Spec, &model.Status, model.Generation, string(model.UID), set.Namespace)
+		case aimv1alpha1.ProfileSourceKindAIMClusterModel:
+			var model aimv1alpha2.AIMClusterModel
+			if err := reader.Get(ctx, client.ObjectKey{Name: set.Spec.SourceRef.Name}, &model); err != nil {
+				return nil, fmt.Errorf("load source AIMClusterModel %q: %w", set.Spec.SourceRef.Name, err)
+			}
+			return loadModelCatalogCandidates(
+				ctx,
+				reader,
+				&model.Spec,
+				&model.Status,
+				model.Generation,
+				string(model.UID),
+				constants.GetOperatorNamespace(),
+			)
+		default:
+			return nil, fmt.Errorf("unsupported profile source kind %q", set.Spec.SourceRef.Kind)
 		}
-		return resolvedProfileSetCandidates(catalog.ToCandidates()), nil
 	}
 	provenance, scope, err := aimprofile.ProvenanceLabelSelector(set.Spec.Selector)
 	if err != nil {
@@ -586,12 +770,33 @@ func loadNamespaceCandidates(ctx context.Context, c client.Client, reader client
 
 func loadClusterCandidates(ctx context.Context, c client.Client, reader client.Reader, set *aimv1alpha2.AIMClusterProfileSet) ([]profileSetCandidate, error) {
 	if set.Spec.SourceRef != nil {
-		namespace := constants.GetOperatorNamespace()
-		_, catalog, err := aimprofile.LoadDiscoveryCatalog(ctx, reader, *set.Spec.SourceRef, namespace)
-		if err != nil {
-			return nil, fmt.Errorf("load sourceRef %q from operator namespace %q: %w", set.Spec.SourceRef.Name, namespace, err)
+		switch set.Spec.SourceRef.EffectiveKind() {
+		case aimv1alpha1.ProfileSourceKindConfigMap:
+			namespace := constants.GetOperatorNamespace()
+			_, catalog, err := aimprofile.LoadDiscoveryCatalog(ctx, reader, *set.Spec.SourceRef, namespace)
+			if err != nil {
+				return nil, fmt.Errorf("load sourceRef %q from operator namespace %q: %w", set.Spec.SourceRef.Name, namespace, err)
+			}
+			return resolvedProfileSetCandidates(catalog.ToCandidates()), nil
+		case aimv1alpha1.ProfileSourceKindAIMClusterModel:
+			var model aimv1alpha2.AIMClusterModel
+			if err := reader.Get(ctx, client.ObjectKey{Name: set.Spec.SourceRef.Name}, &model); err != nil {
+				return nil, fmt.Errorf("load source AIMClusterModel %q: %w", set.Spec.SourceRef.Name, err)
+			}
+			return loadModelCatalogCandidates(
+				ctx,
+				reader,
+				&model.Spec,
+				&model.Status,
+				model.Generation,
+				string(model.UID),
+				constants.GetOperatorNamespace(),
+			)
+		case aimv1alpha1.ProfileSourceKindAIMModel:
+			return nil, fmt.Errorf("AIMClusterProfileSet cannot use namespace-scoped AIMModel %q as a source", set.Spec.SourceRef.Name)
+		default:
+			return nil, fmt.Errorf("unsupported profile source kind %q", set.Spec.SourceRef.Kind)
 		}
-		return resolvedProfileSetCandidates(catalog.ToCandidates()), nil
 	}
 	provenance, _, err := aimprofile.ProvenanceLabelSelector(set.Spec.Selector)
 	if err != nil {
@@ -604,6 +809,78 @@ func loadClusterCandidates(ctx context.Context, c client.Client, reader client.R
 		aimIDFilter = ""
 	}
 	return listClusterProfileCandidatesWithLabels(ctx, c, aimIDFilter, provenance)
+}
+
+func loadModelCatalogCandidates(
+	ctx context.Context,
+	reader client.Reader,
+	spec *aimv1alpha1.AIMModelSpec,
+	status *aimv1alpha1.AIMModelStatus,
+	generation int64,
+	modelUID string,
+	expectedCacheNamespace string,
+) ([]profileSetCandidate, error) {
+	if spec == nil || spec.Image == "" {
+		return nil, fmt.Errorf("referenced model is not image-backed")
+	}
+	if status == nil {
+		return nil, fmt.Errorf("referenced model has no discovery status")
+	}
+	if generation > 0 && status.ObservedGeneration != generation {
+		return nil, fmt.Errorf(
+			"referenced model discovery is stale: observed generation %d, current generation %d",
+			status.ObservedGeneration,
+			generation,
+		)
+	}
+	if status.DiscoveryCacheRef == nil || status.DiscoveryCacheRef.Name == "" {
+		return nil, fmt.Errorf("referenced model has not published a discovery cache")
+	}
+	cacheNamespace := status.DiscoveryCacheRef.Namespace
+	if cacheNamespace == "" {
+		cacheNamespace = expectedCacheNamespace
+	}
+	if cacheNamespace != expectedCacheNamespace {
+		return nil, fmt.Errorf(
+			"referenced model discovery cache namespace %q does not match expected namespace %q",
+			cacheNamespace,
+			expectedCacheNamespace,
+		)
+	}
+	cache, catalog, err := aimprofile.LoadDiscoveryCatalog(
+		ctx,
+		reader,
+		aimv1alpha1.ProfileSourceRef{
+			Kind: aimv1alpha1.ProfileSourceKindConfigMap,
+			Name: status.DiscoveryCacheRef.Name,
+		},
+		cacheNamespace,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("load referenced model discovery cache %s/%s: %w", cacheNamespace, status.DiscoveryCacheRef.Name, err)
+	}
+	if modelUID != "" && !aimmodel.CacheOwnedByModel(cache, modelUID) {
+		return nil, fmt.Errorf("referenced discovery cache %s/%s is not owned by the current model", cacheNamespace, cache.Name)
+	}
+	expectedSpecHash := aimmodel.ComputeDiscoverySpecHash(
+		spec.Image,
+		spec.ImagePullSecrets,
+		spec.ServiceAccountName,
+		aimmodel.DiscoveryCommandVersion,
+	)
+	if !aimmodel.CacheHasMatchingSpecHash(cache, expectedSpecHash) {
+		return nil, fmt.Errorf("referenced model discovery cache %s/%s is stale", cacheNamespace, cache.Name)
+	}
+
+	candidates := catalog.ToCandidates()
+	for i := range candidates {
+		candidates[i].Spec.ImagePullSecrets = append(
+			[]corev1.LocalObjectReference(nil),
+			spec.ImagePullSecrets...,
+		)
+		candidates[i].Spec.ServiceAccountName = spec.ServiceAccountName
+	}
+	return resolvedProfileSetCandidates(candidates), nil
 }
 
 func listClusterProfileCandidatesWithLabels(ctx context.Context, c client.Client, aimID string, provenance labels.Selector) ([]profileSetCandidate, error) {
@@ -677,10 +954,53 @@ func resolvedProfileSetCandidates(candidates []aimprofile.ProfileCopyCandidate) 
 	for i := range candidates {
 		resolved[i] = profileSetCandidate{
 			ProfileCopyCandidate: candidates[i],
-			contractResolved:     true,
+			labels: map[string]string{
+				constants.LabelKeyProfileRole:   aimprofile.ProfileRoleLabelValue(candidates[i].Spec),
+				constants.LabelKeyProfileOrigin: string(aimv1alpha1.ProfileOriginDiscovered),
+			},
+			sourceKind:       "discovery catalog",
+			contractResolved: true,
 		}
 	}
 	return resolved
+}
+
+// profileSetPruneReady allows stale managed outputs to be removed only after
+// every non-empty replacement exists with the desired spec and has reported
+// Ready for its current generation. A valid zero-match selection may prune
+// immediately because there is no replacement rollout to wait for.
+func profileSetPruneReady(desired []desiredProfile, existing []managedProfile) bool {
+	desiredNames := desiredProfileNames(desired)
+	hasStale := false
+	for _, profile := range existing {
+		if _, keep := desiredNames[client.ObjectKeyFromObject(profile.Object).String()]; !keep {
+			hasStale = true
+			break
+		}
+	}
+	if !hasStale || len(desired) == 0 {
+		return true
+	}
+
+	existingByKey := make(map[string]managedProfile, len(existing))
+	for _, profile := range existing {
+		existingByKey[client.ObjectKeyFromObject(profile.Object).String()] = profile
+	}
+	for _, wanted := range desired {
+		current, found := existingByKey[client.ObjectKeyFromObject(wanted.Object).String()]
+		if !found ||
+			current.Object.GetGeneration() <= 0 ||
+			current.Status.ObservedGeneration != current.Object.GetGeneration() ||
+			current.Status.Status != constants.AIMStatusReady {
+			return false
+		}
+		wantedSpec, wantedOK := profileSpecCommon(wanted.Object)
+		currentSpec, currentOK := profileSpecCommon(current.Object)
+		if !wantedOK || !currentOK || !aimprofile.ProfileSpecsEquivalent(currentSpec, wantedSpec) {
+			return false
+		}
+	}
+	return true
 }
 
 func mergeCandidates(clusterCandidates, namespaceCandidates []aimprofile.ProfileCopyCandidate) []aimprofile.ProfileCopyCandidate {

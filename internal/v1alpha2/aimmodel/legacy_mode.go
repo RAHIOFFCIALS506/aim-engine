@@ -36,12 +36,13 @@
 //     RecommendedDeployments → AIMServiceTemplate, plus customTemplates /
 //     fine-tuned matching) runs whenever the spec carries any v1alpha1
 //     inputs (image, customTemplates, modelSources, aimId, etc.). It is
-//     skipped entirely for pure v1alpha2 specs (profileCopy-only) so it
+//     skipped entirely for pure v1alpha2 specs (profiles-only) so it
 //     does not surface conditions like ImageMetadataReady=False on a model
 //     that legitimately has no image.
 //   - The v1alpha2 native pipeline (in-cluster discovery Job → catalog →
-//     AIMProfile, plus profileCopy → AIMProfileSet) always runs. It is a
-//     no-op when neither spec.image nor spec.profileCopy is set.
+//     AIMProfile, plus spec.profiles → AIMProfileSet) always runs. When image
+//     and profiles are combined, the child set reads directly from the
+//     model-owned catalog and only the derived outputs are materialised.
 //
 // The two pipelines write disjoint plan items (templates vs profiles) and
 // disjoint status fields, so they compose without conflict. Earlier
@@ -81,10 +82,10 @@ func derivationSpec(spec *aimv1alpha1.AIMModelSpec) *aimv1alpha1.AIMProfileSetSp
 // spec shape. Returns one of AIMModelKindImage, AIMModelKindDerived,
 // AIMModelKindCustom, or empty when the spec doesn't match any known flow.
 //
-// Precedence: spec.image wins over spec.profiles when both are somehow
-// set (CEL should prevent this, but if it leaks through we treat the
-// image as authoritative since image discovery would dominate the
-// resulting profile set).
+// Precedence: spec.image wins over spec.profiles when both are set. This is a
+// supported image-backed derivation flow: discovery provides the source
+// catalog, the child profile set applies selection/overrides, and status.kind
+// remains Image.
 //
 // Within the derivation flows, the discriminator is the source profile's
 // role: a `base`-role selector means "overlay onto a generic base

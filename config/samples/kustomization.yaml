@@ -11,6 +11,8 @@ resources:
 - aim_v1alpha1_aimservicetemplate.yaml
 - aim_v1alpha1_aimtemplatecache.yaml
 - aim_v1alpha2_aimmodel_official.yaml
+- aim_v1alpha2_aimclustermodel_partitioned.yaml
+- aim_v1alpha2_aimclusterprofileset_model_catalog.yaml
 - aim_v1alpha2_aimmodel_finetune.yaml
 - aim_v1alpha2_aimprofileset.yaml
 - aim_v1alpha2_aimprofileset_cache.yaml

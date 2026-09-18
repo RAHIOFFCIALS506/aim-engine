@@ -59,6 +59,7 @@ const (
 // +kubebuilder:validation:XValidation:rule="!has(self.spec.profiles)",message="spec.profiles is only supported on v1alpha2; use spec.profileCopy on v1alpha1"
 // +kubebuilder:validation:XValidation:rule="!has(self.spec.modelId)",message="spec.modelId is only supported on v1alpha2"
 // +kubebuilder:validation:XValidation:rule="!has(self.spec.accelerator)",message="spec.accelerator is only supported on v1alpha2"
+// +kubebuilder:validation:XValidation:rule="!has(self.spec.profileCopy) || !has(self.spec.profileCopy.sourceRef) || !has(self.spec.profileCopy.sourceRef.kind) || self.spec.profileCopy.sourceRef.kind == 'ConfigMap'",message="v1alpha1 spec.profileCopy.sourceRef supports only ConfigMap; use v1alpha2 for AIMModel or AIMClusterModel catalog references"
 type AIMClusterModel struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`

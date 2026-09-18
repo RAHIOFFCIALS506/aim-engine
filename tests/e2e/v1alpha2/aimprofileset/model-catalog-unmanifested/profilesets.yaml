@@ -1,0 +1,31 @@
+apiVersion: aim.eai.amd.com/v1alpha2
+kind: AIMProfileSet
+metadata:
+  name: namespace-unmanifested-partitioned
+spec:
+  sourceRef:
+    kind: AIMClusterModel
+    name: profileset-unmanifested-catalog
+  selector:
+    profileId: mi325x-fp8-latency
+  versionPolicy: pinned
+  version: "0.2.2"
+  overrides:
+    acceleratorCount: 1
+    acceleratorPartitioningMode: CPX-NPS4
+---
+apiVersion: aim.eai.amd.com/v1alpha2
+kind: AIMClusterProfileSet
+metadata:
+  name: cluster-unmanifested-partitioned
+spec:
+  sourceRef:
+    kind: AIMClusterModel
+    name: profileset-unmanifested-catalog
+  selector:
+    profileId: mi325x-fp8-latency
+  versionPolicy: pinned
+  version: "0.2.2"
+  overrides:
+    acceleratorCount: 1
+    acceleratorPartitioningMode: CPX-NPS4

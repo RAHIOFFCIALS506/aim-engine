@@ -5,12 +5,16 @@ metadata:
 spec:
   description: |
     Verifies that the v1alpha2 AIMModel onboarding contract is enforced by CRD
-    validation: only spec.image XOR spec.profiles is accepted; legacy
+    validation: spec.modelId is exclusive, while spec.image and spec.profiles
+    may be combined for image-scoped derivation; legacy
     onboarding fields (profileCopy, custom, customTemplates, top-level
     modelSources) are rejected; spec.derivedFrom is rejected on new v1alpha2
-    objects (deprecated flat shape); spec.profiles cannot be combined with
-    image / aimId / etc.; profiles version contract is enforced; and
-    v1alpha1 keeps rejecting spec.derivedFrom and spec.profiles.
+    objects (deprecated flat shape); image-backed profiles reject user-supplied
+    sourceRef/modelRef and disabled metadata extraction; profiles cannot be
+    combined with aimId; the profiles version contract is enforced; and
+    v1alpha1 keeps rejecting spec.derivedFrom, spec.profiles, and model-kind
+    sourceRefs on deprecated profileCopy. The same image-backed contract is
+    covered for AIMClusterModel.
   timeouts:
     assert: 30s
   steps:
@@ -144,7 +148,27 @@ spec:
                   - modelId: invalid-org/invalid-model
                     sourceUri: hf://invalid-org/invalid-model
 
-    - name: Reject profiles combined with image
+    - name: Accept image-backed profiles
+      try:
+        - apply:
+            resource:
+              apiVersion: aim.eai.amd.com/v1alpha2
+              kind: AIMModel
+              metadata:
+                name: valid-image-plus-profiles
+              spec:
+                image: quay.io/amd/aim-invalid:0.1.0
+                discovery:
+                  createServiceTemplates: false
+                profiles:
+                  derivedFrom:
+                    selector:
+                      acceleratorModel: MI300X
+                      acceleratorCount: 1
+                  versionPolicy: pinned
+                  version: 0.1.0
+
+    - name: Reject image-backed profiles with sourceRef
       try:
         - apply:
             expect:
@@ -154,13 +178,145 @@ spec:
               apiVersion: aim.eai.amd.com/v1alpha2
               kind: AIMModel
               metadata:
-                name: invalid-image-plus-profiles
+                name: invalid-image-profiles-source-ref
+              spec:
+                image: quay.io/amd/aim-invalid:0.1.0
+                profiles:
+                  derivedFrom:
+                    sourceRef:
+                      name: alternate-cache
+                    selector:
+                      acceleratorModel: MI300X
+                  versionPolicy: pinned
+                  version: 0.1.0
+
+    - name: Reject image-backed profiles with modelRef
+      try:
+        - apply:
+            expect:
+              - check:
+                  ($error != null): true
+            resource:
+              apiVersion: aim.eai.amd.com/v1alpha2
+              kind: AIMModel
+              metadata:
+                name: invalid-image-profiles-model-ref
               spec:
                 image: quay.io/amd/aim-invalid:0.1.0
                 profiles:
                   derivedFrom:
                     selector:
-                      aimId: invalid-org/invalid-model
+                      acceleratorModel: MI300X
+                      modelRef:
+                        name: alternate-model
+                  versionPolicy: pinned
+                  version: 0.1.0
+
+    - name: Reject image-backed profiles with metadata discovery disabled
+      try:
+        - apply:
+            expect:
+              - check:
+                  ($error != null): true
+            resource:
+              apiVersion: aim.eai.amd.com/v1alpha2
+              kind: AIMModel
+              metadata:
+                name: invalid-image-profiles-no-discovery
+              spec:
+                image: quay.io/amd/aim-invalid:0.1.0
+                discovery:
+                  extractMetadata: false
+                profiles:
+                  derivedFrom:
+                    selector:
+                      acceleratorModel: MI300X
+                  versionPolicy: pinned
+                  version: 0.1.0
+
+    - name: Accept cluster image-backed profiles
+      try:
+        - apply:
+            resource:
+              apiVersion: aim.eai.amd.com/v1alpha2
+              kind: AIMClusterModel
+              metadata:
+                name: valid-cluster-image-plus-profiles
+              spec:
+                image: quay.io/amd/aim-invalid:0.1.0
+                discovery:
+                  createServiceTemplates: false
+                profiles:
+                  derivedFrom:
+                    selector:
+                      acceleratorModel: MI300X
+                      acceleratorCount: 1
+                  versionPolicy: pinned
+                  version: 0.1.0
+
+    - name: Reject cluster image-backed profiles with sourceRef
+      try:
+        - apply:
+            expect:
+              - check:
+                  ($error != null): true
+            resource:
+              apiVersion: aim.eai.amd.com/v1alpha2
+              kind: AIMClusterModel
+              metadata:
+                name: invalid-cluster-image-profiles-source
+              spec:
+                image: quay.io/amd/aim-invalid:0.1.0
+                profiles:
+                  derivedFrom:
+                    sourceRef:
+                      name: alternate-cache
+                    selector:
+                      acceleratorModel: MI300X
+                  versionPolicy: pinned
+                  version: 0.1.0
+
+    - name: Reject cluster image-backed profiles with modelRef
+      try:
+        - apply:
+            expect:
+              - check:
+                  ($error != null): true
+            resource:
+              apiVersion: aim.eai.amd.com/v1alpha2
+              kind: AIMClusterModel
+              metadata:
+                name: invalid-cluster-image-profiles-model-ref
+              spec:
+                image: quay.io/amd/aim-invalid:0.1.0
+                profiles:
+                  derivedFrom:
+                    selector:
+                      acceleratorModel: MI300X
+                      modelRef:
+                        name: alternate-model
+                  versionPolicy: pinned
+                  version: 0.1.0
+
+    - name: Reject cluster image-backed profiles with metadata discovery disabled
+      try:
+        - apply:
+            expect:
+              - check:
+                  ($error != null): true
+            resource:
+              apiVersion: aim.eai.amd.com/v1alpha2
+              kind: AIMClusterModel
+              metadata:
+                name: invalid-cluster-image-profiles-no-discovery
+              spec:
+                image: quay.io/amd/aim-invalid:0.1.0
+                discovery:
+                  extractMetadata: false
+                profiles:
+                  derivedFrom:
+                    selector:
+                      acceleratorModel: MI300X
                   versionPolicy: pinned
                   version: 0.1.0
 
@@ -220,3 +376,39 @@ spec:
                       aimId: invalid-org/invalid-model
                   versionPolicy: pinned
                   version: 0.1.0
+
+    - name: Reject model catalog sourceRef on v1alpha1 profileCopy
+      try:
+        - apply:
+            expect:
+              - check:
+                  ($error != null): true
+            resource:
+              apiVersion: aim.eai.amd.com/v1alpha1
+              kind: AIMModel
+              metadata:
+                name: invalid-model-source-ref-v1alpha1
+              spec:
+                profileCopy:
+                  sourceRef:
+                    kind: AIMModel
+                    name: source-model
+                  versionPolicy: all
+
+    - name: Reject model catalog sourceRef on v1alpha1 cluster profileCopy
+      try:
+        - apply:
+            expect:
+              - check:
+                  ($error != null): true
+            resource:
+              apiVersion: aim.eai.amd.com/v1alpha1
+              kind: AIMClusterModel
+              metadata:
+                name: invalid-cluster-model-source-ref-v1alpha1
+              spec:
+                profileCopy:
+                  sourceRef:
+                    kind: AIMClusterModel
+                    name: source-cluster-model
+                  versionPolicy: all

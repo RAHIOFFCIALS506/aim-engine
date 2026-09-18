@@ -40,6 +40,7 @@ import (
 	"github.com/amd-enterprise-ai/aim-engine/internal/constants"
 	controllerutils "github.com/amd-enterprise-ai/aim-engine/internal/controller/utils"
 	"github.com/amd-enterprise-ai/aim-engine/internal/utils"
+	"github.com/amd-enterprise-ai/aim-engine/internal/v1alpha2/aimmodel"
 	"github.com/amd-enterprise-ai/aim-engine/internal/v1alpha2/aimprofile"
 	"github.com/amd-enterprise-ai/aim-engine/internal/v1alpha2/profileyaml"
 )
@@ -108,6 +109,480 @@ metadata:
 	}
 	if candidates[0].Spec.Image != "quay.io/amd/aim-qwen:0.9.0" {
 		t.Fatalf("candidate image = %q, want source image from metadata", candidates[0].Spec.Image)
+	}
+}
+
+func TestLoadNamespaceCandidates_UsesAIMModelDiscoveryCatalog(t *testing.T) {
+	t.Parallel()
+
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatalf("corev1.AddToScheme() error = %v", err)
+	}
+	if err := aimv1alpha2.AddToScheme(scheme); err != nil {
+		t.Fatalf("AddToScheme() error = %v", err)
+	}
+
+	const (
+		namespace   = "team-a"
+		modelName   = "llama-source"
+		modelUID    = "llama-source-uid"
+		cacheName   = "llama-source-discovery"
+		sourceImage = "amdenterpriseai/aim-meta-llama-llama-3-1-8b-instruct:0.11.1"
+	)
+	pullSecrets := []corev1.LocalObjectReference{{Name: "registry-creds"}}
+	serviceAccount := "aim-puller"
+	specHash := aimmodel.ComputeDiscoverySpecHash(
+		sourceImage,
+		pullSecrets,
+		serviceAccount,
+		aimmodel.DiscoveryCommandVersion,
+	)
+	cache, err := aimmodel.BuildDiscoveryCacheConfigMap(aimmodel.DiscoveryCacheInput{
+		Name:                    cacheName,
+		Namespace:               namespace,
+		ModelUID:                modelUID,
+		ModelName:               modelName,
+		SourceImage:             sourceImage,
+		SourceSpecHash:          specHash,
+		DiscoveryCommandVersion: aimmodel.DiscoveryCommandVersion,
+		Profiles: map[string][]byte{
+			"meta-llama/Llama-3.1-8B-Instruct/mi300x-tp1.yaml": []byte(`aim_id: meta-llama/Llama-3.1-8B-Instruct
+model_id: meta-llama/Llama-3.1-8B-Instruct
+metadata:
+  engine: vllm
+  metric: latency
+  precision: fp16
+  type: optimized
+  accelerator_model: MI300X
+  accelerator_count: 1
+engine_args:
+  tensor_parallel_size: 1
+`),
+		},
+	})
+	if err != nil {
+		t.Fatalf("BuildDiscoveryCacheConfigMap() error = %v", err)
+	}
+	model := &aimv1alpha2.AIMModel{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       modelName,
+			Namespace:  namespace,
+			UID:        modelUID,
+			Generation: 2,
+		},
+		Spec: aimv1alpha1.AIMModelSpec{
+			Image:              sourceImage,
+			ImagePullSecrets:   pullSecrets,
+			ServiceAccountName: serviceAccount,
+		},
+		Status: aimv1alpha1.AIMModelStatus{
+			ObservedGeneration: 2,
+			DiscoveryCacheRef: &aimv1alpha1.DiscoveryCacheReference{
+				Name:      cacheName,
+				Namespace: namespace,
+			},
+		},
+	}
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(model, cache).
+		Build()
+	count := int32(1)
+	set := &aimv1alpha2.AIMProfileSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "llama-partitioned",
+			Namespace: namespace,
+			UID:       "set-uid",
+		},
+		Spec: aimv1alpha1.AIMProfileSetSpec{
+			SourceRef: &aimv1alpha1.ProfileSourceRef{
+				Kind: aimv1alpha1.ProfileSourceKindAIMModel,
+				Name: modelName,
+			},
+			Selector: aimv1alpha1.ProfileSelector{
+				AcceleratorModel: "MI300X",
+				AcceleratorCount: &count,
+			},
+			VersionPolicy: aimv1alpha1.ProfileVersionPolicyPinned,
+			Version:       "0.11.1",
+			Overrides: &aimv1alpha1.ProfileOverrides{
+				AcceleratorCount:            &count,
+				AcceleratorPartitioningMode: "CPX-NPS4",
+			},
+		},
+	}
+
+	candidates, err := loadNamespaceCandidates(context.Background(), fakeClient, fakeClient, set)
+	if err != nil {
+		t.Fatalf("loadNamespaceCandidates() error = %v", err)
+	}
+	if len(candidates) != 1 {
+		t.Fatalf("len(candidates) = %d, want one unmaterialized catalog candidate", len(candidates))
+	}
+	if len(candidates[0].Spec.ImagePullSecrets) != 1 ||
+		candidates[0].Spec.ImagePullSecrets[0].Name != "registry-creds" ||
+		candidates[0].Spec.ServiceAccountName != serviceAccount {
+		t.Fatalf("candidate runtime identity = %#v/%q, want model credentials", candidates[0].Spec.ImagePullSecrets, candidates[0].Spec.ServiceAccountName)
+	}
+
+	selected, err := resolveSelectedProfileSetCandidates(candidates, profileCopyRequest(set.Spec))
+	if err != nil {
+		t.Fatalf("resolveSelectedProfileSetCandidates() error = %v", err)
+	}
+	desired, err := buildDesiredNamespaceProfiles(set, selected)
+	if err != nil {
+		t.Fatalf("buildDesiredNamespaceProfiles() error = %v", err)
+	}
+	if len(desired) != 1 {
+		t.Fatalf("len(desired) = %d, want one partitioned profile", len(desired))
+	}
+	profile := desired[0].Object.(*aimv1alpha2.AIMProfile)
+	if profile.Labels[constants.LabelKeySourceModel] != "" {
+		t.Fatalf("standalone derived profile unexpectedly claims model ownership: %#v", profile.Labels)
+	}
+}
+
+func TestLoadClusterCandidates_UsesAIMClusterModelDiscoveryCatalog(t *testing.T) {
+	t.Parallel()
+
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatalf("corev1.AddToScheme() error = %v", err)
+	}
+	if err := aimv1alpha2.AddToScheme(scheme); err != nil {
+		t.Fatalf("AddToScheme() error = %v", err)
+	}
+
+	const (
+		modelName   = "gpt-oss-source"
+		modelUID    = "gpt-oss-source-uid"
+		cacheName   = "gpt-oss-source-discovery"
+		sourceImage = "amdenterpriseai/aim-openai-gpt-oss-20b:0.11.1"
+	)
+	operatorNamespace := constants.GetOperatorNamespace()
+	specHash := aimmodel.ComputeDiscoverySpecHash(sourceImage, nil, "", aimmodel.DiscoveryCommandVersion)
+	cache, err := aimmodel.BuildDiscoveryCacheConfigMap(aimmodel.DiscoveryCacheInput{
+		Name:                    cacheName,
+		Namespace:               operatorNamespace,
+		ModelUID:                modelUID,
+		ModelName:               modelName,
+		SourceImage:             sourceImage,
+		SourceSpecHash:          specHash,
+		DiscoveryCommandVersion: aimmodel.DiscoveryCommandVersion,
+		Profiles: map[string][]byte{
+			"openai/gpt-oss-20b/mi300x-tp1.yaml": []byte(`aim_id: openai/gpt-oss-20b
+model_id: openai/gpt-oss-20b
+metadata:
+  engine: vllm
+  metric: latency
+  precision: fp8
+  type: optimized
+  accelerator_model: MI300X
+  accelerator_count: 1
+engine_args:
+  tensor_parallel_size: 1
+`),
+		},
+	})
+	if err != nil {
+		t.Fatalf("BuildDiscoveryCacheConfigMap() error = %v", err)
+	}
+	model := &aimv1alpha2.AIMClusterModel{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       modelName,
+			UID:        modelUID,
+			Generation: 3,
+		},
+		Spec: aimv1alpha1.AIMModelSpec{Image: sourceImage},
+		Status: aimv1alpha1.AIMModelStatus{
+			ObservedGeneration: 3,
+			DiscoveryCacheRef: &aimv1alpha1.DiscoveryCacheReference{
+				Name:      cacheName,
+				Namespace: operatorNamespace,
+			},
+		},
+	}
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(model, cache).
+		Build()
+	count := int32(1)
+	set := &aimv1alpha2.AIMClusterProfileSet{
+		ObjectMeta: metav1.ObjectMeta{Name: "gpt-oss-partitioned", UID: "set-uid"},
+		Spec: aimv1alpha1.AIMProfileSetSpec{
+			SourceRef: &aimv1alpha1.ProfileSourceRef{
+				Kind: aimv1alpha1.ProfileSourceKindAIMClusterModel,
+				Name: modelName,
+			},
+			Selector: aimv1alpha1.ProfileSelector{
+				AcceleratorModel: "MI300X",
+				AcceleratorCount: &count,
+			},
+			VersionPolicy: aimv1alpha1.ProfileVersionPolicyPinned,
+			Version:       "0.11.1",
+			Overrides: &aimv1alpha1.ProfileOverrides{
+				AcceleratorCount:            &count,
+				AcceleratorPartitioningMode: "CPX-NPS4",
+			},
+		},
+	}
+
+	candidates, err := loadClusterCandidates(context.Background(), fakeClient, fakeClient, set)
+	if err != nil {
+		t.Fatalf("loadClusterCandidates() error = %v", err)
+	}
+	selected, err := resolveSelectedProfileSetCandidates(candidates, profileCopyRequest(set.Spec))
+	if err != nil {
+		t.Fatalf("resolveSelectedProfileSetCandidates() error = %v", err)
+	}
+	desired, err := buildDesiredClusterProfiles(set, selected)
+	if err != nil {
+		t.Fatalf("buildDesiredClusterProfiles() error = %v", err)
+	}
+	if len(desired) != 1 {
+		t.Fatalf("len(desired) = %d, want one partitioned cluster profile", len(desired))
+	}
+	profile := desired[0].Object.(*aimv1alpha2.AIMClusterProfile)
+	if profile.Spec.AcceleratorPartitioningMode != "CPX-NPS4" {
+		t.Fatalf("partitioning mode = %q, want CPX-NPS4", profile.Spec.AcceleratorPartitioningMode)
+	}
+	if profile.Labels[constants.LabelKeySourceModel] != "" {
+		t.Fatalf("standalone derived cluster profile unexpectedly claims model ownership: %#v", profile.Labels)
+	}
+}
+
+func TestLoadModelCatalogCandidates_RejectsStaleCache(t *testing.T) {
+	t.Parallel()
+
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatalf("corev1.AddToScheme() error = %v", err)
+	}
+	const (
+		namespace = "team-a"
+		modelUID  = "source-uid"
+		cacheName = "source-discovery"
+	)
+	oldImage := "registry.example/aim:0.11.0"
+	cache, err := aimmodel.BuildDiscoveryCacheConfigMap(aimmodel.DiscoveryCacheInput{
+		Name:                    cacheName,
+		Namespace:               namespace,
+		ModelUID:                modelUID,
+		ModelName:               "source",
+		SourceImage:             oldImage,
+		SourceSpecHash:          aimmodel.ComputeDiscoverySpecHash(oldImage, nil, "", aimmodel.DiscoveryCommandVersion),
+		DiscoveryCommandVersion: aimmodel.DiscoveryCommandVersion,
+		Profiles: map[string][]byte{
+			"model/profile.yaml": []byte(`model_id: org/model
+metadata:
+  engine: vllm
+  metric: latency
+  precision: fp16
+  type: optimized
+  accelerator_model: MI300X
+  accelerator_count: 1
+`),
+		},
+	})
+	if err != nil {
+		t.Fatalf("BuildDiscoveryCacheConfigMap() error = %v", err)
+	}
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(cache).Build()
+	spec := &aimv1alpha1.AIMModelSpec{Image: "registry.example/aim:0.11.1"}
+	status := &aimv1alpha1.AIMModelStatus{
+		ObservedGeneration: 1,
+		DiscoveryCacheRef: &aimv1alpha1.DiscoveryCacheReference{
+			Name:      cacheName,
+			Namespace: namespace,
+		},
+	}
+
+	_, err = loadModelCatalogCandidates(
+		context.Background(),
+		fakeClient,
+		spec,
+		status,
+		1,
+		modelUID,
+		namespace,
+	)
+	if err == nil || !strings.Contains(err.Error(), "stale") {
+		t.Fatalf("loadModelCatalogCandidates() error = %v, want stale-cache error", err)
+	}
+}
+
+func TestCacheBackedDerivationSelectsUnmaterializedPartitionSource(t *testing.T) {
+	t.Parallel()
+
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatalf("corev1.AddToScheme() error = %v", err)
+	}
+	if err := aimv1alpha2.AddToScheme(scheme); err != nil {
+		t.Fatalf("AddToScheme() error = %v", err)
+	}
+	profileYAML := `aim_id: meta-llama/Llama-3.1-8B-Instruct
+model_id: meta-llama/Llama-3.1-8B-Instruct
+metadata:
+  engine: vllm
+  metric: latency
+  precision: fp16
+  type: optimized
+  accelerator_model: MI300X
+  accelerator_count: 1
+engine_args:
+  tensor_parallel_size: 1
+`
+	configMap := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "llama-discovery", Namespace: "team-a"},
+		Data: map[string]string{
+			aimprofile.FlattenProfilePath("meta-llama/Llama-3.1-8B-Instruct/mi300x-tp1.yaml"): profileYAML,
+			aimprofile.DiscoveryCacheMetadataKey: `{
+				"aimId":"meta-llama/Llama-3.1-8B-Instruct",
+				"sourceImage":"amdenterpriseai/aim-meta-llama-llama-3-1-8b-instruct:0.11.1"
+			}`,
+		},
+	}
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(configMap).Build()
+	count := int32(1)
+	set := &aimv1alpha2.AIMProfileSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "llama-partitioned",
+			Namespace: "team-a",
+			UID:       "set-uid",
+		},
+		Spec: aimv1alpha1.AIMProfileSetSpec{
+			SourceRef: &aimv1alpha1.ProfileSourceRef{Name: configMap.Name},
+			Selector: aimv1alpha1.ProfileSelector{
+				AcceleratorModel: "MI300X",
+				AcceleratorCount: &count,
+			},
+			VersionPolicy: aimv1alpha1.ProfileVersionPolicyPinned,
+			Version:       "0.11.1",
+			Overrides: &aimv1alpha1.ProfileOverrides{
+				AcceleratorCount:            &count,
+				AcceleratorPartitioningMode: "CPX-NPS4",
+			},
+		},
+	}
+
+	// The fake client contains only the discovery ConfigMap: no source
+	// AIMProfile was materialized. The cache entry must still be selectable.
+	candidates, err := loadNamespaceCandidates(context.Background(), fakeClient, fakeClient, set)
+	if err != nil {
+		t.Fatalf("loadNamespaceCandidates() error = %v", err)
+	}
+	selected, err := resolveSelectedProfileSetCandidates(candidates, profileCopyRequest(set.Spec))
+	if err != nil {
+		t.Fatalf("resolveSelectedProfileSetCandidates() error = %v", err)
+	}
+	if len(selected) != 1 {
+		t.Fatalf("len(selected) = %d, want 1 cache-backed candidate", len(selected))
+	}
+	desired, err := buildDesiredNamespaceProfiles(set, selected)
+	if err != nil {
+		t.Fatalf("buildDesiredNamespaceProfiles() error = %v", err)
+	}
+	if len(desired) != 1 {
+		t.Fatalf("len(desired) = %d, want 1 partitioned profile", len(desired))
+	}
+	profile := desired[0].Object.(*aimv1alpha2.AIMProfile)
+	if profile.Spec.AcceleratorCount != 1 ||
+		profile.Spec.AcceleratorPartitioningMode != "CPX-NPS4" {
+		t.Fatalf(
+			"derived accelerator shape = count %d mode %q, want count 1 mode CPX-NPS4",
+			profile.Spec.AcceleratorCount,
+			profile.Spec.AcceleratorPartitioningMode,
+		)
+	}
+	var engineArgs map[string]any
+	if err := json.Unmarshal(profile.Spec.EngineArgs.Raw, &engineArgs); err != nil {
+		t.Fatalf("decode inherited engineArgs: %v", err)
+	}
+	if got := engineArgs["tensor_parallel_size"]; got != float64(1) {
+		t.Fatalf("tensor_parallel_size = %#v, want 1 inherited from the selected TP1 source", got)
+	}
+}
+
+func TestResolvedCacheCandidatesHonorRoleAndOriginSelectors(t *testing.T) {
+	t.Parallel()
+
+	deployable := aimprofile.ProfileCopyCandidate{
+		Name: "deployable",
+		Spec: aimv1alpha2.AIMProfileSpecCommon{
+			AimId:            "amd/example",
+			ModelId:          "amd/example",
+			ProfileId:        "deployable",
+			AcceleratorModel: "MI300X",
+			ModelSources: []aimv1alpha1.AIMModelSource{{
+				ModelID:   "amd/example",
+				SourceURI: "hf://amd/example",
+			}},
+		},
+	}
+	base := aimprofile.ProfileCopyCandidate{
+		Name: "base",
+		Spec: aimv1alpha2.AIMProfileSpecCommon{
+			ProfileId:        "base",
+			AcceleratorModel: "MI300X",
+		},
+	}
+	candidates := resolvedProfileSetCandidates([]aimprofile.ProfileCopyCandidate{deployable, base})
+
+	tests := []struct {
+		name     string
+		selector aimv1alpha1.ProfileSelector
+		wantName string
+	}{
+		{
+			name:     "default role excludes base",
+			selector: aimv1alpha1.ProfileSelector{AcceleratorModel: "MI300X"},
+			wantName: "deployable",
+		},
+		{
+			name: "base role selects base",
+			selector: aimv1alpha1.ProfileSelector{
+				AcceleratorModel: "MI300X",
+				Role:             aimv1alpha1.ProfileSelectorRoleBase,
+			},
+			wantName: "base",
+		},
+		{
+			name: "discovered origin matches cache",
+			selector: aimv1alpha1.ProfileSelector{
+				AcceleratorModel: "MI300X",
+				Origin:           aimv1alpha1.ProfileOriginDiscovered,
+			},
+			wantName: "deployable",
+		},
+		{
+			name: "derived origin excludes cache",
+			selector: aimv1alpha1.ProfileSelector{
+				AcceleratorModel: "MI300X",
+				Origin:           aimv1alpha1.ProfileOriginDerived,
+			},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			selected, err := resolveSelectedProfileSetCandidates(candidates, aimprofile.ProfileCopyRequest{
+				Selector:      tc.selector,
+				VersionPolicy: aimv1alpha1.ProfileVersionPolicyAll,
+			})
+			if err != nil {
+				t.Fatalf("resolveSelectedProfileSetCandidates() error = %v", err)
+			}
+			if tc.wantName == "" {
+				if len(selected) != 0 {
+					t.Fatalf("selected = %#v, want no matches", selected)
+				}
+				return
+			}
+			if len(selected) != 1 || selected[0].Name != tc.wantName {
+				t.Fatalf("selected = %#v, want only %q", selected, tc.wantName)
+			}
+		})
 	}
 }
 
@@ -415,6 +890,289 @@ func TestPlanResources_SkipsDeletesWhenCandidatesFailToLoad(t *testing.T) {
 	}
 	if len(obs.componentHealth) != 1 || len(obs.componentHealth[0].Errors) != 1 {
 		t.Fatalf("componentHealth = %#v, want one actionable fetch error", obs.componentHealth)
+	}
+}
+
+func TestProfileSetReconcilers_RejectLegacyConflictingSourceScopesWithoutPruning(t *testing.T) {
+	t.Parallel()
+
+	sourceRef := &aimv1alpha1.ProfileSourceRef{
+		Kind: aimv1alpha1.ProfileSourceKindConfigMap,
+		Name: "source-catalog",
+	}
+	modelRef := &aimv1alpha1.ProfileSelectorModelRef{Name: "source-model"}
+
+	t.Run("namespace", func(t *testing.T) {
+		set := &aimv1alpha2.AIMProfileSet{
+			ObjectMeta: metav1.ObjectMeta{Name: "legacy-conflict", Namespace: "team-a", UID: "set-uid"},
+			Spec: aimv1alpha1.AIMProfileSetSpec{
+				SourceRef:     sourceRef.DeepCopy(),
+				Selector:      aimv1alpha1.ProfileSelector{ModelRef: modelRef.DeepCopy()},
+				VersionPolicy: aimv1alpha1.ProfileVersionPolicyAll,
+			},
+		}
+		existing := managedProfile{Object: &aimv1alpha2.AIMProfile{
+			ObjectMeta: metav1.ObjectMeta{Name: "existing", Namespace: set.Namespace},
+		}}
+		reconciler := &ProfileSetReconciler{}
+		obs := reconciler.ComposeState(
+			context.Background(),
+			controllerutils.ReconcileContext[*aimv1alpha2.AIMProfileSet]{Object: set},
+			ProfileSetFetchResult{
+				set:        set,
+				candidates: controllerutils.FetchResult[[]profileSetCandidate]{},
+				managed:    controllerutils.FetchResult[[]managedProfile]{Value: []managedProfile{existing}},
+			},
+		)
+		plan := reconciler.PlanResources(
+			context.Background(),
+			controllerutils.ReconcileContext[*aimv1alpha2.AIMProfileSet]{Object: set},
+			obs,
+		)
+
+		if obs.buildErr == nil || !strings.Contains(obs.buildErr.Error(), "sourceRef") {
+			t.Fatalf("buildErr = %v, want actionable conflicting-source error", obs.buildErr)
+		}
+		if got := controllerutils.CategorizeError(obs.buildErr).Category(); got != controllerutils.ErrorCategoryInvalidSpec {
+			t.Fatalf("error category = %s, want InvalidSpec", got)
+		}
+		if obs.pruneSafe || len(plan.GetToApply()) != 0 || len(plan.GetToDelete()) != 0 {
+			t.Fatalf("legacy conflict planned mutations: observation %#v plan %#v", obs, plan)
+		}
+	})
+
+	t.Run("cluster", func(t *testing.T) {
+		set := &aimv1alpha2.AIMClusterProfileSet{
+			ObjectMeta: metav1.ObjectMeta{Name: "legacy-conflict", UID: "set-uid"},
+			Spec: aimv1alpha1.AIMProfileSetSpec{
+				SourceRef:     sourceRef.DeepCopy(),
+				Selector:      aimv1alpha1.ProfileSelector{ModelRef: modelRef.DeepCopy()},
+				VersionPolicy: aimv1alpha1.ProfileVersionPolicyAll,
+			},
+		}
+		existing := managedProfile{Object: &aimv1alpha2.AIMClusterProfile{
+			ObjectMeta: metav1.ObjectMeta{Name: "existing"},
+		}}
+		reconciler := &ClusterProfileSetReconciler{}
+		obs := reconciler.ComposeState(
+			context.Background(),
+			controllerutils.ReconcileContext[*aimv1alpha2.AIMClusterProfileSet]{Object: set},
+			ClusterProfileSetFetchResult{
+				set:        set,
+				candidates: controllerutils.FetchResult[[]profileSetCandidate]{},
+				managed:    controllerutils.FetchResult[[]managedProfile]{Value: []managedProfile{existing}},
+			},
+		)
+		plan := reconciler.PlanResources(
+			context.Background(),
+			controllerutils.ReconcileContext[*aimv1alpha2.AIMClusterProfileSet]{Object: set},
+			obs,
+		)
+
+		if obs.buildErr == nil || !strings.Contains(obs.buildErr.Error(), "sourceRef") {
+			t.Fatalf("buildErr = %v, want actionable conflicting-source error", obs.buildErr)
+		}
+		if got := controllerutils.CategorizeError(obs.buildErr).Category(); got != controllerutils.ErrorCategoryInvalidSpec {
+			t.Fatalf("error category = %s, want InvalidSpec", got)
+		}
+		if obs.pruneSafe || len(plan.GetToApply()) != 0 || len(plan.GetToDelete()) != 0 {
+			t.Fatalf("legacy conflict planned mutations: observation %#v plan %#v", obs, plan)
+		}
+	})
+}
+
+func TestProfileSetPruneReady_WaitsForCurrentReadyReplacement(t *testing.T) {
+	t.Parallel()
+
+	desiredObject := &aimv1alpha2.AIMProfile{
+		ObjectMeta: metav1.ObjectMeta{Name: "replacement", Namespace: "team-a"},
+		Spec: aimv1alpha2.AIMProfileSpec{AIMProfileSpecCommon: aimv1alpha2.AIMProfileSpecCommon{
+			AimId:            "amd/example",
+			AcceleratorModel: "MI300X",
+		}},
+	}
+	staleProfile := managedProfile{
+		Object: &aimv1alpha2.AIMProfile{
+			ObjectMeta: metav1.ObjectMeta{Name: "stale", Namespace: "team-a", Generation: 1},
+		},
+		Status: aimv1alpha2.AIMProfileStatus{
+			ObservedGeneration: 1,
+			Status:             constants.AIMStatusReady,
+		},
+	}
+	desired := []desiredProfile{{Object: desiredObject}}
+
+	if profileSetPruneReady(desired, []managedProfile{staleProfile}) {
+		t.Fatal("missing replacement allowed stale profile pruning")
+	}
+
+	replacement := desiredObject.DeepCopy()
+	replacement.Generation = 2
+	replacement.Spec.AutoSelectionPolicy = aimv1alpha1.AIMProfileAutoSelectionPolicyOptimized
+	replacement.Spec.AcceleratorPartitioningMode = aimprofile.PartitioningModeUnpartitioned
+	existing := managedProfile{
+		Object: replacement,
+		Status: aimv1alpha2.AIMProfileStatus{
+			ObservedGeneration: 1,
+			Status:             constants.AIMStatusReady,
+		},
+	}
+	if profileSetPruneReady(desired, []managedProfile{staleProfile, existing}) {
+		t.Fatal("replacement with stale status allowed pruning")
+	}
+
+	existing.Status.ObservedGeneration = replacement.Generation
+	if !profileSetPruneReady(desired, []managedProfile{staleProfile, existing}) {
+		t.Fatal("current Ready replacement did not allow stale profile pruning")
+	}
+	if !profileSetPruneReady(nil, []managedProfile{staleProfile}) {
+		t.Fatal("valid zero-match selection should allow stale profile pruning")
+	}
+}
+
+func TestSummarizeManagedProfiles_RequiresDesiredSpecAndCurrentStatus(t *testing.T) {
+	t.Parallel()
+
+	desiredObject := &aimv1alpha2.AIMProfile{
+		ObjectMeta: metav1.ObjectMeta{Name: "derived", Namespace: "team-a"},
+		Spec: aimv1alpha2.AIMProfileSpec{AIMProfileSpecCommon: aimv1alpha2.AIMProfileSpecCommon{
+			AimId: "amd/example",
+			Image: "example.com/aim:1.0.0",
+			ModelSources: []aimv1alpha1.AIMModelSource{{
+				ModelID:   "amd/example",
+				SourceURI: "hf://amd/example",
+			}},
+		}},
+	}
+	desired := []desiredProfile{{Object: desiredObject}}
+	persisted := desiredObject.DeepCopy()
+	persisted.Generation = 3
+	persisted.Spec.AutoSelectionPolicy = aimv1alpha1.AIMProfileAutoSelectionPolicyOptimized
+	persisted.Spec.AcceleratorPartitioningMode = aimprofile.PartitioningModeUnpartitioned
+
+	counts, existing := summarizeManagedProfiles(desired, []managedProfile{{
+		Object: persisted,
+		Status: aimv1alpha2.AIMProfileStatus{
+			ObservedGeneration: 2,
+			Status:             constants.AIMStatusReady,
+		},
+	}})
+	if existing != 1 || counts.Ready != 0 {
+		t.Fatalf("stale status counted as ready: existing=%d counts=%#v", existing, counts)
+	}
+
+	counts, existing = summarizeManagedProfiles(desired, []managedProfile{{
+		Object: persisted,
+		Status: aimv1alpha2.AIMProfileStatus{
+			ObservedGeneration: 3,
+			Status:             constants.AIMStatusReady,
+		},
+	}})
+	if existing != 1 || counts.Ready != 1 {
+		t.Fatalf("current defaulted profile not counted as ready: existing=%d counts=%#v", existing, counts)
+	}
+
+	persisted.Spec.Image = "example.com/aim:2.0.0"
+	counts, existing = summarizeManagedProfiles(desired, []managedProfile{{
+		Object: persisted,
+		Status: aimv1alpha2.AIMProfileStatus{
+			ObservedGeneration: 3,
+			Status:             constants.AIMStatusReady,
+		},
+	}})
+	if existing != 0 || counts.Ready != 0 {
+		t.Fatalf("wrong-spec profile counted as desired: existing=%d counts=%#v", existing, counts)
+	}
+}
+
+func TestStabilizeDerivedProfileNames_RollsImmutableAimIDWithoutOscillation(t *testing.T) {
+	t.Parallel()
+
+	const (
+		namespace   = "team-a"
+		baseName    = "derived-mi300x-tp1-12345678"
+		previousAIM = "acme/previous"
+		targetAIM   = "acme/replacement"
+	)
+	newDesired := func() []desiredProfile {
+		return []desiredProfile{{Object: &aimv1alpha2.AIMProfile{
+			ObjectMeta: metav1.ObjectMeta{Name: baseName, Namespace: namespace},
+			Spec: aimv1alpha2.AIMProfileSpec{AIMProfileSpecCommon: aimv1alpha2.AIMProfileSpecCommon{
+				AimId:            targetAIM,
+				AcceleratorModel: "MI300X",
+			}},
+		}}}
+	}
+	oldBase := managedProfile{
+		Object: &aimv1alpha2.AIMProfile{
+			ObjectMeta: metav1.ObjectMeta{Name: baseName, Namespace: namespace, Generation: 1},
+			Spec: aimv1alpha2.AIMProfileSpec{AIMProfileSpecCommon: aimv1alpha2.AIMProfileSpecCommon{
+				AimId:            previousAIM,
+				AcceleratorModel: "MI300X",
+			}},
+		},
+		Status: aimv1alpha2.AIMProfileStatus{
+			ObservedGeneration: 1,
+			Status:             constants.AIMStatusReady,
+		},
+	}
+
+	desired := newDesired()
+	if err := stabilizeDerivedProfileNames(desired, []managedProfile{oldBase}); err != nil {
+		t.Fatalf("stabilizeDerivedProfileNames() error = %v", err)
+	}
+	alternateName, err := utils.GenerateDerivedName(
+		[]string{baseName},
+		utils.WithHashSource(baseName, "aimId", targetAIM),
+	)
+	if err != nil {
+		t.Fatalf("GenerateDerivedName() error = %v", err)
+	}
+	if got := desired[0].Object.GetName(); got != alternateName {
+		t.Fatalf("replacement name = %q, want %q", got, alternateName)
+	}
+	if profileSetPruneReady(desired, []managedProfile{oldBase}) {
+		t.Fatal("old immutable-identity profile was pruned before its replacement existed")
+	}
+
+	replacementObject := desired[0].Object.(*aimv1alpha2.AIMProfile).DeepCopy()
+	replacementObject.Generation = 1
+	replacement := managedProfile{
+		Object: replacementObject,
+		Status: aimv1alpha2.AIMProfileStatus{
+			ObservedGeneration: 1,
+			Status:             constants.AIMStatusReady,
+		},
+	}
+	if !profileSetPruneReady(desired, []managedProfile{oldBase, replacement}) {
+		t.Fatal("current Ready identity replacement did not permit pruning the old profile")
+	}
+
+	reconciledAgain := newDesired()
+	if err := stabilizeDerivedProfileNames(reconciledAgain, []managedProfile{replacement}); err != nil {
+		t.Fatalf("second stabilizeDerivedProfileNames() error = %v", err)
+	}
+	if got := reconciledAgain[0].Object.GetName(); got != alternateName {
+		t.Fatalf("replacement name oscillated to %q, want stable %q", got, alternateName)
+	}
+
+	clusterDesired := []desiredProfile{{Object: &aimv1alpha2.AIMClusterProfile{
+		ObjectMeta: metav1.ObjectMeta{Name: baseName},
+		Spec: aimv1alpha2.AIMClusterProfileSpec{AIMProfileSpecCommon: aimv1alpha2.AIMProfileSpecCommon{
+			AimId: targetAIM,
+		}},
+	}}}
+	clusterExisting := []managedProfile{{Object: &aimv1alpha2.AIMClusterProfile{
+		ObjectMeta: metav1.ObjectMeta{Name: baseName},
+		Spec: aimv1alpha2.AIMClusterProfileSpec{AIMProfileSpecCommon: aimv1alpha2.AIMProfileSpecCommon{
+			AimId: previousAIM,
+		}},
+	}}}
+	if err := stabilizeDerivedProfileNames(clusterDesired, clusterExisting); err != nil {
+		t.Fatalf("cluster stabilizeDerivedProfileNames() error = %v", err)
+	}
+	if got := clusterDesired[0].Object.GetName(); got != alternateName {
+		t.Fatalf("cluster replacement name = %q, want %q", got, alternateName)
 	}
 }
 

@@ -47,13 +47,14 @@ Every `AIMModel` resolves to one of four flows, selected by which spec field is 
 
 | Flow | Spec | Source of profiles |
 |---|---|---|
-| **Official** | `spec.image` (AIM image) | Image discovery — profile YAMLs inside the container |
+| **Official / image-derived** | `spec.image`, optionally with `spec.profiles` | Image discovery — direct materialisation, or selected/overridden outputs from the image cache |
 | **Generated** | `spec.modelId` | Hardware-matched RuntimeConfig fallbacks |
 | **Fine-tuned** | `spec.profiles.derivedFrom` (selecting deployable profiles) | A previously-applied official AIMModel |
 | **Custom** | `spec.profiles.derivedFrom` (selecting base-image base profiles) | A previously-applied base-image AIMModel |
 
-CRD validation enforces exactly one of `spec.image`, `spec.modelId`, or
-`spec.profiles`.
+CRD validation requires `spec.modelId` alone, or at least one of `spec.image`
+and `spec.profiles`. Combining image and profiles is the image-backed
+derivation flow.
 
 ## Service resolution
 

@@ -68,6 +68,7 @@ type AIMClusterProfileSetReconciler struct {
 // +kubebuilder:rbac:groups=aim.eai.amd.com,resources=aimclusterprofilesets/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=aim.eai.amd.com,resources=aimclusterprofilesets/finalizers,verbs=update
 // +kubebuilder:rbac:groups=aim.eai.amd.com,resources=aimclusterprofiles,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=aim.eai.amd.com,resources=aimclustermodels,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 
@@ -108,7 +109,11 @@ func (r *AIMClusterProfileSetReconciler) SetupWithManager(mgr ctrl.Manager) erro
 		if set.Spec.SourceRef == nil {
 			return nil
 		}
-		return singleValueIndex(profileSourceRefIndexValue(constants.GetOperatorNamespace(), set.Spec.SourceRef.Name))
+		return singleValueIndex(profileSourceRefIndexValue(
+			set.Spec.SourceRef.EffectiveKind(),
+			profileSourceNamespace(set.Spec.SourceRef.EffectiveKind(), constants.GetOperatorNamespace()),
+			set.Spec.SourceRef.Name,
+		))
 	}); err != nil {
 		return err
 	}
@@ -127,12 +132,36 @@ func (r *AIMClusterProfileSetReconciler) SetupWithManager(mgr ctrl.Manager) erro
 		if !ok {
 			return nil
 		}
-		return clusterProfileSetsForSourceRef(ctx, r.Client, profileSourceRefIndexValue(configMap.Namespace, configMap.Name))
+		requests := clusterProfileSetsForSourceRef(
+			ctx,
+			r.Client,
+			profileSourceRefIndexValue(aimv1alpha1.ProfileSourceKindConfigMap, configMap.Namespace, configMap.Name),
+		)
+		for _, indexValue := range modelSourceRefIndexValuesForCache(configMap) {
+			requests = append(requests, clusterProfileSetsForSourceRef(ctx, r.Client, indexValue)...)
+		}
+		return dedupeRequests(requests)
+	})
+	modelHandler := handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []reconcile.Request {
+		clusterModel, ok := obj.(*aimv1alpha2.AIMClusterModel)
+		if !ok {
+			return nil
+		}
+		return clusterProfileSetsForSourceRef(
+			ctx,
+			r.Client,
+			profileSourceRefIndexValue(
+				aimv1alpha1.ProfileSourceKindAIMClusterModel,
+				"",
+				clusterModel.Name,
+			),
+		)
 	})
 
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&aimv1alpha2.AIMClusterProfileSet{}).
 		Watches(&aimv1alpha2.AIMClusterProfile{}, profileHandler).
+		Watches(&aimv1alpha2.AIMClusterModel{}, modelHandler).
 		Watches(
 			&corev1.ConfigMap{},
 			configMapHandler,

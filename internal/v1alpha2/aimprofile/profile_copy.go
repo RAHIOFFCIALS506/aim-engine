@@ -31,6 +31,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
 
 	aimv1alpha1 "github.com/amd-enterprise-ai/aim-engine/api/v1alpha1"
 	aimv1alpha2 "github.com/amd-enterprise-ai/aim-engine/api/v1alpha2"
@@ -56,13 +57,34 @@ type ProfileCopyRequest struct {
 	ImageOverride string
 }
 
+// ProfileSpecsEquivalent reports whether two common profile specs describe the
+// same persisted API value. Desired profiles built from raw discovery YAML have
+// not passed through CRD defaulting yet, while existing profiles have. Apply
+// those defaults before comparing so rollout/pruning gates do not wait forever
+// on semantically identical values.
+func ProfileSpecsEquivalent(left, right aimv1alpha2.AIMProfileSpecCommon) bool {
+	defaultProfileSpecForComparison(&left)
+	defaultProfileSpecForComparison(&right)
+	return equality.Semantic.DeepEqual(left, right)
+}
+
+func defaultProfileSpecForComparison(spec *aimv1alpha2.AIMProfileSpecCommon) {
+	if spec.AutoSelectionPolicy == "" {
+		spec.AutoSelectionPolicy = aimv1alpha1.AIMProfileAutoSelectionPolicyOptimized
+	}
+	if spec.AcceleratorPartitioningMode == "" {
+		spec.AcceleratorPartitioningMode = PartitioningModeUnpartitioned
+	}
+}
+
 // MatchesProfileCopySelector returns true when a source profile satisfies all selector fields.
 //
 // Note: provenance filters (selector.modelRef, selector.role, selector.origin)
 // are applied earlier by the caller against the candidate's labels — the
 // underlying aimprofile.ProfileCopyCandidate type does not carry labels.
-// AIMProfileSet reconcilers filter the source list with
-// FilterProvenanceLabels before constructing candidates.
+// AIMProfileSet reconcilers use real profile labels for resource-backed
+// candidates and synthesize role=base/deployable plus origin=discovered for
+// raw discovery-catalog candidates.
 //
 // All selector fields use strict equality: an empty selector field is a
 // wildcard (matches anything), a non-empty selector field requires the

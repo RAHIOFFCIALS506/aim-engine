@@ -1,0 +1,58 @@
+# Standalone profile sets can consume the complete catalog of an image-backed
+# AIMClusterModel, including source entries that were not materialized because
+# their original hardware shape is unsupported by this cluster.
+#
+# These outputs are owned by the AIMClusterProfileSet, not by the source model.
+# Select them directly by aimId/profile fields. Use AIMClusterModel.spec.profiles
+# instead when the profiles must be owned and readiness-accounted by the model.
+apiVersion: aim.eai.amd.com/v1alpha2
+kind: AIMClusterModel
+metadata:
+  name: llama-3-1-8b-instruct-catalog
+spec:
+  image: amdenterpriseai/aim-meta-llama-llama-3-1-8b-instruct:0.11.1
+  discovery:
+    createServiceTemplates: false
+---
+apiVersion: aim.eai.amd.com/v1alpha2
+kind: AIMClusterProfileSet
+metadata:
+  name: llama-3-1-8b-instruct-partitioned-set
+spec:
+  sourceRef:
+    kind: AIMClusterModel
+    name: llama-3-1-8b-instruct-catalog
+  selector:
+    acceleratorModel: MI300X
+    acceleratorCount: 1
+  versionPolicy: pinned
+  version: "0.11.1"
+  overrides:
+    acceleratorCount: 1
+    acceleratorPartitioningMode: CPX-NPS4
+---
+apiVersion: aim.eai.amd.com/v1alpha2
+kind: AIMClusterModel
+metadata:
+  name: gpt-oss-20b-catalog
+spec:
+  image: amdenterpriseai/aim-openai-gpt-oss-20b:0.11.1
+  discovery:
+    createServiceTemplates: false
+---
+apiVersion: aim.eai.amd.com/v1alpha2
+kind: AIMClusterProfileSet
+metadata:
+  name: gpt-oss-20b-partitioned-set
+spec:
+  sourceRef:
+    kind: AIMClusterModel
+    name: gpt-oss-20b-catalog
+  selector:
+    acceleratorModel: MI300X
+    acceleratorCount: 1
+  versionPolicy: pinned
+  version: "0.11.1"
+  overrides:
+    acceleratorCount: 1
+    acceleratorPartitioningMode: CPX-NPS4

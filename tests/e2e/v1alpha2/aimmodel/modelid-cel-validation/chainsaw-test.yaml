@@ -4,7 +4,7 @@ kind: Test
 metadata:
   name: v1alpha2-aimmodel-modelid-cel-validation
 spec:
-  description: v1alpha2 models accept exactly one of image, modelId, or profiles
+  description: v1alpha2 models accept modelId alone, or image and/or profiles
   steps:
     - name: Accept modelId-only shape
       try:

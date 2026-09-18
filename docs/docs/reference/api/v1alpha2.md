@@ -206,9 +206,12 @@ v1alpha1 and the v1alpha2 wrapper is a thin re-export so JSON wire format
 is identical between versions and the None conversion strategy works
 without a webhook.
 
-v1alpha2 onboarding contract: exactly one of spec.image (official
-discovery), spec.modelId (generated profiles), or spec.profiles
-(fine-tune / custom-model derivation); legacy
+v1alpha2 onboarding contract: spec.modelId (generated profiles) is mutually
+exclusive with the image/profile family. Within that family, spec.image
+(discovery) and spec.profiles (derivation) may be used separately or
+together. The combined image+profiles shape derives directly from this
+model's discovery cache, including catalog entries that were not materialised
+because the cluster lacks matching hardware. Legacy
 v1alpha1 onboarding fields and the deprecated flat spec.derivedFrom shape
 are forbidden on NEW v1alpha2 objects. Each "forbidden" rule uses
 optionalOldSelf so that objects originally created via v1alpha1 (which
@@ -615,6 +618,8 @@ AIMServiceList contains a list of AIMService.
 | `kind` _string_ | `AIMServiceList` | | |
 | `metadata` _[ListMeta](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.32/#listmeta-v1-meta)_ | Refer to Kubernetes API documentation for fields of `metadata`. |  |  |
 | `items` _[AIMService](#aimservice) array_ |  |  |  |
+
+
 
 
 

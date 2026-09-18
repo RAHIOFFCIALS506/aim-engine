@@ -1,0 +1,44 @@
+# Image-backed derivation keeps the source scope implicit: each model selects
+# directly from its own discovery cache, including entries that are not
+# materialized as AIMClusterProfiles on the current cluster.
+#
+# acceleratorCount is intentionally present in both places. The selector picks
+# a TP1 source so inherited engine arguments remain consistent; the override
+# then retargets that profile to one CPX-NPS4 partition.
+apiVersion: aim.eai.amd.com/v1alpha2
+kind: AIMClusterModel
+metadata:
+  name: llama-3-1-8b-instruct-partitioned
+spec:
+  image: amdenterpriseai/aim-meta-llama-llama-3-1-8b-instruct:0.11.1
+  discovery:
+    createServiceTemplates: false
+  profiles:
+    derivedFrom:
+      selector:
+        acceleratorModel: MI300X
+        acceleratorCount: 1
+    versionPolicy: pinned
+    version: "0.11.1"
+    overrides:
+      acceleratorCount: 1
+      acceleratorPartitioningMode: CPX-NPS4
+---
+apiVersion: aim.eai.amd.com/v1alpha2
+kind: AIMClusterModel
+metadata:
+  name: gpt-oss-20b-partitioned
+spec:
+  image: amdenterpriseai/aim-openai-gpt-oss-20b:0.11.1
+  discovery:
+    createServiceTemplates: false
+  profiles:
+    derivedFrom:
+      selector:
+        acceleratorModel: MI300X
+        acceleratorCount: 1
+    versionPolicy: pinned
+    version: "0.11.1"
+    overrides:
+      acceleratorCount: 1
+      acceleratorPartitioningMode: CPX-NPS4

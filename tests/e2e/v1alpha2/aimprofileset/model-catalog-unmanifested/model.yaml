@@ -1,0 +1,8 @@
+apiVersion: aim.eai.amd.com/v1alpha2
+kind: AIMClusterModel
+metadata:
+  name: profileset-unmanifested-catalog
+spec:
+  image: docker.io/amdenterpriseai/aim-dummy:0.2.2
+  discovery:
+    createServiceTemplates: false

@@ -22,6 +22,7 @@ ModelCtrl -> Profile: spec.modelId
 ModelCtrl -> ProfileSetCtrl: spec.profiles
 ProfileSet -> ProfileSetCtrl
 Discovery -> Profile: yields
+Discovery -> ProfileSetCtrl: catalog source
 ProfileSetCtrl -> Profile: derives
 HandProfile -> ProfileCtrl
 ProfileCtrl -> Profile: reconciles

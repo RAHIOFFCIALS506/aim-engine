@@ -17,6 +17,12 @@ AIMModel / AIMClusterModel  (spec.image — official / base-image flow)
                     └── AIMArtifact  (owned by cache in Dedicated mode; orphan in Shared)
                             └── PVC + Download Job  (owned by artifact)
 
+AIMModel / AIMClusterModel  (spec.image + spec.profiles — image-backed derivation)
+    ├── Discovery Job + ConfigMap (owned by model; complete image catalog)
+    └── AIMProfileSet / AIMClusterProfileSet  (owned by model; cache-backed)
+            └── selected AIMProfile / AIMClusterProfile  (owned by profile set)
+                    └── ... (same as above)
+
 AIMModel / AIMClusterModel  (spec.profiles — fine-tune / custom-model flow)
     └── AIMProfileSet / AIMClusterProfileSet  (owned by model)
             └── AIMProfile / AIMClusterProfile  (owned by profile set)
@@ -34,6 +40,16 @@ Key behaviours:
 - **Shared profile caches** have no owner reference. They persist across services for reuse.
 - **Dedicated profile caches and their artifacts** are owner-referenced by the service and garbage-collected with it.
 - **AIMProfile resources** are owner-referenced by the producing `AIMModel` (for image discovery) or `AIMProfileSet` (for derivation). User-authored profiles have no AIM controller owner.
+- **Image-backed derivation does not materialise the source catalog.** The
+  model-owned profile set reads all image entries directly from the discovery
+  cache, including entries unsupported by the current cluster, and creates
+  only the selected/overridden outputs.
+- **Replacement cleanup is readiness-gated.** During a non-empty profile-set
+  transition, stale derived profiles remain until all replacement profiles
+  match the desired spec and report `Ready` for their current generation.
+  When model derivation is removed, the old child set remains until non-empty
+  direct/generated replacements satisfy the same readiness check. A valid
+  zero-result desired set may be pruned immediately.
 - **Auto-created models**:
     - v1alpha1 `spec.model.image` path: no owner reference; the model persists for reuse by other services.
     - v1alpha2 `spec.model.image` path (requires the `aim.eai.amd.com/reconciler-pipeline: profile` annotation): owner-referenced by the originating service and garbage-collected with it. Named `<service>-auto-<6charHash(image)>`. See [Services → By image](services.md#by-image).
@@ -185,9 +201,10 @@ CRD schemas include [CEL validation rules](https://kubernetes.io/docs/tasks/exte
 
 | CRD | Rule |
 |---|---|
-| `AIMModel` / `AIMClusterModel` | Exactly one of `spec.image`, `spec.modelId`, or `spec.profiles` |
+| `AIMModel` / `AIMClusterModel` | Set `spec.modelId` alone, or set `spec.image` and/or `spec.profiles`; `modelId` is exclusive |
 | `AIMModel` / `AIMClusterModel` | `spec.source` and `spec.accelerator` are valid only with `spec.modelId` |
-| `AIMModel` / `AIMClusterModel` | `spec.profiles` cannot be combined with `spec.aimId`, `spec.source`, `spec.discovery`, `spec.defaultServiceTemplate`, `spec.runtimeConfigName`, `spec.env`, or `spec.imageMetadata` |
+| `AIMModel` / `AIMClusterModel` | `spec.profiles` cannot be combined with `spec.aimId` or `spec.source`; discovery/runtime fields on that flow require `spec.image` |
+| `AIMModel` / `AIMClusterModel` | Image-backed `spec.profiles` must omit `profiles.derivedFrom.sourceRef` and `selector.modelRef`, and cannot disable `discovery.extractMetadata` |
 | `AIMModel` / `AIMClusterModel` | `spec.modelSources`, `spec.custom`, `spec.customTemplates`, and `spec.profileCopy` are forbidden on new v1alpha2 resources |
 | `AIMModel` / `AIMClusterModel` | `spec.modelId` cannot be combined with image-discovery/runtime fields such as `spec.discovery`, `spec.defaultServiceTemplate`, `spec.env`, `spec.imageMetadata`, `spec.imagePullSecrets`, `spec.serviceAccountName`, or `spec.resources`; configure those on the RuntimeConfig fallback |
 | `AIMService` | At least one of `spec.model` or `spec.profile` |

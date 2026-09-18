@@ -1,0 +1,158 @@
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: v1alpha2-aimprofileset-model-catalog-unmanifested
+  labels:
+    # The test relies on MI325X being absent from the mocked Kind inventory so
+    # the source profile remains catalog-only and the derived profiles report
+    # NotAvailable deterministically.
+    requires: kind
+spec:
+  description: |
+    Verifies that standalone v1alpha2 profile sets can consume the complete
+    discovery catalog of an image-backed AIMClusterModel. The selected MI325X
+    profile is present in aim-dummy but unsupported by the Kind inventory, so
+    the source model must not materialize it. Both AIMProfileSet and
+    AIMClusterProfileSet must nevertheless derive it from the private catalog
+    and preserve the requested CPX-NPS4 partition override.
+  timeouts:
+    assert: 180s
+  steps:
+    - name: Create the image-backed source model
+      try:
+        - apply:
+            file: model.yaml
+
+    - name: Wait for discovery to publish supported and unsupported entries
+      try:
+        - assert:
+            timeout: 180s
+            resource:
+              apiVersion: aim.eai.amd.com/v1alpha2
+              kind: AIMClusterModel
+              metadata:
+                name: profileset-unmanifested-catalog
+              status:
+                aimId: HuggingFaceTB/SmolLM2-135M
+                discoveryCacheRef:
+                  namespace: aim-system
+                (discoveryCacheRef.name != ""): true
+                (discoveredProfiles.supported > `0`): true
+                (discoveredProfiles.unsupported > `0`): true
+
+    - name: Prove the selected source exists only in the private catalog
+      try:
+        - script:
+            timeout: 30s
+            content: |
+              set -eu
+
+              MODEL=profileset-unmanifested-catalog
+              PROFILE_ID=mi325x-fp8-latency
+              CACHE_NAME=$(kubectl get aimclustermodel "$MODEL" \
+                -o jsonpath='{.status.discoveryCacheRef.name}')
+              CACHE_NAMESPACE=$(kubectl get aimclustermodel "$MODEL" \
+                -o jsonpath='{.status.discoveryCacheRef.namespace}')
+
+              kubectl get configmap -n "$CACHE_NAMESPACE" "$CACHE_NAME" -o json \
+                | jq -e --arg profile_id "$PROFILE_ID" \
+                    '[.data | to_entries[] |
+                      select(.key | test("^profiles\\..*\\.yaml$")) |
+                      select(.key | contains($profile_id))] |
+                     length == 1' >/dev/null \
+                || {
+                  echo "ERROR: expected exactly one $PROFILE_ID entry in the discovery catalog"
+                  kubectl get configmap -n "$CACHE_NAMESPACE" "$CACHE_NAME" -o json \
+                    | jq -r '.data | keys[]'
+                  exit 1
+                }
+
+              MATERIALIZED=$(kubectl get aimclusterprofiles -o json \
+                | jq -r --arg model "$MODEL" --arg profile_id "$PROFILE_ID" \
+                    '[.items[] |
+                      select(.metadata.labels["aim.eai.amd.com/source-model"] == $model) |
+                      select(.metadata.labels["aim.eai.amd.com/source-model-scope"] == "cluster") |
+                      select(.spec.profileId == $profile_id)] |
+                     length')
+              if [ "$MATERIALIZED" -ne 0 ]; then
+                echo "ERROR: unsupported source profile was unexpectedly materialized"
+                kubectl get aimclusterprofiles -o yaml
+                exit 1
+              fi
+
+    - name: Create namespace and cluster profile sets from the model catalog
+      try:
+        - apply:
+            file: profilesets.yaml
+
+    - name: Assert the namespace profile set derived the catalog-only profile
+      try:
+        - assert:
+            timeout: 90s
+            resource:
+              apiVersion: aim.eai.amd.com/v1alpha2
+              kind: AIMProfile
+              metadata:
+                annotations:
+                  aim.eai.amd.com/profile-source: copy
+                  aim.eai.amd.com/profile-set-name: namespace-unmanifested-partitioned
+              spec:
+                aimId: HuggingFaceTB/SmolLM2-135M
+                modelId: HuggingFaceTB/SmolLM2-135M
+                profileId: mi325x-fp8-latency
+                acceleratorModel: MI325X
+                acceleratorCount: 1
+                acceleratorPartitioningMode: CPX-NPS4
+              status:
+                status: NotAvailable
+        - assert:
+            timeout: 90s
+            resource:
+              apiVersion: aim.eai.amd.com/v1alpha2
+              kind: AIMProfileSet
+              metadata:
+                name: namespace-unmanifested-partitioned
+              status:
+                status: NotAvailable
+                managedProfiles:
+                  total: 1
+                  ready: 0
+                  notAvailable: 1
+                  deployable: 1
+                  base: 0
+
+    - name: Assert the cluster profile set derived the catalog-only profile
+      try:
+        - assert:
+            timeout: 90s
+            resource:
+              apiVersion: aim.eai.amd.com/v1alpha2
+              kind: AIMClusterProfile
+              metadata:
+                annotations:
+                  aim.eai.amd.com/profile-source: copy
+                  aim.eai.amd.com/profile-set-name: cluster-unmanifested-partitioned
+              spec:
+                aimId: HuggingFaceTB/SmolLM2-135M
+                modelId: HuggingFaceTB/SmolLM2-135M
+                profileId: mi325x-fp8-latency
+                acceleratorModel: MI325X
+                acceleratorCount: 1
+                acceleratorPartitioningMode: CPX-NPS4
+              status:
+                status: NotAvailable
+        - assert:
+            timeout: 90s
+            resource:
+              apiVersion: aim.eai.amd.com/v1alpha2
+              kind: AIMClusterProfileSet
+              metadata:
+                name: cluster-unmanifested-partitioned
+              status:
+                status: NotAvailable
+                managedProfiles:
+                  total: 1
+                  ready: 0
+                  notAvailable: 1
+                  deployable: 1
+                  base: 0

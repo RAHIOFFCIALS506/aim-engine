@@ -76,10 +76,51 @@ const (
 	ProfileVersionPolicyAll    ProfileVersionPolicy = "all"
 )
 
-// ProfileSourceRef identifies an alternate discovery cache source for derivation.
+// ProfileSourceKind identifies the resource that supplies a v1alpha2 profile
+// set's cache-backed source catalog. Deprecated v1alpha1 model profileCopy
+// accepts only ConfigMap.
+// +kubebuilder:validation:Enum=ConfigMap;AIMModel;AIMClusterModel
+type ProfileSourceKind string
+
+const (
+	// ProfileSourceKindConfigMap reads a discovery catalog directly from a
+	// ConfigMap. This is the default for backwards compatibility with the
+	// original sourceRef shape.
+	ProfileSourceKindConfigMap ProfileSourceKind = "ConfigMap"
+	// ProfileSourceKindAIMModel resolves the referenced namespace-scoped
+	// AIMModel's current discovery cache.
+	ProfileSourceKindAIMModel ProfileSourceKind = "AIMModel"
+	// ProfileSourceKindAIMClusterModel resolves the referenced cluster-scoped
+	// AIMClusterModel's current discovery cache.
+	ProfileSourceKindAIMClusterModel ProfileSourceKind = "AIMClusterModel"
+)
+
+// ProfileSourceRef identifies an alternate source catalog for derivation.
 type ProfileSourceRef struct {
-	// Name is the discovery cache ConfigMap name.
+	// Kind selects the source resource. ConfigMap reads the named discovery
+	// catalog directly. AIMModel and AIMClusterModel resolve the model's
+	// status.discoveryCacheRef, allowing selection from its complete image
+	// catalog including profiles that were not materialized for the current
+	// cluster hardware.
+	// +optional
+	// +kubebuilder:default=ConfigMap
+	Kind ProfileSourceKind `json:"kind,omitempty"`
+
+	// Name is the source resource name. AIMModel references resolve in the
+	// AIMProfileSet namespace; AIMClusterModel references are cluster-scoped.
+	// ConfigMap references resolve in the AIMProfileSet namespace, or in the
+	// operator namespace for AIMClusterProfileSet.
+	// +kubebuilder:validation:MinLength=1
 	Name string `json:"name"`
+}
+
+// EffectiveKind returns the source kind after applying the backwards-compatible
+// default for objects created before sourceRef.kind existed.
+func (r ProfileSourceRef) EffectiveKind() ProfileSourceKind {
+	if r.Kind == "" {
+		return ProfileSourceKindConfigMap
+	}
+	return r.Kind
 }
 
 // ProfileSelectorScope determines how a ProfileSelector.ModelRef resolves the
@@ -360,10 +401,11 @@ type ProfileOverrides struct {
 //
 // The selector-non-empty rule accepts every documented narrowing field
 // (including modelRef and origin) and lets sourceRef-only specs through:
-// when sourceRef is set, the discovery cache itself acts as the source
+// when sourceRef is set, the referenced catalog itself acts as the source
 // scope and a separate selector is not required.
 //
 // +kubebuilder:validation:XValidation:rule="has(self.sourceRef) || has(self.selector.aimId) || has(self.selector.modelId) || has(self.selector.profileId) || has(self.selector.engine) || has(self.selector.metric) || has(self.selector.precision) || has(self.selector.type) || has(self.selector.acceleratorModel) || has(self.selector.acceleratorVendor) || has(self.selector.acceleratorType) || has(self.selector.acceleratorCount) || has(self.selector.engineArgs) || has(self.selector.modelRef) || has(self.selector.origin)",message="selector must set at least one matching field, or set sourceRef"
+// +kubebuilder:validation:XValidation:rule="!has(self.sourceRef) || !has(self.selector.modelRef) || (oldSelf.hasValue() && has(oldSelf.value().sourceRef) && has(oldSelf.value().selector.modelRef))",message="selector.modelRef cannot be combined with sourceRef; sourceRef already defines the source scope",optionalOldSelf=true
 // +kubebuilder:validation:XValidation:rule="has(self.version) || (has(self.versionPolicy) && self.versionPolicy != 'pinned')",message="version is required when versionPolicy is pinned"
 // +kubebuilder:validation:XValidation:rule="!has(self.versionPolicy) || (self.versionPolicy != 'latest' && self.versionPolicy != 'all') || !has(self.version)",message="latest/all versionPolicy must not set version"
 // +kubebuilder:validation:XValidation:rule="!(has(self.selector.role) && self.selector.role == 'base') || (!has(self.selector.aimId) && !has(self.selector.modelId) && !has(self.selector.profileId))",message="selector.aimId/modelId/profileId are not allowed when selector.role=base; set overrides.aimId/modelId/profileId instead (base profiles have no source identity to filter on)"
@@ -372,10 +414,15 @@ type ProfileOverrides struct {
 //
 //nolint:lll // kubebuilder marker; CEL rule cannot be wrapped across lines
 type AIMProfileSetSpec struct {
-	// SourceRef points to an alternate discovery cache source.
-	// When omitted, derivation uses visible AIMProfile and AIMClusterProfile objects.
-	// For AIMProfileSet, the referenced ConfigMap is read from the same namespace.
-	// For AIMClusterProfileSet, it is read from the operator namespace.
+	// SourceRef selects a cache-backed source. ConfigMap reads a discovery
+	// catalog directly. AIMModel and AIMClusterModel resolve the referenced
+	// model's current discovery cache, including entries that were not
+	// materialized as profile resources because their original hardware shape
+	// is unsupported by the cluster.
+	//
+	// When omitted, derivation uses visible AIMProfile and AIMClusterProfile
+	// objects. selector.modelRef is a filter for that real-profile-backed mode
+	// and cannot be combined with sourceRef.
 	// +optional
 	SourceRef *ProfileSourceRef `json:"sourceRef,omitempty"`
 

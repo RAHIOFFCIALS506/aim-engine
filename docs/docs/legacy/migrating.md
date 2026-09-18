@@ -23,7 +23,7 @@ administrator-run Plan/Apply behavior and manual outcomes are governed by
 | `AIMService.spec.model.image` | `AIMModel.spec.image` (then `AIMService.spec.model.name`) | Image-based services should onboard an explicit AIMModel. |
 | `AIMModel.spec.custom` | `AIMModel.spec.image` (base) + `AIMModel.spec.profiles` | Two-step custom-model flow. |
 | `AIMModel.spec.customTemplates` | `AIMProfileSet` | Standalone derivation resource. |
-| `AIMModel.spec.profileCopy` | `AIMModel.spec.profiles` | Profile-copy is now first-class (groups derivedFrom + version + overrides). |
+| `AIMModel.spec.profileCopy` | `AIMModel.spec.profiles` | Profile-copy is now first-class. When the legacy model also has `spec.image`, keep the image: v1alpha2 uses its private discovery cache as the derivation source. |
 | `AIMModel.spec.modelSources` | `AIMProfile.spec.modelSources` | Sources live on each profile. |
 | `AIMTemplateCache` | `AIMProfileCache` | Created automatically from `AIMProfile.spec.caching`. |
 
@@ -168,11 +168,12 @@ spec:
     derivedFrom:
       selector:
         role: base
-        aimId: acme/custom-transformer
         modelRef:
           name: aim-base-vllm
     versionPolicy: all
     overrides:
+      aimId: acme/custom-transformer
+      modelId: acme/custom-transformer
       modelSources:
         - modelId: acme/custom-transformer
           sourceUri: s3://acme-models/custom-transformer
@@ -205,6 +206,44 @@ spec:
 ```
 
 See [Fine-Tuned Models](../guides/fine-tuned-models.md) for the full walkthrough.
+
+### Image-backed profile derivation
+
+Do not keep a new partitioning/remix workflow on the deprecated v1alpha1
+`profileCopy` surface. In v1alpha2, combine the image and derivation in one
+model:
+
+```yaml
+apiVersion: aim.eai.amd.com/v1alpha2
+kind: AIMClusterModel
+metadata:
+  name: llama-3-1-8b-instruct-partitioned
+spec:
+  image: amdenterpriseai/aim-meta-llama-llama-3-1-8b-instruct:0.11.1
+  discovery:
+    createServiceTemplates: false
+  profiles:
+    derivedFrom:
+      selector:
+        acceleratorModel: MI300X
+        acceleratorCount: 1
+    versionPolicy: pinned
+    version: "0.11.1"
+    overrides:
+      acceleratorCount: 1
+      acceleratorPartitioningMode: CPX-NPS4
+```
+
+The image implicitly scopes the source catalog. Do not copy a legacy
+`profileCopy.selector.modelRef` or `sourceRef` into this shape. The controller
+injects its model-owned discovery cache, so it can select an image profile even
+when that source profile is unsupported on the current cluster and was never
+materialised as an `AIMClusterProfile`. Only the selected, overridden output is
+created.
+
+Keep `acceleratorCount` in the selector as well as the override when inherited
+engine arguments are topology-sensitive. Selecting a count-1 source avoids
+copying TP2/TP4/TP8 arguments into a one-partition result.
 
 ### AIMServiceTemplate → AIMProfile
 
@@ -309,7 +348,7 @@ handling of custom and ambiguous resources.
 ## Validation traps
 
 The v1alpha2 CRD rejects legacy-only fields and invalid combinations of the
-three onboarding spec shapes:
+onboarding spec shapes:
 
 | Rejected on v1alpha2 | Resource | Why |
 |---|---|---|
@@ -318,10 +357,13 @@ three onboarding spec shapes:
 | `spec.customTemplates` | `AIMModel` | Replaced by `AIMProfileSet` / `derivedFrom`. |
 | `spec.profileCopy` | `AIMModel` | Replaced by `derivedFrom`. |
 | Flat `spec.derivedFrom` | `AIMModel` | Use `spec.profiles.derivedFrom`. |
-| Any combination of two or more of `spec.image`, `spec.modelId`, and `spec.profiles` | `AIMModel` | Exactly one onboarding flow is required. |
-| None of `spec.image`, `spec.modelId`, or `spec.profiles` | `AIMModel` | Exactly one onboarding flow is required. |
+| `spec.modelId` combined with `spec.image` or `spec.profiles` | `AIMModel` | Generated onboarding is standalone. |
+| None of `spec.image`, `spec.modelId`, or `spec.profiles` | `AIMModel` | An onboarding source is required. |
+| Image-backed `spec.profiles` with `profiles.derivedFrom.sourceRef` or `selector.modelRef` | `AIMModel` | The image's own discovery cache is the source scope. |
+| Image-backed `spec.profiles` with `discovery.extractMetadata: false` | `AIMModel` | The derivation source cannot be built without image metadata discovery. |
 | `spec.source` or `spec.accelerator` without `spec.modelId` | `AIMModel` | These fields configure generated model-ID onboarding only. |
-| `spec.aimId`, `spec.source`, or `spec.runtimeConfigName` with `spec.profiles` | `AIMModel` | Derivation identity and runtime come from the selected source profiles and overrides. |
+| `spec.aimId` or `spec.source` with `spec.profiles` | `AIMModel` | Derivation identity and source come from the selected source profiles and overrides. |
+| `spec.runtimeConfigName` or other image runtime/discovery fields with profiles-only onboarding | `AIMModel` | Those fields are valid only when the same model also sets `spec.image`. |
 | Image-discovery/runtime fields such as `spec.discovery`, `spec.env`, `spec.imagePullSecrets`, `spec.serviceAccountName`, or `spec.resources` with `spec.modelId` | `AIMModel` | Configure the generated profile runtime on the referenced RuntimeConfig fallback. |
 | `spec.template` | `AIMService` | Use `spec.profile`. |
 | `spec.overrides` | `AIMService` | Use `spec.profileOverrides`. |

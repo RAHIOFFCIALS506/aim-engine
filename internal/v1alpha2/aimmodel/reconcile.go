@@ -31,6 +31,7 @@ import (
 
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -155,7 +156,7 @@ func (obs ModelObservation) GetComponentHealth(_ context.Context, _ kubernetes.I
 
 // GetApplyOptions delegates to the legacy reconciler when the legacy
 // pipeline ran (RuntimeConfig is a v1alpha1-shaped concept fetched on the
-// legacy side). For pure v1alpha2 specs (profileCopy-only) the legacy
+// legacy side). For pure v1alpha2 specs (profiles-only) the legacy
 // pipeline is skipped entirely and no apply-time options are needed.
 func (r *ModelReconciler) GetApplyOptions(obs ModelObservation) controllerutils.ApplyOptions {
 	if obs.legacyObservation != nil {
@@ -179,16 +180,27 @@ func (r *ModelReconciler) FetchRemoteState(
 	// pipelines emit disjoint outputs (legacy → AIMServiceTemplates from
 	// RecommendedDeployments / customTemplates / aimId-matching; native →
 	// AIMProfiles from in-cluster discovery + AIMProfileSet from
-	// profileCopy) and write disjoint status fields, so it is safe to
+	// profile derivation) and write disjoint status fields, so it is safe to
 	// compose them whenever both have work to do.
 	//
-	// Skipping the legacy fetch for pure v1alpha2 specs (profileCopy-only)
+	// Skipping the legacy fetch for pure v1alpha2 specs (profiles-only)
 	// is essential: otherwise the legacy ImageMetadata fetch tries to parse
 	// an empty image reference and surfaces spurious failures
 	// (ImageMetadataReady=False, DependenciesReachable=False).
 	result := ModelFetchResult{
 		model:            model,
 		existingProfiles: controllerutils.FetchResult[[]managedProfile]{Value: nil, Error: nil},
+	}
+	childName, childNameErr := childProfileSetName(model.Name)
+	if childNameErr != nil {
+		result.childProfileSet = controllerutils.FetchResult[*aimv1alpha2.AIMProfileSet]{Error: childNameErr}
+	} else {
+		result.childProfileSet = controllerutils.Fetch(
+			ctx,
+			c,
+			client.ObjectKey{Name: childName, Namespace: model.Namespace},
+			&aimv1alpha2.AIMProfileSet{},
+		)
 	}
 
 	legacyModel, legacyAutoCustom, legacyModelErr := hydrateLegacyAutoCustomModel(ctx, c, model)
@@ -203,6 +215,8 @@ func (r *ModelReconciler) FetchRemoteState(
 				controllerutils.ReconcileContext[*aimv1alpha1.AIMModel]{Object: result.legacyModel},
 			)
 			result.legacyFetch = &legacyFetch
+			profiles, err := listManagedNamespaceProfiles(ctx, c, model.Namespace, string(model.UID))
+			result.existingProfiles = controllerutils.FetchResult[[]managedProfile]{Value: profiles, Error: err}
 		}
 		return result
 	}
@@ -252,14 +266,6 @@ func (r *ModelReconciler) FetchRemoteState(
 	}
 	profiles, err := listManagedNamespaceProfiles(ctx, c, model.Namespace, string(model.UID))
 	result.existingProfiles = controllerutils.FetchResult[[]managedProfile]{Value: profiles, Error: err}
-	if derivationSpec(&model.Spec) != nil {
-		childName, childNameErr := childProfileSetName(model.Name)
-		if childNameErr != nil {
-			result.childProfileSet = controllerutils.FetchResult[*aimv1alpha2.AIMProfileSet]{Error: childNameErr}
-		} else {
-			result.childProfileSet = controllerutils.Fetch(ctx, c, client.ObjectKey{Name: childName, Namespace: model.Namespace}, &aimv1alpha2.AIMProfileSet{})
-		}
-	}
 	return result
 }
 
@@ -283,6 +289,27 @@ func (r *ModelReconciler) ComposeState(
 		)
 		obs.legacyObservation = &legacyObs
 		obs.componentHealth = legacyObs.GetComponentHealth()
+		obs.BuildErr = profileInventoryReadError(
+			fetch.existingProfiles.Error,
+			fetch.childProfileSet.Error,
+			"failed to list stale profiles managed by this compatibility AIMModel",
+			"failed to read the stale child AIMProfileSet",
+		)
+		if obs.BuildErr != nil {
+			obs.componentHealth = append(obs.componentHealth, controllerutils.ComponentHealth{
+				Component:      componentProfiles,
+				State:          constants.AIMStatusDegraded,
+				Reason:         "NativeCleanupBlocked",
+				Message:        obs.BuildErr.Error(),
+				Errors:         []error{obs.BuildErr},
+				DependencyType: controllerutils.DependencyTypeUpstream,
+			})
+		} else {
+			// Compatibility auto-custom models are served exclusively through
+			// the legacy template path. Any model-owned native profile or
+			// child ProfileSet is stale and can be retired.
+			obs.pruneSafe = true
+		}
 		applyModelServingPathPolicy(
 			&fetch.legacyModel.Spec,
 			true,
@@ -302,14 +329,26 @@ func (r *ModelReconciler) ComposeState(
 	}
 	obs.Kind = classifyModelKind(&fetch.model.Spec)
 	derivation := derivationSpec(&fetch.model.Spec)
-	desiredProfilesKnown := derivation != nil
+	desiredProfilesKnown := false
 	obs.BuildErr = profileInventoryReadError(
 		fetch.existingProfiles.Error,
 		fetch.childProfileSet.Error,
-		derivation != nil,
 		"failed to list profiles managed by this AIMModel",
 		"failed to read the child AIMProfileSet",
 	)
+	if obs.BuildErr == nil {
+		obs.BuildErr = validateDerivationSourceScope(derivation)
+	}
+	if obs.BuildErr == nil &&
+		derivation != nil &&
+		fetch.model.Spec.Image != "" &&
+		!shouldRunNativeDiscovery(&fetch.model.Spec) {
+		obs.BuildErr = controllerutils.NewInvalidSpecError(
+			"ImageProfileDerivationRequiresDiscovery",
+			"spec.discovery.extractMetadata must be true when spec.image and spec.profiles are used together",
+			nil,
+		)
+	}
 	if derivation != nil {
 		// For role=base derivations the target aimId lives on
 		// overrides.aimId (CEL forbids selector.aimId then); for
@@ -338,7 +377,10 @@ func (r *ModelReconciler) ComposeState(
 		}
 		if decision.Catalog != nil {
 			catalog := *decision.Catalog
-			obs.ResolvedAimID = firstNonEmpty(catalog.AimID, obs.ResolvedAimID)
+			// A derivation override is the target model identity and must win
+			// over the source image catalog's aimId. Image-only discovery has
+			// no pre-resolved identity, so it still falls back to the catalog.
+			obs.ResolvedAimID = firstNonEmpty(obs.ResolvedAimID, catalog.AimID)
 			obs.ResolvedBaseImage = catalog.BaseImage
 			cacheName, err := discoveryCacheName(fetch.model.Name)
 			if err != nil {
@@ -395,11 +437,12 @@ func (r *ModelReconciler) ComposeState(
 		} else {
 			obs.ProfileSetRef = &aimv1alpha1.ProfileSetReference{Name: childName, Namespace: fetch.model.Namespace}
 			obs.DesiredProfileSet = buildDesiredProfileSet(fetch.model, obs.DiscoveryCacheRef, childName)
+			desiredProfilesKnown = obs.DesiredProfileSet != nil
 		}
 		obs.ManagedProfiles,
 			obs.ExistingDesiredCount,
 			obs.ProfileSetCurrent,
-			obs.ProfileSetStatus = observedNamespaceProfileSet(fetch.childProfileSet)
+			obs.ProfileSetStatus = observedNamespaceProfileSet(fetch.childProfileSet, obs.DesiredProfileSet)
 	} else if fetch.existingProfiles.OK() {
 		obs.ManagedProfiles, obs.ExistingDesiredCount = summarizeManagedProfiles(obs.DesiredProfiles, fetch.existingProfiles.Value)
 	}
@@ -495,7 +538,10 @@ func (r *ModelReconciler) PlanResources(
 		}
 	}
 	if derivation == nil && obs.childProfileSet.OK() && obs.childProfileSet.Value != nil {
-		plan.Delete(obs.childProfileSet.Value)
+		if len(obs.DesiredProfiles) == 0 ||
+			desiredProfilesReadyAndCurrent(obs.DesiredProfiles, obs.existingProfiles.Value) {
+			plan.Delete(obs.childProfileSet.Value)
+		}
 	}
 	return plan
 }
@@ -578,9 +624,29 @@ func profileSetStatusCurrent(
 		status.ObservedGeneration == profileSet.GetGeneration()
 }
 
+func profileSetSpecsEquivalent(left, right aimv1alpha1.AIMProfileSetSpec) bool {
+	defaultProfileSetSpecForComparison(&left)
+	defaultProfileSetSpecForComparison(&right)
+	return equality.Semantic.DeepEqual(left, right)
+}
+
+func defaultProfileSetSpecForComparison(spec *aimv1alpha1.AIMProfileSetSpec) {
+	if spec.VersionPolicy == "" {
+		spec.VersionPolicy = aimv1alpha1.ProfileVersionPolicyPinned
+	}
+	if spec.Selector.Role == "" {
+		spec.Selector.Role = aimv1alpha1.ProfileSelectorRoleDeployable
+	}
+	if spec.Selector.ModelRef != nil && spec.Selector.ModelRef.Scope == "" {
+		spec.Selector.ModelRef.Scope = aimv1alpha1.ProfileSelectorScopeAuto
+	}
+	if spec.SourceRef != nil && spec.SourceRef.Kind == "" {
+		spec.SourceRef.Kind = aimv1alpha1.ProfileSourceKindConfigMap
+	}
+}
+
 func profileInventoryReadError(
 	existingProfilesErr, childProfileSetErr error,
-	derivation bool,
 	listMessage, childMessage string,
 ) error {
 	if existingProfilesErr != nil {
@@ -590,7 +656,7 @@ func profileInventoryReadError(
 			existingProfilesErr,
 		)
 	}
-	if derivation && childProfileSetErr != nil && !apierrors.IsNotFound(childProfileSetErr) {
+	if childProfileSetErr != nil && !apierrors.IsNotFound(childProfileSetErr) {
 		return controllerutils.NewInfrastructureError(
 			"ProfileSetReadFailed",
 			childMessage,
@@ -621,6 +687,7 @@ func observedProfileSet(
 
 func observedNamespaceProfileSet(
 	result controllerutils.FetchResult[*aimv1alpha2.AIMProfileSet],
+	desired *aimv1alpha2.AIMProfileSet,
 ) (
 	aimv1alpha1.ManagedProfileCounts,
 	int32,
@@ -630,11 +697,14 @@ func observedNamespaceProfileSet(
 	if !result.OK() || result.Value == nil {
 		return aimv1alpha1.ManagedProfileCounts{}, 0, false, ""
 	}
-	return observedProfileSet(result.Value, result.Value.Status)
+	managed, existing, current, status := observedProfileSet(result.Value, result.Value.Status)
+	current = current && desired != nil && profileSetSpecsEquivalent(result.Value.Spec, desired.Spec)
+	return managed, existing, current, status
 }
 
 func observedClusterProfileSet(
 	result controllerutils.FetchResult[*aimv1alpha2.AIMClusterProfileSet],
+	desired *aimv1alpha2.AIMClusterProfileSet,
 ) (
 	aimv1alpha1.ManagedProfileCounts,
 	int32,
@@ -644,7 +714,9 @@ func observedClusterProfileSet(
 	if !result.OK() || result.Value == nil {
 		return aimv1alpha1.ManagedProfileCounts{}, 0, false, ""
 	}
-	return observedProfileSet(result.Value, result.Value.Status)
+	managed, existing, current, status := observedProfileSet(result.Value, result.Value.Status)
+	current = current && desired != nil && profileSetSpecsEquivalent(result.Value.Spec, desired.Spec)
+	return managed, existing, current, status
 }
 
 func profilePruneSafe(
@@ -661,10 +733,32 @@ func profilePruneSafe(
 	if !derivation {
 		return true
 	}
-	return profileSetCurrent &&
-		profileSetStatus == constants.AIMStatusReady &&
-		managedProfiles.Total > 0 &&
-		managedProfiles.Ready == managedProfiles.Total
+	if !profileSetCurrent {
+		return false
+	}
+	switch profileSetStatus {
+	case constants.AIMStatusReady:
+		return managedProfiles.Total > 0 &&
+			managedProfiles.Ready == managedProfiles.Total
+	case constants.AIMStatusNotAvailable:
+		// A current zero-result profile set is a complete, valid desired
+		// state. There is no replacement rollout to wait for, so stale direct
+		// profiles from the previous model shape may be removed.
+		return managedProfiles.Total == 0
+	default:
+		return false
+	}
+}
+
+func validateDerivationSourceScope(spec *aimv1alpha1.AIMProfileSetSpec) error {
+	if spec == nil || spec.SourceRef == nil || spec.Selector.ModelRef == nil {
+		return nil
+	}
+	return controllerutils.NewInvalidSpecError(
+		"ConflictingProfileSources",
+		"profile derivation cannot combine sourceRef with selector.modelRef; sourceRef selects a catalog while modelRef filters already-materialized profiles",
+		nil,
+	)
 }
 
 func classifyProfileSetTerminalStatus(status constants.AIMStatus) (reason, message string, terminal bool) {
@@ -719,51 +813,15 @@ func buildModelComponentHealth(obs ModelObservation) []controllerutils.Component
 		return health
 	}
 	if obs.model.Spec.ModelID != "" {
-		if obs.ManagedProfiles.Total == 0 {
-			message := obs.ProfileGenerationFailureMessage
-			if message == "" {
-				message = "No configured runtime fallback matches available cluster hardware"
-			}
-			return append(health, controllerutils.ComponentHealth{
-				Component: componentProfiles,
-				State:     constants.AIMStatusNotAvailable,
-				Reason:    "NoCompatibleRuntime",
-				Message:   message,
-			})
-		}
-		if obs.ExistingDesiredCount < obs.ManagedProfiles.Total {
-			return append(health, controllerutils.ComponentHealth{
-				Component: componentProfiles,
-				State:     constants.AIMStatusProgressing,
-				Reason:    constants.ReasonCreating,
-				Message:   "Generated profiles are still being created",
-			})
-		}
-		if obs.ManagedProfiles.Ready == obs.ManagedProfiles.Total {
-			return append(health, controllerutils.ComponentHealth{
-				Component: componentProfiles,
-				State:     constants.AIMStatusReady,
-				Reason:    "GeneratedProfilesReady",
-			})
-		}
-		if obs.ManagedProfiles.Ready > 0 {
-			return append(health, controllerutils.ComponentHealth{
-				Component: componentProfiles,
-				State:     constants.AIMStatusDegraded,
-				Reason:    "GeneratedProfilesPartiallyReady",
-				Message:   "Some generated profiles are ready, but others are not available",
-			})
-		}
-		return append(health, controllerutils.ComponentHealth{
-			Component: componentProfiles,
-			State:     constants.AIMStatusNotAvailable,
-			Reason:    "HardwareNotAvailable",
-			Message:   "Generated profiles exist but no compatible hardware is currently available",
-		})
+		return append(health, modelIDProfilesComponentHealth(obs))
 	}
 	if runNativeDiscovery && obs.model.Spec.Image != "" && obs.DiscoveryCacheRef == nil {
+		component := componentProfiles
+		if derivationSpec(&obs.model.Spec) != nil {
+			component = componentProfileSet
+		}
 		health = append(health, controllerutils.ComponentHealth{
-			Component: componentProfiles,
+			Component: component,
 			State:     constants.AIMStatusProgressing,
 			Reason:    constants.ReasonCreating,
 			Message:   "Waiting for discovery to produce a profile cache",
@@ -771,66 +829,7 @@ func buildModelComponentHealth(obs ModelObservation) []controllerutils.Component
 		return health
 	}
 	if derivationSpec(&obs.model.Spec) != nil {
-		if obs.ExistingDesiredCount == 0 {
-			health = append(health, controllerutils.ComponentHealth{
-				Component: componentProfileSet,
-				State:     constants.AIMStatusProgressing,
-				Reason:    constants.ReasonCreating,
-				Message:   "Managed profile set is still being created",
-			})
-			return health
-		}
-		if !obs.ProfileSetCurrent {
-			health = append(health, controllerutils.ComponentHealth{
-				Component: componentProfileSet,
-				State:     constants.AIMStatusProgressing,
-				Reason:    "ProfileSetNotCurrent",
-				Message:   "Managed profile set has not reported current Ready status",
-			})
-			return health
-		}
-		if reason, message, terminal := classifyProfileSetTerminalStatus(obs.ProfileSetStatus); terminal {
-			health = append(health, controllerutils.ComponentHealth{
-				Component: componentProfileSet,
-				State:     obs.ProfileSetStatus,
-				Reason:    reason,
-				Message:   message,
-			})
-			return health
-		}
-		if obs.ProfileSetStatus != constants.AIMStatusReady {
-			health = append(health, controllerutils.ComponentHealth{
-				Component: componentProfileSet,
-				State:     constants.AIMStatusProgressing,
-				Reason:    "ProfileSetNotCurrent",
-				Message:   "Managed profile set has not reported current Ready status",
-			})
-			return health
-		}
-		if obs.ManagedProfiles.Total > 0 && obs.ManagedProfiles.Ready == obs.ManagedProfiles.Total {
-			health = append(health, controllerutils.ComponentHealth{
-				Component: componentProfileSet,
-				State:     constants.AIMStatusReady,
-				Reason:    "ManagedProfilesReady",
-			})
-			return health
-		}
-		if obs.ManagedProfiles.Ready > 0 {
-			health = append(health, controllerutils.ComponentHealth{
-				Component: componentProfileSet,
-				State:     constants.AIMStatusDegraded,
-				Reason:    "ManagedProfilesPartiallyReady",
-				Message:   "Some derived profiles are ready, but others are not available",
-			})
-			return health
-		}
-		health = append(health, controllerutils.ComponentHealth{
-			Component: componentProfileSet,
-			State:     constants.AIMStatusNotAvailable,
-			Reason:    "ManagedProfilesNotAvailable",
-			Message:   "No ready derived profiles available for this model",
-		})
-		return health
+		return append(health, derivedProfileSetComponentHealth(obs))
 	}
 	if !runNativeDiscovery {
 		// Custom / fine-tuned models do not produce v1alpha2 AIMProfiles.
@@ -880,6 +879,106 @@ func buildModelComponentHealth(obs ModelObservation) []controllerutils.Component
 		Message:   "Managed profiles exist but none are ready",
 	})
 	return health
+}
+
+func modelIDProfilesComponentHealth(obs ModelObservation) controllerutils.ComponentHealth {
+	if obs.ManagedProfiles.Total == 0 {
+		message := obs.ProfileGenerationFailureMessage
+		if message == "" {
+			message = "No configured runtime fallback matches available cluster hardware"
+		}
+		return controllerutils.ComponentHealth{
+			Component: componentProfiles,
+			State:     constants.AIMStatusNotAvailable,
+			Reason:    "NoCompatibleRuntime",
+			Message:   message,
+		}
+	}
+	if obs.ExistingDesiredCount < obs.ManagedProfiles.Total {
+		return controllerutils.ComponentHealth{
+			Component: componentProfiles,
+			State:     constants.AIMStatusProgressing,
+			Reason:    constants.ReasonCreating,
+			Message:   "Generated profiles are still being created",
+		}
+	}
+	if obs.ManagedProfiles.Ready == obs.ManagedProfiles.Total {
+		return controllerutils.ComponentHealth{
+			Component: componentProfiles,
+			State:     constants.AIMStatusReady,
+			Reason:    "GeneratedProfilesReady",
+		}
+	}
+	if obs.ManagedProfiles.Ready > 0 {
+		return controllerutils.ComponentHealth{
+			Component: componentProfiles,
+			State:     constants.AIMStatusDegraded,
+			Reason:    "GeneratedProfilesPartiallyReady",
+			Message:   "Some generated profiles are ready, but others are not available",
+		}
+	}
+	return controllerutils.ComponentHealth{
+		Component: componentProfiles,
+		State:     constants.AIMStatusNotAvailable,
+		Reason:    "HardwareNotAvailable",
+		Message:   "Generated profiles exist but no compatible hardware is currently available",
+	}
+}
+
+func derivedProfileSetComponentHealth(obs ModelObservation) controllerutils.ComponentHealth {
+	if obs.ExistingDesiredCount == 0 {
+		return controllerutils.ComponentHealth{
+			Component: componentProfileSet,
+			State:     constants.AIMStatusProgressing,
+			Reason:    constants.ReasonCreating,
+			Message:   "Managed profile set is still being created",
+		}
+	}
+	if !obs.ProfileSetCurrent {
+		return controllerutils.ComponentHealth{
+			Component: componentProfileSet,
+			State:     constants.AIMStatusProgressing,
+			Reason:    "ProfileSetNotCurrent",
+			Message:   "Managed profile set has not reported current Ready status",
+		}
+	}
+	if reason, message, terminal := classifyProfileSetTerminalStatus(obs.ProfileSetStatus); terminal {
+		return controllerutils.ComponentHealth{
+			Component: componentProfileSet,
+			State:     obs.ProfileSetStatus,
+			Reason:    reason,
+			Message:   message,
+		}
+	}
+	if obs.ProfileSetStatus != constants.AIMStatusReady {
+		return controllerutils.ComponentHealth{
+			Component: componentProfileSet,
+			State:     constants.AIMStatusProgressing,
+			Reason:    "ProfileSetNotCurrent",
+			Message:   "Managed profile set has not reported current Ready status",
+		}
+	}
+	if obs.ManagedProfiles.Total > 0 && obs.ManagedProfiles.Ready == obs.ManagedProfiles.Total {
+		return controllerutils.ComponentHealth{
+			Component: componentProfileSet,
+			State:     constants.AIMStatusReady,
+			Reason:    "ManagedProfilesReady",
+		}
+	}
+	if obs.ManagedProfiles.Ready > 0 {
+		return controllerutils.ComponentHealth{
+			Component: componentProfileSet,
+			State:     constants.AIMStatusDegraded,
+			Reason:    "ManagedProfilesPartiallyReady",
+			Message:   "Some derived profiles are ready, but others are not available",
+		}
+	}
+	return controllerutils.ComponentHealth{
+		Component: componentProfileSet,
+		State:     constants.AIMStatusNotAvailable,
+		Reason:    "ManagedProfilesNotAvailable",
+		Message:   "No ready derived profiles available for this model",
+	}
 }
 
 func discoveryComponentHealth(obs ModelObservation) controllerutils.ComponentHealth {
@@ -1285,11 +1384,25 @@ func buildDesiredProfileSet(model *aimv1alpha2.AIMModel, cacheRef *aimv1alpha1.D
 	if derivation == nil {
 		return nil
 	}
+	if model.Spec.Image != "" && cacheRef == nil {
+		return nil
+	}
 	spec := *derivation.DeepCopy()
-	if model.Spec.Image != "" && cacheRef != nil {
+	if model.Spec.Image != "" {
 		spec.SourceRef = &aimv1alpha1.ProfileSourceRef{
+			Kind: aimv1alpha1.ProfileSourceKindConfigMap,
 			Name: cacheRef.Name,
 		}
+		// The image-owned cache is the complete source scope. Admission
+		// rejects modelRef on new image-backed objects; clear it defensively
+		// for previously stored compatibility shapes.
+		spec.Selector.ModelRef = nil
+	}
+	if len(model.Spec.ImagePullSecrets) > 0 {
+		spec.ImagePullSecrets = copyPullSecrets(model.Spec.ImagePullSecrets)
+	}
+	if model.Spec.ServiceAccountName != "" {
+		spec.ServiceAccountName = model.Spec.ServiceAccountName
 	}
 	profileSet := &aimv1alpha2.AIMProfileSet{}
 	profileSet.Namespace = model.Namespace
@@ -1306,6 +1419,35 @@ func buildDesiredProfileSet(model *aimv1alpha2.AIMModel, cacheRef *aimv1alpha1.D
 	}
 	profileSet.Spec = spec
 	return profileSet
+}
+
+// desiredProfilesReadyAndCurrent reports whether every desired direct profile
+// already exists with the desired spec and has a Ready status for its current
+// generation. It gates removal of a previous child profile set so transitions
+// from derived to direct/generated profiles do not create an availability gap.
+func desiredProfilesReadyAndCurrent(desired []desiredProfile, existing []managedProfile) bool {
+	if len(desired) == 0 {
+		return true
+	}
+	existingByKey := make(map[string]managedProfile, len(existing))
+	for _, profile := range existing {
+		existingByKey[client.ObjectKeyFromObject(profile.Object).String()] = profile
+	}
+	for _, wanted := range desired {
+		current, found := existingByKey[client.ObjectKeyFromObject(wanted.Object).String()]
+		if !found ||
+			current.Object.GetGeneration() <= 0 ||
+			current.Status.ObservedGeneration != current.Object.GetGeneration() ||
+			current.Status.Status != constants.AIMStatusReady {
+			return false
+		}
+		wantedSpec, wantedOK := profileSpecCommon(wanted.Object)
+		currentSpec, currentOK := profileSpecCommon(current.Object)
+		if !wantedOK || !currentOK || !aimprofile.ProfileSpecsEquivalent(currentSpec, wantedSpec) {
+			return false
+		}
+	}
+	return true
 }
 
 func isSupportedProfile(spec aimv1alpha2.AIMProfileSpecCommon, nodes []corev1.Node) bool {
@@ -1339,7 +1481,16 @@ func summarizeManagedProfiles(desired []desiredProfile, existing []managedProfil
 		if !found {
 			continue
 		}
+		wantedSpec, wantedOK := profileSpecCommon(desired.Object)
+		currentSpec, currentOK := profileSpecCommon(profile.Object)
+		if !wantedOK || !currentOK || !aimprofile.ProfileSpecsEquivalent(currentSpec, wantedSpec) {
+			continue
+		}
 		existingDesiredCount++
+		if profile.Object.GetGeneration() > 0 &&
+			profile.Status.ObservedGeneration != profile.Object.GetGeneration() {
+			continue
+		}
 		switch profile.Status.Status {
 		case constants.AIMStatusReady:
 			result.Ready++

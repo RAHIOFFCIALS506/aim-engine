@@ -1,0 +1,185 @@
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: v1alpha2-aimprofileset-source-ref-validation
+spec:
+  description: |
+    Verifies the model-catalog source contract for standalone profile sets:
+    namespace sets may reference AIMModel or AIMClusterModel, cluster sets may
+    reference AIMClusterModel, sourceRef cannot be combined with the
+    real-profile selector.modelRef filter, and unknown source kinds are
+    rejected.
+  steps:
+    - name: Accept namespace model catalog source
+      try:
+        - apply:
+            resource:
+              apiVersion: aim.eai.amd.com/v1alpha2
+              kind: AIMProfileSet
+              metadata:
+                name: valid-namespace-model-source
+              spec:
+                sourceRef:
+                  kind: AIMModel
+                  name: source-model
+                selector:
+                  acceleratorModel: MI300X
+                versionPolicy: all
+
+    - name: Accept cluster model catalog source from namespace set
+      try:
+        - apply:
+            resource:
+              apiVersion: aim.eai.amd.com/v1alpha2
+              kind: AIMProfileSet
+              metadata:
+                name: valid-cluster-model-source
+              spec:
+                sourceRef:
+                  kind: AIMClusterModel
+                  name: source-cluster-model
+                selector:
+                  acceleratorModel: MI300X
+                versionPolicy: all
+
+    - name: Accept cluster model catalog source from cluster set
+      try:
+        - apply:
+            resource:
+              apiVersion: aim.eai.amd.com/v1alpha2
+              kind: AIMClusterProfileSet
+              metadata:
+                name: valid-cluster-set-model-source
+              spec:
+                sourceRef:
+                  kind: AIMClusterModel
+                  name: source-cluster-model
+                selector:
+                  acceleratorModel: MI300X
+                versionPolicy: all
+
+    - name: Reject namespace model source from cluster set
+      try:
+        - apply:
+            expect:
+              - check:
+                  ($error != null): true
+            resource:
+              apiVersion: aim.eai.amd.com/v1alpha2
+              kind: AIMClusterProfileSet
+              metadata:
+                name: invalid-cluster-set-namespace-model
+              spec:
+                sourceRef:
+                  kind: AIMModel
+                  name: source-model
+                selector:
+                  acceleratorModel: MI300X
+                versionPolicy: all
+
+    - name: Reject sourceRef combined with selector modelRef
+      try:
+        - apply:
+            expect:
+              - check:
+                  ($error != null): true
+            resource:
+              apiVersion: aim.eai.amd.com/v1alpha2
+              kind: AIMProfileSet
+              metadata:
+                name: invalid-double-source-scope
+              spec:
+                sourceRef:
+                  kind: AIMModel
+                  name: source-model
+                selector:
+                  modelRef:
+                    name: source-model
+                  acceleratorModel: MI300X
+                versionPolicy: all
+
+    - name: Reject sourceRef combined with modelRef in profiles-only AIMModel
+      try:
+        - apply:
+            expect:
+              - check:
+                  ($error != null): true
+            resource:
+              apiVersion: aim.eai.amd.com/v1alpha2
+              kind: AIMModel
+              metadata:
+                name: invalid-model-double-source-scope
+              spec:
+                profiles:
+                  derivedFrom:
+                    sourceRef:
+                      kind: ConfigMap
+                      name: source-catalog
+                    selector:
+                      modelRef:
+                        name: source-model
+                      acceleratorModel: MI300X
+                  versionPolicy: all
+
+    - name: Reject sourceRef combined with modelRef in profiles-only AIMClusterModel
+      try:
+        - apply:
+            expect:
+              - check:
+                  ($error != null): true
+            resource:
+              apiVersion: aim.eai.amd.com/v1alpha2
+              kind: AIMClusterModel
+              metadata:
+                name: invalid-cluster-model-double-source-scope
+              spec:
+                profiles:
+                  derivedFrom:
+                    sourceRef:
+                      kind: AIMClusterModel
+                      name: source-cluster-model
+                    selector:
+                      modelRef:
+                        name: source-cluster-model
+                      acceleratorModel: MI300X
+                  versionPolicy: all
+
+    - name: Reject unknown source kind
+      try:
+        - apply:
+            expect:
+              - check:
+                  ($error != null): true
+            resource:
+              apiVersion: aim.eai.amd.com/v1alpha2
+              kind: AIMProfileSet
+              metadata:
+                name: invalid-source-kind
+              spec:
+                sourceRef:
+                  kind: Deployment
+                  name: source
+                selector:
+                  acceleratorModel: MI300X
+                versionPolicy: all
+
+    - name: Reject namespace model source from cluster model derivation
+      try:
+        - apply:
+            expect:
+              - check:
+                  ($error != null): true
+            resource:
+              apiVersion: aim.eai.amd.com/v1alpha2
+              kind: AIMClusterModel
+              metadata:
+                name: invalid-cluster-model-namespace-source
+              spec:
+                profiles:
+                  derivedFrom:
+                    sourceRef:
+                      kind: AIMModel
+                      name: source-model
+                    selector:
+                      acceleratorModel: MI300X
+                  versionPolicy: all

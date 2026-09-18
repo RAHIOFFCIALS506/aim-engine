@@ -33,6 +33,27 @@ import (
 	aimv1alpha2 "github.com/amd-enterprise-ai/aim-engine/api/v1alpha2"
 )
 
+func TestProfileSpecsEquivalent_AppliesAPIServerDefaults(t *testing.T) {
+	t.Parallel()
+
+	desired := aimv1alpha2.AIMProfileSpecCommon{
+		AimId: "amd/example",
+		Image: "example.com/aim:1.0.0",
+	}
+	persisted := desired
+	persisted.AutoSelectionPolicy = aimv1alpha1.AIMProfileAutoSelectionPolicyOptimized
+	persisted.AcceleratorPartitioningMode = PartitioningModeUnpartitioned
+
+	if !ProfileSpecsEquivalent(desired, persisted) {
+		t.Fatal("schema-defaulted profile must compare equal to its pre-admission desired form")
+	}
+
+	persisted.AcceleratorCount = 2
+	if ProfileSpecsEquivalent(desired, persisted) {
+		t.Fatal("material profile-spec difference compared equal")
+	}
+}
+
 func TestMatchesProfileCopySelector_PartialEngineArgs(t *testing.T) {
 	t.Parallel()
 

@@ -16,8 +16,9 @@ v1alpha1 `AIMModel` had a wide spec that supported several overlapping flows:
 - **Profile-copy** — `spec.profileCopy` for replicating a published profile onto custom weights.
 - **Defaults** — `spec.defaultServiceTemplate`, `spec.runtimeConfigName`, `spec.env` to influence downstream resources.
 
-v1alpha2 replaces these with four flows, each driven by exactly one of
-`spec.image`, `spec.modelId`, or `spec.profiles`.
+v1alpha2 replaces these with four flows. `spec.modelId` is standalone;
+`spec.image` and `spec.profiles` may be used separately or together, with the
+combined shape deriving directly from the image's discovery catalog.
 
 ## v1alpha1 spec fields
 
@@ -148,11 +149,16 @@ The selector and overrides shape is unchanged — only the wrapping field name. 
 
 v1alpha2 explicitly forbids the legacy fields. Admission rejects:
 
-- `spec.aimId` (was top-level on v1alpha1 — now resolved via discovery or `derivedFrom.overrides.aimId`).
+- `spec.aimId` outside the generated `spec.modelId` flow (image and derivation
+  identities now come from discovery, source profiles, or
+  `profiles.overrides.aimId`).
 - `spec.modelSources` (now on `AIMProfile.spec.modelSources`).
 - `spec.custom` and `spec.customTemplates` (replaced by base-image + derivation).
 - `spec.profileCopy` (replaced by `derivedFrom`).
-- `spec.discovery`, `spec.defaultServiceTemplate`, `spec.runtimeConfigName`, `spec.env`, `spec.imageMetadata`.
+- `spec.discovery`, `spec.defaultServiceTemplate`, `spec.runtimeConfigName`,
+  `spec.env`, and `spec.imageMetadata` on profiles-only models. Image-backed
+  derivation may use the image-associated fields, but metadata extraction
+  cannot be disabled.
 
 Each rejection produces a targeted error message naming the v1alpha2 equivalent.
 

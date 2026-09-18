@@ -4,7 +4,9 @@
 
 You'll encounter profile sets in two ways:
 
-1. **Implicitly**, as children of `AIMModel.spec.profiles` — every fine-tuned or custom-model `AIMModel` synthesises an `AIMProfileSet` named `<model>-profiles-<hash>` and summarises its output.
+1. **Implicitly**, as children of `AIMModel.spec.profiles` — image-backed
+   derivation, fine-tuned, and custom-model flows synthesise an
+   `AIMProfileSet` named `<model>-profiles-<hash>` and summarise its output.
 2. **Directly**, as standalone resources you author yourself when you want to derive profiles without creating an owning `AIMModel`.
 
 The same internal primitive handles both — `AIMModel.spec.profiles` is translated into an `AIMProfileSetSpec` for the synthesised child set.
@@ -23,25 +25,90 @@ The same internal primitive handles both — `AIMModel.spec.profiles` is transla
 
 For sourcing:
 
-- `AIMProfileSet` selects from namespace-scoped `AIMProfile` objects in its own namespace.
+- In real-profile-backed mode, `AIMProfileSet` prefers namespace-scoped
+  `AIMProfile` objects in its own namespace and falls back to
+  `AIMClusterProfile` objects when no namespace candidate matches. An explicit
+  `selector.modelRef.scope` removes that fallback ambiguity.
 - `AIMClusterProfileSet` selects from cluster-scoped `AIMClusterProfile` objects.
-- Cache-backed sources (`spec.sourceRef`) are read from the same namespace for `AIMProfileSet` and from the operator namespace for `AIMClusterProfileSet`.
+- `sourceRef.kind: AIMModel` resolves an image-backed `AIMModel` in the
+  `AIMProfileSet` namespace.
+- `sourceRef.kind: AIMClusterModel` resolves an image-backed
+  `AIMClusterModel`. Both profile-set scopes may consume a cluster model.
+- `sourceRef.kind: ConfigMap` is read from the same namespace for
+  `AIMProfileSet` and from the operator namespace for
+  `AIMClusterProfileSet`. Omitting `kind` retains this ConfigMap behavior for
+  backwards compatibility.
 
-## Two source modes
+## Source modes
 
-A profile set selects sources in one of two modes — set by whether `spec.sourceRef` is populated.
+A profile set selects sources according to `spec.sourceRef`:
 
 | Mode | `spec.sourceRef` | Source pool |
 |---|---|---|
 | **Real-profile-backed** | omitted | Existing `AIMProfile` / `AIMClusterProfile` objects in the set's scope |
-| **Cache-backed** | set | Entries from a discovery cache `ConfigMap` (typically published by an `AIMModel`) |
+| **Model-catalog-backed** | `kind: AIMModel` or `kind: AIMClusterModel` | The referenced model's complete, current image-discovery catalog |
+| **ConfigMap-catalog-backed** | `kind: ConfigMap` or omitted | Entries from the named discovery-cache `ConfigMap` |
 
-The two modes are mutually exclusive — the controller doesn't mix them in a single reconcile.
+The modes are mutually exclusive — the controller doesn't mix source pools in
+a single reconcile.
 
-Cache-backed mode is mainly used by `AIMModel.spec.profiles.derivedFrom.sourceRef` when the source is an image's discovery output rather than already-materialised profiles. For standalone use, you'll almost always omit `sourceRef`.
+Cache-backed mode is used internally by an `AIMModel` or `AIMClusterModel`
+that combines `spec.image` with `spec.profiles`. The model controller injects
+its own discovery-cache reference into the child profile set. Users must not
+set `profiles.derivedFrom.sourceRef` or `selector.modelRef` in that combined
+shape because the image already defines the source scope.
+
+A standalone profile set should normally reference the source model rather than
+naming its internal ConfigMap:
+
+```yaml
+sourceRef:
+  kind: AIMClusterModel
+  name: llama-3-1-8b-instruct
+```
+
+The controller waits until that model has published a discovery cache for its
+current generation, verifies that the cache belongs to the referenced model
+and matches its current image/discovery inputs, then reads it. Direct
+`kind: ConfigMap` remains available for user-authored or externally managed
+catalogs.
+
+The cache contains the complete image catalog, including entries that were not
+materialised as profile CRs because their original hardware requirements do not
+match the current cluster. A cache-backed set can therefore select one of those
+entries, apply overrides, and materialise only the resulting profile. Catalog
+candidates participate in the same `role` and `origin` filtering as real
+profiles: their role is derived from the source spec and their origin is
+`discovered`.
+
+Keeping the complete catalog in the model-owned cache is deliberate. An
+alternative would be to materialise every discovered entry as an ordinary
+`AIMProfile` / `AIMClusterProfile`, including entries unsupported by the
+cluster. That would make unsupported source material visible to normal service
+selection, distort model readiness and managed-profile counts, and add API
+server, etcd, and watch traffic for resources that cannot be deployed as-is.
+The private catalog keeps discovery complete while materialising only profiles
+that are either natively supported or explicitly selected and transformed.
+
+`sourceRef` and `selector.modelRef` cannot be combined. They serve different
+purposes: `sourceRef` chooses a catalog source, while `selector.modelRef`
+filters the pool of already-materialised profiles when `sourceRef` is omitted.
+Keeping them separate avoids silently changing existing `modelRef` selectors
+from “real profiles” to “the full image catalog.”
+
+A standalone profile set owns its derived profiles. Referencing a model as its
+source does not make those outputs part of the model's
+`status.managedProfiles`. If services must resolve the outputs through
+`spec.model.name`, use `AIMModel.spec.profiles` /
+`AIMClusterModel.spec.profiles` so the model owns and readiness-accounts for
+the generated profiles. Standalone outputs can instead be selected directly by
+`aimId` and the other profile selector fields.
 
 :::{note}
-**Editing a user pre-populated `sourceRef` catalog is not reactive.** The operator watches the ConfigMaps it manages (including discovery caches published by an `AIMModel`), so those changes reconcile the profile set immediately. A catalog `ConfigMap` you create and maintain yourself is read on demand but not live-watched — edits are picked up on the profile set's next reconcile. To apply an edit promptly, re-apply or re-annotate the `AIMProfileSet` / `AIMClusterProfileSet` to trigger a reconcile.
+Model-backed profile sets react to both source-model status changes and updates
+to the model-owned cache. A ConfigMap with the discovery-catalog shape is also
+watched directly. Re-applying or re-annotating the profile set always forces a
+fresh read.
 :::
 
 ## Selector
@@ -62,7 +129,7 @@ Cache-backed mode is mainly used by `AIMModel.spec.profiles.derivedFrom.sourceRe
 | `acceleratorType` | Match `gpu` or `cpu`. |
 | `acceleratorCount` | Match by accelerator unit count. |
 | `engineArgs` | Partial match on engine args — every provided top-level key must exist on the source with an equal value. |
-| `modelRef.name` | Narrow to profiles produced by a specific AIM(Cluster)Model (matched via the `source-model` label). |
+| `modelRef.name` | In real-profile-backed mode, narrow to materialised profiles produced by a specific AIM(Cluster)Model (matched via the `source-model` label). To read that model's complete image catalog, use `spec.sourceRef.kind: AIMModel` / `AIMClusterModel` instead. |
 | `modelRef.scope` | `Auto` (try namespace first, then cluster), `Namespace`, or `Cluster`. Default `Auto`. |
 | `role` | `base` or `deployable`. Default `deployable`. |
 | `origin` | `discovered`, `derived`, or `user-authored`. When unset, doesn't filter by origin. |
@@ -105,6 +172,7 @@ The same shape applies to [`AIMModel.spec.profiles.derivedFrom`](../guides/custo
 | `modelSources` | Replaces source `modelSources` entirely. The first source's `modelId` is auto-copied into the derived profile's `spec.modelId`. |
 | `acceleratorModel` | Replaces source `acceleratorModel`. |
 | `acceleratorCount` | Replaces source `acceleratorCount`. |
+| `acceleratorPartitioningMode` | Replaces the source partitioning mode. Must be accompanied by `acceleratorCount`. Select a source whose count/engine arguments already match the intended topology; changing the output count does not automatically rewrite inherited tensor-parallel engine arguments. |
 | `containerEnv` | Merges by env-var name; matching names override, new names append. |
 | `engineEnv` | Merges by key; matching keys override, new keys append. |
 | `engineArgs` | Shallow merge on top of source `engineArgs`; matching top-level keys override, new keys append. |
@@ -122,6 +190,12 @@ When the profile set's top-level `spec.image` is unset, the derived profile's im
 An explicit top-level `spec.image` always wins outright, regardless of the above.
 
 Derived profiles inherit the source profile's `status.baseImage` so subsequent derivations or overlays can rebase consistently.
+
+Model-catalog-backed sets also inherit the source model's image pull-secret and
+service-account names unless the set overrides them. For a namespace-scoped
+`AIMProfileSet` that references an `AIMClusterModel`, resources with those names
+must exist in the ProfileSet's destination namespace; Kubernetes secret and
+service-account references do not cross namespace boundaries.
 
 ### Profile YAML contract inheritance
 
@@ -159,7 +233,7 @@ spec:
 
 | Field | Description |
 |---|---|
-| `sourceRef` | Optional reference to a discovery-cache `ConfigMap`. If omitted, source selection uses same-scope real profiles. |
+| `sourceRef` | Optional catalog source. `kind` is `AIMModel`, `AIMClusterModel`, or `ConfigMap` (the backwards-compatible default); `name` identifies the source. If omitted, source selection uses real profiles. |
 | `selector` | Match criteria — see [Selector](#selector). |
 | `versionPolicy` | `pinned`, `latest`, `all` — see [Version policy](#version-policy). |
 | `version` | Required when `versionPolicy: pinned`. |
@@ -193,29 +267,46 @@ spec:
     acceleratorCount: 4
 ```
 
-### Cache-backed derivation
+### Model-catalog-backed derivation
 
-Profile set that derives directly from an `AIMModel`'s discovery cache without going through materialised profiles:
+Cluster profile set that derives directly from an `AIMClusterModel`'s complete
+discovery catalog without naming its internal cache or requiring the source
+profile to have been materialised:
 
 ```yaml
 apiVersion: aim.eai.amd.com/v1alpha2
-kind: AIMProfileSet
+kind: AIMClusterProfileSet
 metadata:
-  name: qwen3-cache-derived
-  namespace: ml-team
+  name: llama-3-1-8b-partitioned
 spec:
   sourceRef:
+    kind: AIMClusterModel
+    name: llama-3-1-8b-instruct
+  selector:
+    acceleratorModel: MI300X
+    acceleratorCount: 1
+  versionPolicy: pinned
+  version: "0.11.1"
+  overrides:
+    acceleratorCount: 1
+    acceleratorPartitioningMode: CPX-NPS4
+```
+
+Use `kind: AIMModel` on an `AIMProfileSet` to resolve a namespace-scoped model
+in the same namespace. An `AIMProfileSet` may also use
+`kind: AIMClusterModel`; an `AIMClusterProfileSet` cannot reference an
+`AIMModel` because a cluster-scoped object has no namespace in which to resolve
+one.
+
+For a raw or externally managed catalog, retain the lower-level ConfigMap form:
+
+```yaml
+spec:
+  sourceRef:
+    kind: ConfigMap
     name: qwen3-32b-custom-discovery
   selector:
-    aimId: qwen/Qwen3-32B
     acceleratorModel: MI300X
-  versionPolicy: pinned
-  version: "0.9.0"
-  overrides:
-    image: quay.io/acme/aim-base-vllm:0.9.0
-    modelSources:
-      - modelId: acme/qwen3-32b-custom
-        sourceUri: s3://models/qwen3-32b-custom/
 ```
 
 ### Custom-model derivation (role: base)
@@ -316,7 +407,10 @@ Common causes:
 - A selector field is too restrictive — relax `precision`, `acceleratorModel`, etc.
 - `modelRef.name` typo or wrong scope.
 - Source profiles lack the `aim.eai.amd.com/profile-copyable: "true"` annotation.
-- For cache-backed mode: `spec.sourceRef.name` doesn't reference an existing ConfigMap.
+- For model-catalog-backed mode: the referenced model is missing, is not
+  image-backed, or has not published a current discovery cache yet.
+- For ConfigMap-catalog-backed mode: `spec.sourceRef.name` doesn't reference an
+  existing discovery-catalog ConfigMap in the expected namespace.
 
 ### `managedProfiles.total == 0` after applying
 
@@ -332,6 +426,12 @@ kubectl get aimprofileset <profileset-name> -o yaml
 ```
 
 Conditions on the profile set carry the actionable detail; the model just summarises.
+
+During a non-empty selector or cache transition, stale derived profiles are
+retained until every replacement profile exists, matches the desired spec, and
+has reported `Ready` for its current generation. A valid zero-match selection
+prunes stale outputs immediately because there is no replacement rollout to
+wait for.
 
 ## Related documentation
 

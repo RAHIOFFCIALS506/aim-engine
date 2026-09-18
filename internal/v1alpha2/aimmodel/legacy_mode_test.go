@@ -154,9 +154,9 @@ func TestHasLegacyInputs_RuntimeConfigNameDoesNotTrigger(t *testing.T) {
 	}
 }
 
-// TestHasLegacyInputs_PureProfileCopyDoesNotTrigger keeps the documented
-// "profileCopy-only" pure-v1alpha2 case skipping the legacy pipeline so
-// it does not surface spurious ImageMetadataReady=False conditions.
+// TestHasLegacyInputs_PureProfileCopyDoesNotTrigger keeps the deprecated
+// profileCopy compatibility shape on the native derivation pipeline so it
+// does not surface spurious ImageMetadataReady=False conditions.
 func TestHasLegacyInputs_PureProfileCopyDoesNotTrigger(t *testing.T) {
 	spec := aimv1alpha1.AIMModelSpec{
 		ProfileCopy: &aimv1alpha1.AIMProfileSetSpec{

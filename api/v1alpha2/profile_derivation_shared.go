@@ -49,6 +49,15 @@ const (
 // ProfileSourceRef identifies an alternate discovery cache source for derivation.
 type ProfileSourceRef = aimv1alpha1.ProfileSourceRef
 
+// ProfileSourceKind identifies the resource supplying a cache-backed source catalog.
+type ProfileSourceKind = aimv1alpha1.ProfileSourceKind
+
+const (
+	ProfileSourceKindConfigMap       = aimv1alpha1.ProfileSourceKindConfigMap
+	ProfileSourceKindAIMModel        = aimv1alpha1.ProfileSourceKindAIMModel
+	ProfileSourceKindAIMClusterModel = aimv1alpha1.ProfileSourceKindAIMClusterModel
+)
+
 // ProfileSelector narrows the source profiles selected for derivation.
 type ProfileSelector = aimv1alpha1.ProfileSelector
 

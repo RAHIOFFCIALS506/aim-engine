@@ -27,6 +27,7 @@ import (
 	"errors"
 	"testing"
 
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	aimv1alpha1 "github.com/amd-enterprise-ai/aim-engine/api/v1alpha1"
@@ -36,6 +37,147 @@ import (
 	"github.com/amd-enterprise-ai/aim-engine/internal/v1alpha2/aimprofile"
 	"github.com/amd-enterprise-ai/aim-engine/internal/v1alpha2/profileyaml"
 )
+
+func TestBuildDesiredClusterProfileSet_ImageBackedProfilesWaitsForCacheAndInjectsCredentials(t *testing.T) {
+	t.Parallel()
+
+	count := int32(1)
+	model := &aimv1alpha2.AIMClusterModel{
+		ObjectMeta: metav1.ObjectMeta{Name: "gpt-oss-partitioned", UID: "model-uid"},
+		Spec: aimv1alpha1.AIMModelSpec{
+			Image: "amdenterpriseai/aim-openai-gpt-oss-20b:0.11.1",
+			Profiles: &aimv1alpha1.AIMModelProfilesSpec{
+				DerivedFrom: &aimv1alpha1.AIMModelProfilesDerivedFrom{
+					SourceRef: &aimv1alpha1.ProfileSourceRef{Name: "user-supplied-cache"},
+					Selector: aimv1alpha1.ProfileSelector{
+						AcceleratorModel: "MI300X",
+						AcceleratorCount: &count,
+						ModelRef: &aimv1alpha1.ProfileSelectorModelRef{
+							Name: "user-supplied-model",
+						},
+					},
+				},
+				VersionPolicy: aimv1alpha1.ProfileVersionPolicyPinned,
+				Version:       "0.11.1",
+				Overrides: &aimv1alpha1.ProfileOverrides{
+					AcceleratorCount:            &count,
+					AcceleratorPartitioningMode: "CPX-NPS4",
+				},
+			},
+			ImagePullSecrets:   []corev1.LocalObjectReference{{Name: "registry-creds"}},
+			ServiceAccountName: "aim-puller",
+		},
+	}
+	profileSetName, err := childProfileSetName(model.Name)
+	if err != nil {
+		t.Fatalf("childProfileSetName() error = %v", err)
+	}
+	if got := buildDesiredClusterProfileSet(model, nil, profileSetName); got != nil {
+		t.Fatalf("buildDesiredClusterProfileSet() before discovery = %#v, want nil", got)
+	}
+
+	cacheRef := &aimv1alpha1.DiscoveryCacheReference{
+		Name:      "gpt-oss-discovery-cache",
+		Namespace: constants.GetOperatorNamespace(),
+	}
+	desired := buildDesiredClusterProfileSet(model, cacheRef, profileSetName)
+	if desired == nil {
+		t.Fatal("buildDesiredClusterProfileSet() after discovery = nil")
+	}
+	if desired.Spec.SourceRef == nil || desired.Spec.SourceRef.Name != cacheRef.Name {
+		t.Fatalf("child sourceRef = %#v, want model-owned cache %q", desired.Spec.SourceRef, cacheRef.Name)
+	}
+	if desired.Spec.SourceRef.Kind != aimv1alpha1.ProfileSourceKindConfigMap {
+		t.Fatalf("child sourceRef kind = %q, want ConfigMap", desired.Spec.SourceRef.Kind)
+	}
+	if desired.Spec.Selector.ModelRef != nil {
+		t.Fatalf("child selector.modelRef = %#v, want image-owned scope", desired.Spec.Selector.ModelRef)
+	}
+	if len(desired.Spec.ImagePullSecrets) != 1 || desired.Spec.ImagePullSecrets[0].Name != "registry-creds" {
+		t.Fatalf("child imagePullSecrets = %#v, want top-level model credentials", desired.Spec.ImagePullSecrets)
+	}
+	if desired.Spec.ServiceAccountName != "aim-puller" {
+		t.Fatalf("child serviceAccountName = %q, want %q", desired.Spec.ServiceAccountName, "aim-puller")
+	}
+}
+
+func TestClusterComposeState_ImageBackedDerivationIgnoresNodeInventoryFailure(t *testing.T) {
+	t.Parallel()
+
+	count := int32(1)
+	model := &aimv1alpha2.AIMClusterModel{
+		ObjectMeta: metav1.ObjectMeta{Name: "gpt-oss-partitioned", UID: "model-uid"},
+		Spec: aimv1alpha1.AIMModelSpec{
+			Image: "amdenterpriseai/aim-openai-gpt-oss-20b:0.11.1",
+			Profiles: &aimv1alpha1.AIMModelProfilesSpec{
+				DerivedFrom: &aimv1alpha1.AIMModelProfilesDerivedFrom{
+					Selector: aimv1alpha1.ProfileSelector{
+						AcceleratorModel: "MI300X",
+						AcceleratorCount: &count,
+					},
+				},
+				VersionPolicy: aimv1alpha1.ProfileVersionPolicyPinned,
+				Version:       "0.11.1",
+				Overrides: &aimv1alpha1.ProfileOverrides{
+					AimId: "acme/gpt-oss-partitioned",
+				},
+			},
+		},
+	}
+	catalog := aimprofile.DiscoveryCatalog{
+		Profiles: []aimprofile.DiscoveryCatalogItem{{
+			Name:    "mi300x-tp1",
+			Version: "0.11.1",
+			Spec: aimv1alpha2.AIMProfileSpecCommon{
+				AimId:            "openai/gpt-oss-20b",
+				ModelId:          "openai/gpt-oss-20b",
+				ProfileId:        "mi300x-tp1",
+				AcceleratorModel: "MI300X",
+				AcceleratorCount: 1,
+			},
+		}},
+	}
+	reconciler := &ClusterModelReconciler{}
+	obs := reconciler.ComposeState(
+		context.Background(),
+		controllerutils.ReconcileContext[*aimv1alpha2.AIMClusterModel]{Object: model},
+		ClusterModelFetchResult{
+			model: model,
+			discovery: DiscoveryDecision{
+				Catalog: &catalog,
+				Reason:  "DiscoveryCacheValid",
+			},
+			nodes: controllerutils.FetchResult[[]corev1.Node]{
+				Error: errListNodesFailed,
+			},
+			existingClusterProfiles: controllerutils.FetchResult[[]managedProfile]{},
+			childProfileSet:         controllerutils.FetchResult[*aimv1alpha2.AIMClusterProfileSet]{},
+		},
+	)
+	if obs.BuildErr != nil {
+		t.Fatalf("BuildErr = %v, node inventory must not block cache-backed derivation", obs.BuildErr)
+	}
+	if obs.ResolvedAimID != "acme/gpt-oss-partitioned" {
+		t.Fatalf("ResolvedAimID = %q, want derivation override", obs.ResolvedAimID)
+	}
+	if obs.DesiredProfileSet == nil || obs.DesiredProfileSet.Spec.SourceRef == nil {
+		t.Fatalf("DesiredProfileSet = %#v, want cache-backed child", obs.DesiredProfileSet)
+	}
+	if len(obs.DesiredProfiles) != 0 {
+		t.Fatalf("len(DesiredProfiles) = %d, source catalog entries must not be materialized directly", len(obs.DesiredProfiles))
+	}
+	plan := reconciler.PlanResources(
+		context.Background(),
+		controllerutils.ReconcileContext[*aimv1alpha2.AIMClusterModel]{Object: model},
+		obs,
+	)
+	if len(plan.GetToApply()) != 1 {
+		t.Fatalf("owned applies = %#v, want only child AIMClusterProfileSet", plan.GetToApply())
+	}
+	if _, ok := plan.GetToApply()[0].(*aimv1alpha2.AIMClusterProfileSet); !ok {
+		t.Fatalf("applied object = %T, want *AIMClusterProfileSet", plan.GetToApply()[0])
+	}
+}
 
 func TestClusterComposeState_ProfileSetReadFailureBlocksNativeMutation(t *testing.T) {
 	model := &aimv1alpha2.AIMClusterModel{
@@ -79,6 +221,64 @@ func TestClusterComposeState_ProfileSetReadFailureBlocksNativeMutation(t *testin
 		len(plan.GetToApplyWithForce()) != 0 ||
 		len(plan.GetToDelete()) != 0 {
 		t.Fatalf("child read failure allowed cluster mutation: %#v", plan)
+	}
+}
+
+func TestClusterComposeState_CurrentZeroMatchProfileSetPrunesStaleDirectProfiles(t *testing.T) {
+	t.Parallel()
+
+	model := &aimv1alpha2.AIMClusterModel{
+		ObjectMeta: metav1.ObjectMeta{Name: "derived", UID: "model-uid"},
+		Spec: aimv1alpha1.AIMModelSpec{
+			Profiles: &aimv1alpha1.AIMModelProfilesSpec{
+				DerivedFrom: &aimv1alpha1.AIMModelProfilesDerivedFrom{
+					Selector: aimv1alpha1.ProfileSelector{AcceleratorModel: "MI300X"},
+				},
+				VersionPolicy: aimv1alpha1.ProfileVersionPolicyAll,
+			},
+		},
+	}
+	childName, err := childProfileSetName(model.Name)
+	if err != nil {
+		t.Fatalf("childProfileSetName() error = %v", err)
+	}
+	child := buildDesiredClusterProfileSet(model, nil, childName)
+	if child == nil {
+		t.Fatal("buildDesiredClusterProfileSet() = nil")
+	}
+	child.Generation = 2
+	child.Status = aimv1alpha1.AIMProfileSetStatus{
+		ObservedGeneration: 2,
+		Status:             constants.AIMStatusNotAvailable,
+		ManagedProfiles:    aimv1alpha1.ManagedProfileCounts{},
+	}
+	stale := &aimv1alpha2.AIMClusterProfile{
+		ObjectMeta: metav1.ObjectMeta{Name: "old-direct"},
+	}
+
+	reconciler := &ClusterModelReconciler{}
+	obs := reconciler.ComposeState(
+		context.Background(),
+		controllerutils.ReconcileContext[*aimv1alpha2.AIMClusterModel]{Object: model},
+		ClusterModelFetchResult{
+			model: model,
+			existingClusterProfiles: controllerutils.FetchResult[[]managedProfile]{
+				Value: []managedProfile{{Object: stale}},
+			},
+			childProfileSet: controllerutils.FetchResult[*aimv1alpha2.AIMClusterProfileSet]{Value: child},
+		},
+	)
+	plan := reconciler.PlanResources(
+		context.Background(),
+		controllerutils.ReconcileContext[*aimv1alpha2.AIMClusterModel]{Object: model},
+		obs,
+	)
+
+	if !obs.ProfileSetCurrent || !obs.pruneSafe {
+		t.Fatalf("current zero-match child did not permit prune: %#v", obs)
+	}
+	if len(plan.GetToDelete()) != 1 || plan.GetToDelete()[0].GetName() != stale.Name {
+		t.Fatalf("deletes = %#v, want stale direct cluster profile", plan.GetToDelete())
 	}
 }
 

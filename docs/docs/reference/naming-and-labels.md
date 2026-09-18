@@ -255,7 +255,7 @@ The operator maintains field indexes for efficient lookups. The full set used by
 | `.spec.image` | `AIMModel`, `AIMClusterModel` | Models by image URI |
 | `.spec.selector.aimId` | `AIMProfileSet`, `AIMClusterProfileSet`, `AIMService` | Resources by selector aimId |
 | `.spec.selector.modelRef.name` | `AIMProfileSet`, `AIMClusterProfileSet`, `AIMService` | Resources by selected source model |
-| `.spec.sourceRef` | `AIMProfileSet`, `AIMClusterProfileSet` | Profile sets by source discovery cache |
+| `.spec.sourceRef` | `AIMProfileSet`, `AIMClusterProfileSet` | Profile sets by typed catalog source (`kind`, scope, and name) |
 | `.spec.aimId` | `AIMProfile`, `AIMClusterProfile` | Profiles by aimId |
 | `.spec.profileName` | `AIMProfileCache` | Caches by target profile name |
 | `.spec.sourceUri` | `AIMArtifact` | Artifacts by source URI |

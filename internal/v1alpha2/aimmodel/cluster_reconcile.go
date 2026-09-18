@@ -135,11 +135,22 @@ func (r *ClusterModelReconciler) FetchRemoteState(
 	// spec carries any v1alpha1-shaped inputs. See the package-level docs
 	// in legacy_mode.go for why the two pipelines co-execute when both
 	// have work to do, and why the legacy side must be skipped for pure
-	// v1alpha2 specs (profileCopy-only) — otherwise the legacy ImageMetadata
+	// v1alpha2 specs (profiles-only) — otherwise the legacy ImageMetadata
 	// fetch tries to parse an empty image reference and surfaces spurious
 	// failures.
 	result := ClusterModelFetchResult{
 		model: model,
+	}
+	childName, childNameErr := childProfileSetName(model.Name)
+	if childNameErr != nil {
+		result.childProfileSet = controllerutils.FetchResult[*aimv1alpha2.AIMClusterProfileSet]{Error: childNameErr}
+	} else {
+		result.childProfileSet = controllerutils.Fetch(
+			ctx,
+			c,
+			client.ObjectKey{Name: childName},
+			&aimv1alpha2.AIMClusterProfileSet{},
+		)
 	}
 	if hasLegacyInputs(model.Spec) {
 		result.legacyModel = asLegacyClusterModel(model)
@@ -178,14 +189,6 @@ func (r *ClusterModelReconciler) FetchRemoteState(
 	}
 	clusterProfiles, err := listManagedClusterProfiles(ctx, c, string(model.UID))
 	result.existingClusterProfiles = controllerutils.FetchResult[[]managedProfile]{Value: clusterProfiles, Error: err}
-	if derivationSpec(&model.Spec) != nil {
-		childName, childNameErr := childProfileSetName(model.Name)
-		if childNameErr != nil {
-			result.childProfileSet = controllerutils.FetchResult[*aimv1alpha2.AIMClusterProfileSet]{Error: childNameErr}
-		} else {
-			result.childProfileSet = controllerutils.Fetch(ctx, c, client.ObjectKey{Name: childName}, &aimv1alpha2.AIMClusterProfileSet{})
-		}
-	}
 	return result
 }
 
@@ -202,14 +205,26 @@ func (r *ClusterModelReconciler) ComposeState(
 	}
 	obs.Kind = classifyModelKind(&fetch.model.Spec)
 	derivation := derivationSpec(&fetch.model.Spec)
-	desiredProfilesKnown := derivation != nil
+	desiredProfilesKnown := false
 	obs.BuildErr = profileInventoryReadError(
 		fetch.existingClusterProfiles.Error,
 		fetch.childProfileSet.Error,
-		derivation != nil,
 		"failed to list cluster profiles managed by this AIMClusterModel",
 		"failed to read the child AIMClusterProfileSet",
 	)
+	if obs.BuildErr == nil {
+		obs.BuildErr = validateDerivationSourceScope(derivation)
+	}
+	if obs.BuildErr == nil &&
+		derivation != nil &&
+		fetch.model.Spec.Image != "" &&
+		!shouldRunNativeDiscovery(&fetch.model.Spec) {
+		obs.BuildErr = controllerutils.NewInvalidSpecError(
+			"ImageProfileDerivationRequiresDiscovery",
+			"spec.discovery.extractMetadata must be true when spec.image and spec.profiles are used together",
+			nil,
+		)
+	}
 	if derivation != nil {
 		// For role=base derivations the target aimId lives on
 		// overrides.aimId (CEL forbids selector.aimId then); for
@@ -238,7 +253,9 @@ func (r *ClusterModelReconciler) ComposeState(
 		}
 		if decision.Catalog != nil {
 			catalog := *decision.Catalog
-			obs.ResolvedAimID = firstNonEmpty(catalog.AimID, obs.ResolvedAimID)
+			// Keep the target identity selected by derivation overrides; only
+			// image-only discovery falls back to the source catalog identity.
+			obs.ResolvedAimID = firstNonEmpty(obs.ResolvedAimID, catalog.AimID)
 			obs.ResolvedBaseImage = catalog.BaseImage
 			cacheName, err := discoveryCacheName(fetch.model.Name)
 			if err != nil {
@@ -298,11 +315,12 @@ func (r *ClusterModelReconciler) ComposeState(
 		} else {
 			obs.ProfileSetRef = &aimv1alpha1.ProfileSetReference{Name: childName}
 			obs.DesiredProfileSet = buildDesiredClusterProfileSet(fetch.model, obs.DiscoveryCacheRef, childName)
+			desiredProfilesKnown = obs.DesiredProfileSet != nil
 		}
 		obs.ManagedProfiles,
 			obs.ExistingDesiredCount,
 			obs.ProfileSetCurrent,
-			obs.ProfileSetStatus = observedClusterProfileSet(fetch.childProfileSet)
+			obs.ProfileSetStatus = observedClusterProfileSet(fetch.childProfileSet, obs.DesiredProfileSet)
 	} else if fetch.existingClusterProfiles.OK() {
 		obs.ManagedProfiles, obs.ExistingDesiredCount = summarizeManagedProfiles(obs.DesiredProfiles, fetch.existingClusterProfiles.Value)
 	}
@@ -383,7 +401,10 @@ func (r *ClusterModelReconciler) PlanResources(
 		}
 	}
 	if derivation == nil && obs.childProfileSet.OK() && obs.childProfileSet.Value != nil {
-		plan.Delete(obs.childProfileSet.Value)
+		if len(obs.DesiredProfiles) == 0 ||
+			desiredProfilesReadyAndCurrent(obs.DesiredProfiles, obs.existingClusterProfiles.Value) {
+			plan.Delete(obs.childProfileSet.Value)
+		}
 	}
 	return plan
 }
@@ -501,11 +522,25 @@ func buildDesiredClusterProfileSet(model *aimv1alpha2.AIMClusterModel, cacheRef 
 	if derivation == nil {
 		return nil
 	}
+	if model.Spec.Image != "" && cacheRef == nil {
+		return nil
+	}
 	spec := *derivation.DeepCopy()
-	if model.Spec.Image != "" && cacheRef != nil {
+	if model.Spec.Image != "" {
 		spec.SourceRef = &aimv1alpha1.ProfileSourceRef{
+			Kind: aimv1alpha1.ProfileSourceKindConfigMap,
 			Name: cacheRef.Name,
 		}
+		// The image-owned cache is the complete source scope. Admission
+		// rejects modelRef on new image-backed objects; clear it defensively
+		// for previously stored compatibility shapes.
+		spec.Selector.ModelRef = nil
+	}
+	if len(model.Spec.ImagePullSecrets) > 0 {
+		spec.ImagePullSecrets = copyPullSecrets(model.Spec.ImagePullSecrets)
+	}
+	if model.Spec.ServiceAccountName != "" {
+		spec.ServiceAccountName = model.Spec.ServiceAccountName
 	}
 	profileSet := &aimv1alpha2.AIMClusterProfileSet{}
 	profileSet.Name = name

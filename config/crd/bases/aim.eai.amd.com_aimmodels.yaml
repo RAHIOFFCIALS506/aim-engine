@@ -69,9 +69,9 @@ spec:
 
               Per-version constraints (v1alpha1 forbids derivedFrom and profiles;
               v1alpha2 forbids profileCopy/custom/customTemplates/top-level modelSources,
-              requires image XOR profiles, and forbids profiles mixed with legacy scalar
-              fields) live on the version-specific AIMModel / AIMClusterModel root types
-              in the per-version *_types.go files.
+              keeps modelId exclusive, and allows image-backed profile derivation) live on
+              the version-specific AIMModel / AIMClusterModel root types in the per-version
+              *_types.go files.
             properties:
               accelerator:
                 description: |-
@@ -1260,13 +1260,36 @@ spec:
                     type: string
                   sourceRef:
                     description: |-
-                      SourceRef points to an alternate discovery cache source.
-                      When omitted, derivation uses visible AIMProfile and AIMClusterProfile objects.
-                      For AIMProfileSet, the referenced ConfigMap is read from the same namespace.
-                      For AIMClusterProfileSet, it is read from the operator namespace.
+                      SourceRef selects a cache-backed source. ConfigMap reads a discovery
+                      catalog directly. AIMModel and AIMClusterModel resolve the referenced
+                      model's current discovery cache, including entries that were not
+                      materialized as profile resources because their original hardware shape
+                      is unsupported by the cluster.
+
+                      When omitted, derivation uses visible AIMProfile and AIMClusterProfile
+                      objects. selector.modelRef is a filter for that real-profile-backed mode
+                      and cannot be combined with sourceRef.
                     properties:
+                      kind:
+                        default: ConfigMap
+                        description: |-
+                          Kind selects the source resource. ConfigMap reads the named discovery
+                          catalog directly. AIMModel and AIMClusterModel resolve the model's
+                          status.discoveryCacheRef, allowing selection from its complete image
+                          catalog including profiles that were not materialized for the current
+                          cluster hardware.
+                        enum:
+                        - ConfigMap
+                        - AIMModel
+                        - AIMClusterModel
+                        type: string
                       name:
-                        description: Name is the discovery cache ConfigMap name.
+                        description: |-
+                          Name is the source resource name. AIMModel references resolve in the
+                          AIMProfileSet namespace; AIMClusterModel references are cluster-scoped.
+                          ConfigMap references resolve in the AIMProfileSet namespace, or in the
+                          operator namespace for AIMClusterProfileSet.
+                        minLength: 1
                         type: string
                     required:
                     - name
@@ -1294,6 +1317,11 @@ spec:
                     || has(self.selector.acceleratorType) || has(self.selector.acceleratorCount)
                     || has(self.selector.engineArgs) || has(self.selector.modelRef)
                     || has(self.selector.origin)
+                - message: selector.modelRef cannot be combined with sourceRef; sourceRef
+                    already defines the source scope
+                  optionalOldSelf: true
+                  rule: '!has(self.sourceRef) || !has(self.selector.modelRef) || (oldSelf.hasValue()
+                    && has(oldSelf.value().sourceRef) && has(oldSelf.value().selector.modelRef))'
                 - message: version is required when versionPolicy is pinned
                   rule: has(self.version) || (has(self.versionPolicy) && self.versionPolicy
                     != 'pinned')
@@ -1499,7 +1527,10 @@ spec:
               image:
                 description: |-
                   Image is the container image URI for this AIM model.
-                  This image is inspected by the operator to select runtime profiles used by templates.
+                  This image is inspected by the operator to discover runtime profiles.
+                  When spec.profiles is also set, the image's complete discovery cache is
+                  the implicit derivation source and only selected/overridden outputs are
+                  materialised.
                   Discovery behavior is controlled by the discovery field and runtime config's AutoDiscovery setting.
                   Required unless modelId, an eligible aimId-only flow, or a profile
                   derivation flow is set.
@@ -2615,13 +2646,36 @@ spec:
                     type: string
                   sourceRef:
                     description: |-
-                      SourceRef points to an alternate discovery cache source.
-                      When omitted, derivation uses visible AIMProfile and AIMClusterProfile objects.
-                      For AIMProfileSet, the referenced ConfigMap is read from the same namespace.
-                      For AIMClusterProfileSet, it is read from the operator namespace.
+                      SourceRef selects a cache-backed source. ConfigMap reads a discovery
+                      catalog directly. AIMModel and AIMClusterModel resolve the referenced
+                      model's current discovery cache, including entries that were not
+                      materialized as profile resources because their original hardware shape
+                      is unsupported by the cluster.
+
+                      When omitted, derivation uses visible AIMProfile and AIMClusterProfile
+                      objects. selector.modelRef is a filter for that real-profile-backed mode
+                      and cannot be combined with sourceRef.
                     properties:
+                      kind:
+                        default: ConfigMap
+                        description: |-
+                          Kind selects the source resource. ConfigMap reads the named discovery
+                          catalog directly. AIMModel and AIMClusterModel resolve the model's
+                          status.discoveryCacheRef, allowing selection from its complete image
+                          catalog including profiles that were not materialized for the current
+                          cluster hardware.
+                        enum:
+                        - ConfigMap
+                        - AIMModel
+                        - AIMClusterModel
+                        type: string
                       name:
-                        description: Name is the discovery cache ConfigMap name.
+                        description: |-
+                          Name is the source resource name. AIMModel references resolve in the
+                          AIMProfileSet namespace; AIMClusterModel references are cluster-scoped.
+                          ConfigMap references resolve in the AIMProfileSet namespace, or in the
+                          operator namespace for AIMClusterProfileSet.
+                        minLength: 1
                         type: string
                     required:
                     - name
@@ -2649,6 +2703,11 @@ spec:
                     || has(self.selector.acceleratorType) || has(self.selector.acceleratorCount)
                     || has(self.selector.engineArgs) || has(self.selector.modelRef)
                     || has(self.selector.origin)
+                - message: selector.modelRef cannot be combined with sourceRef; sourceRef
+                    already defines the source scope
+                  optionalOldSelf: true
+                  rule: '!has(self.sourceRef) || !has(self.selector.modelRef) || (oldSelf.hasValue()
+                    && has(oldSelf.value().sourceRef) && has(oldSelf.value().selector.modelRef))'
                 - message: version is required when versionPolicy is pinned
                   rule: has(self.version) || (has(self.versionPolicy) && self.versionPolicy
                     != 'pinned')
@@ -2680,9 +2739,14 @@ spec:
                   applied to copies (`profiles.overrides`). When set, the AIMModel
                   reconciler synthesises a child AIMProfileSet from this block.
 
-                  Mutually exclusive with spec.image (exactly one of the two is required
-                  for v1alpha2 AIMModel). v1alpha1 rejects spec.profiles via per-version
-                  CEL.
+                  When spec.image is also set, the child set is bound to this model's
+                  discovery cache and can select catalog entries even when the source
+                  profile was not materialised for the cluster's current hardware.
+                  profiles.derivedFrom.sourceRef and selector.modelRef must then be omitted
+                  because the image already supplies the source scope.
+
+                  Mutually exclusive with spec.modelId. v1alpha1 rejects spec.profiles via
+                  per-version CEL.
                 properties:
                   derivedFrom:
                     description: DerivedFrom identifies the source profiles to copy
@@ -2848,12 +2912,33 @@ spec:
                         type: object
                       sourceRef:
                         description: |-
-                          SourceRef points to an alternate discovery cache source (a
-                          pre-populated ConfigMap of profile YAMLs) instead of using the
-                          visible AIMProfile / AIMClusterProfile objects.
+                          SourceRef selects an alternate catalog source instead of using visible
+                          AIMProfile / AIMClusterProfile objects. It may reference a ConfigMap of
+                          profile YAMLs or an image-backed AIMModel / AIMClusterModel whose current
+                          discovery cache supplies the catalog. Omit it when the parent AIMModel
+                          also sets spec.image: the controller injects that model's own discovery
+                          cache and the v1alpha2 API rejects an explicit sourceRef.
                         properties:
+                          kind:
+                            default: ConfigMap
+                            description: |-
+                              Kind selects the source resource. ConfigMap reads the named discovery
+                              catalog directly. AIMModel and AIMClusterModel resolve the model's
+                              status.discoveryCacheRef, allowing selection from its complete image
+                              catalog including profiles that were not materialized for the current
+                              cluster hardware.
+                            enum:
+                            - ConfigMap
+                            - AIMModel
+                            - AIMClusterModel
+                            type: string
                           name:
-                            description: Name is the discovery cache ConfigMap name.
+                            description: |-
+                              Name is the source resource name. AIMModel references resolve in the
+                              AIMProfileSet namespace; AIMClusterModel references are cluster-scoped.
+                              ConfigMap references resolve in the AIMProfileSet namespace, or in the
+                              operator namespace for AIMClusterProfileSet.
+                            minLength: 1
                             type: string
                         required:
                         - name
@@ -3362,6 +3447,13 @@ spec:
                 - message: latest/all versionPolicy must not set version
                   rule: '!has(self.versionPolicy) || (self.versionPolicy != ''latest''
                     && self.versionPolicy != ''all'') || !has(self.version)'
+                - message: derivedFrom.selector.modelRef cannot be combined with derivedFrom.sourceRef;
+                    sourceRef already defines the source scope
+                  optionalOldSelf: true
+                  rule: '!has(self.derivedFrom) || !has(self.derivedFrom.sourceRef)
+                    || !has(self.derivedFrom.selector.modelRef) || (oldSelf.hasValue()
+                    && has(oldSelf.value().derivedFrom) && has(oldSelf.value().derivedFrom.sourceRef)
+                    && has(oldSelf.value().derivedFrom.selector.modelRef))'
                 - message: derivedFrom.selector.aimId/modelId/profileId are not allowed
                     when selector.role=base; set overrides.aimId/modelId/profileId
                     instead (base profiles have no source identity to filter on)
@@ -4235,6 +4327,11 @@ spec:
           rule: '!has(self.spec.modelId)'
         - message: spec.accelerator is only supported on v1alpha2
           rule: '!has(self.spec.accelerator)'
+        - message: v1alpha1 spec.profileCopy.sourceRef supports only ConfigMap; use
+            v1alpha2 for AIMModel or AIMClusterModel catalog references
+          rule: '!has(self.spec.profileCopy) || !has(self.spec.profileCopy.sourceRef)
+            || !has(self.spec.profileCopy.sourceRef.kind) || self.spec.profileCopy.sourceRef.kind
+            == ''ConfigMap'''
     served: true
     storage: false
     subresources:
@@ -4275,9 +4372,12 @@ spec:
           is identical between versions and the None conversion strategy works
           without a webhook.
 
-          v1alpha2 onboarding contract: exactly one of spec.image (official
-          discovery), spec.modelId (generated profiles), or spec.profiles
-          (fine-tune / custom-model derivation); legacy
+          v1alpha2 onboarding contract: spec.modelId (generated profiles) is mutually
+          exclusive with the image/profile family. Within that family, spec.image
+          (discovery) and spec.profiles (derivation) may be used separately or
+          together. The combined image+profiles shape derives directly from this
+          model's discovery cache, including catalog entries that were not materialised
+          because the cluster lacks matching hardware. Legacy
           v1alpha1 onboarding fields and the deprecated flat spec.derivedFrom shape
           are forbidden on NEW v1alpha2 objects. Each "forbidden" rule uses
           optionalOldSelf so that objects originally created via v1alpha1 (which
@@ -4312,9 +4412,9 @@ spec:
 
               Per-version constraints (v1alpha1 forbids derivedFrom and profiles;
               v1alpha2 forbids profileCopy/custom/customTemplates/top-level modelSources,
-              requires image XOR profiles, and forbids profiles mixed with legacy scalar
-              fields) live on the version-specific AIMModel / AIMClusterModel root types
-              in the per-version *_types.go files.
+              keeps modelId exclusive, and allows image-backed profile derivation) live on
+              the version-specific AIMModel / AIMClusterModel root types in the per-version
+              *_types.go files.
             properties:
               accelerator:
                 description: |-
@@ -5503,13 +5603,36 @@ spec:
                     type: string
                   sourceRef:
                     description: |-
-                      SourceRef points to an alternate discovery cache source.
-                      When omitted, derivation uses visible AIMProfile and AIMClusterProfile objects.
-                      For AIMProfileSet, the referenced ConfigMap is read from the same namespace.
-                      For AIMClusterProfileSet, it is read from the operator namespace.
+                      SourceRef selects a cache-backed source. ConfigMap reads a discovery
+                      catalog directly. AIMModel and AIMClusterModel resolve the referenced
+                      model's current discovery cache, including entries that were not
+                      materialized as profile resources because their original hardware shape
+                      is unsupported by the cluster.
+
+                      When omitted, derivation uses visible AIMProfile and AIMClusterProfile
+                      objects. selector.modelRef is a filter for that real-profile-backed mode
+                      and cannot be combined with sourceRef.
                     properties:
+                      kind:
+                        default: ConfigMap
+                        description: |-
+                          Kind selects the source resource. ConfigMap reads the named discovery
+                          catalog directly. AIMModel and AIMClusterModel resolve the model's
+                          status.discoveryCacheRef, allowing selection from its complete image
+                          catalog including profiles that were not materialized for the current
+                          cluster hardware.
+                        enum:
+                        - ConfigMap
+                        - AIMModel
+                        - AIMClusterModel
+                        type: string
                       name:
-                        description: Name is the discovery cache ConfigMap name.
+                        description: |-
+                          Name is the source resource name. AIMModel references resolve in the
+                          AIMProfileSet namespace; AIMClusterModel references are cluster-scoped.
+                          ConfigMap references resolve in the AIMProfileSet namespace, or in the
+                          operator namespace for AIMClusterProfileSet.
+                        minLength: 1
                         type: string
                     required:
                     - name
@@ -5537,6 +5660,11 @@ spec:
                     || has(self.selector.acceleratorType) || has(self.selector.acceleratorCount)
                     || has(self.selector.engineArgs) || has(self.selector.modelRef)
                     || has(self.selector.origin)
+                - message: selector.modelRef cannot be combined with sourceRef; sourceRef
+                    already defines the source scope
+                  optionalOldSelf: true
+                  rule: '!has(self.sourceRef) || !has(self.selector.modelRef) || (oldSelf.hasValue()
+                    && has(oldSelf.value().sourceRef) && has(oldSelf.value().selector.modelRef))'
                 - message: version is required when versionPolicy is pinned
                   rule: has(self.version) || (has(self.versionPolicy) && self.versionPolicy
                     != 'pinned')
@@ -5742,7 +5870,10 @@ spec:
               image:
                 description: |-
                   Image is the container image URI for this AIM model.
-                  This image is inspected by the operator to select runtime profiles used by templates.
+                  This image is inspected by the operator to discover runtime profiles.
+                  When spec.profiles is also set, the image's complete discovery cache is
+                  the implicit derivation source and only selected/overridden outputs are
+                  materialised.
                   Discovery behavior is controlled by the discovery field and runtime config's AutoDiscovery setting.
                   Required unless modelId, an eligible aimId-only flow, or a profile
                   derivation flow is set.
@@ -6858,13 +6989,36 @@ spec:
                     type: string
                   sourceRef:
                     description: |-
-                      SourceRef points to an alternate discovery cache source.
-                      When omitted, derivation uses visible AIMProfile and AIMClusterProfile objects.
-                      For AIMProfileSet, the referenced ConfigMap is read from the same namespace.
-                      For AIMClusterProfileSet, it is read from the operator namespace.
+                      SourceRef selects a cache-backed source. ConfigMap reads a discovery
+                      catalog directly. AIMModel and AIMClusterModel resolve the referenced
+                      model's current discovery cache, including entries that were not
+                      materialized as profile resources because their original hardware shape
+                      is unsupported by the cluster.
+
+                      When omitted, derivation uses visible AIMProfile and AIMClusterProfile
+                      objects. selector.modelRef is a filter for that real-profile-backed mode
+                      and cannot be combined with sourceRef.
                     properties:
+                      kind:
+                        default: ConfigMap
+                        description: |-
+                          Kind selects the source resource. ConfigMap reads the named discovery
+                          catalog directly. AIMModel and AIMClusterModel resolve the model's
+                          status.discoveryCacheRef, allowing selection from its complete image
+                          catalog including profiles that were not materialized for the current
+                          cluster hardware.
+                        enum:
+                        - ConfigMap
+                        - AIMModel
+                        - AIMClusterModel
+                        type: string
                       name:
-                        description: Name is the discovery cache ConfigMap name.
+                        description: |-
+                          Name is the source resource name. AIMModel references resolve in the
+                          AIMProfileSet namespace; AIMClusterModel references are cluster-scoped.
+                          ConfigMap references resolve in the AIMProfileSet namespace, or in the
+                          operator namespace for AIMClusterProfileSet.
+                        minLength: 1
                         type: string
                     required:
                     - name
@@ -6892,6 +7046,11 @@ spec:
                     || has(self.selector.acceleratorType) || has(self.selector.acceleratorCount)
                     || has(self.selector.engineArgs) || has(self.selector.modelRef)
                     || has(self.selector.origin)
+                - message: selector.modelRef cannot be combined with sourceRef; sourceRef
+                    already defines the source scope
+                  optionalOldSelf: true
+                  rule: '!has(self.sourceRef) || !has(self.selector.modelRef) || (oldSelf.hasValue()
+                    && has(oldSelf.value().sourceRef) && has(oldSelf.value().selector.modelRef))'
                 - message: version is required when versionPolicy is pinned
                   rule: has(self.version) || (has(self.versionPolicy) && self.versionPolicy
                     != 'pinned')
@@ -6923,9 +7082,14 @@ spec:
                   applied to copies (`profiles.overrides`). When set, the AIMModel
                   reconciler synthesises a child AIMProfileSet from this block.
 
-                  Mutually exclusive with spec.image (exactly one of the two is required
-                  for v1alpha2 AIMModel). v1alpha1 rejects spec.profiles via per-version
-                  CEL.
+                  When spec.image is also set, the child set is bound to this model's
+                  discovery cache and can select catalog entries even when the source
+                  profile was not materialised for the cluster's current hardware.
+                  profiles.derivedFrom.sourceRef and selector.modelRef must then be omitted
+                  because the image already supplies the source scope.
+
+                  Mutually exclusive with spec.modelId. v1alpha1 rejects spec.profiles via
+                  per-version CEL.
                 properties:
                   derivedFrom:
                     description: DerivedFrom identifies the source profiles to copy
@@ -7091,12 +7255,33 @@ spec:
                         type: object
                       sourceRef:
                         description: |-
-                          SourceRef points to an alternate discovery cache source (a
-                          pre-populated ConfigMap of profile YAMLs) instead of using the
-                          visible AIMProfile / AIMClusterProfile objects.
+                          SourceRef selects an alternate catalog source instead of using visible
+                          AIMProfile / AIMClusterProfile objects. It may reference a ConfigMap of
+                          profile YAMLs or an image-backed AIMModel / AIMClusterModel whose current
+                          discovery cache supplies the catalog. Omit it when the parent AIMModel
+                          also sets spec.image: the controller injects that model's own discovery
+                          cache and the v1alpha2 API rejects an explicit sourceRef.
                         properties:
+                          kind:
+                            default: ConfigMap
+                            description: |-
+                              Kind selects the source resource. ConfigMap reads the named discovery
+                              catalog directly. AIMModel and AIMClusterModel resolve the model's
+                              status.discoveryCacheRef, allowing selection from its complete image
+                              catalog including profiles that were not materialized for the current
+                              cluster hardware.
+                            enum:
+                            - ConfigMap
+                            - AIMModel
+                            - AIMClusterModel
+                            type: string
                           name:
-                            description: Name is the discovery cache ConfigMap name.
+                            description: |-
+                              Name is the source resource name. AIMModel references resolve in the
+                              AIMProfileSet namespace; AIMClusterModel references are cluster-scoped.
+                              ConfigMap references resolve in the AIMProfileSet namespace, or in the
+                              operator namespace for AIMClusterProfileSet.
+                            minLength: 1
                             type: string
                         required:
                         - name
@@ -7605,6 +7790,13 @@ spec:
                 - message: latest/all versionPolicy must not set version
                   rule: '!has(self.versionPolicy) || (self.versionPolicy != ''latest''
                     && self.versionPolicy != ''all'') || !has(self.version)'
+                - message: derivedFrom.selector.modelRef cannot be combined with derivedFrom.sourceRef;
+                    sourceRef already defines the source scope
+                  optionalOldSelf: true
+                  rule: '!has(self.derivedFrom) || !has(self.derivedFrom.sourceRef)
+                    || !has(self.derivedFrom.selector.modelRef) || (oldSelf.hasValue()
+                    && has(oldSelf.value().derivedFrom) && has(oldSelf.value().derivedFrom.sourceRef)
+                    && has(oldSelf.value().derivedFrom.selector.modelRef))'
                 - message: derivedFrom.selector.aimId/modelId/profileId are not allowed
                     when selector.role=base; set overrides.aimId/modelId/profileId
                     instead (base profiles have no source identity to filter on)
@@ -8468,15 +8660,16 @@ spec:
             type: object
         type: object
         x-kubernetes-validations:
-        - message: exactly one of spec.image, spec.modelId, or spec.profiles must
-            be set on v1alpha2
+        - message: set spec.modelId alone, or set spec.image and/or spec.profiles
+            on v1alpha2
           optionalOldSelf: true
-          rule: '((has(self.spec.image) && size(self.spec.image) > 0) ? 1 : 0) + ((has(self.spec.modelId)
-            && size(self.spec.modelId) > 0) ? 1 : 0) + ((has(self.spec.profiles) ||
-            has(self.spec.derivedFrom)) ? 1 : 0) == 1 || (oldSelf.hasValue() && (((has(oldSelf.value().spec.image)
-            && size(oldSelf.value().spec.image) > 0) ? 1 : 0) + ((has(oldSelf.value().spec.modelId)
-            && size(oldSelf.value().spec.modelId) > 0) ? 1 : 0) + ((has(oldSelf.value().spec.profiles)
-            || has(oldSelf.value().spec.derivedFrom)) ? 1 : 0) != 1))'
+          rule: '((((has(self.spec.image) && size(self.spec.image) > 0) || has(self.spec.profiles)
+            || has(self.spec.derivedFrom)) ? 1 : 0) + ((has(self.spec.modelId) &&
+            size(self.spec.modelId) > 0) ? 1 : 0) == 1) || (oldSelf.hasValue() &&
+            (((((has(oldSelf.value().spec.image) && size(oldSelf.value().spec.image)
+            > 0) || has(oldSelf.value().spec.profiles) || has(oldSelf.value().spec.derivedFrom))
+            ? 1 : 0) + ((has(oldSelf.value().spec.modelId) && size(oldSelf.value().spec.modelId)
+            > 0) ? 1 : 0)) != 1))'
         - message: spec.source is only valid with spec.modelId
           rule: '!has(self.spec.source) || (has(self.spec.modelId) && size(self.spec.modelId)
             > 0)'
@@ -8513,12 +8706,25 @@ spec:
           rule: '!has(self.spec.modelSources) || size(self.spec.modelSources) == 0
             || (oldSelf.hasValue() && has(oldSelf.value().spec.modelSources) && size(oldSelf.value().spec.modelSources)
             > 0)'
-        - message: spec.profiles cannot be combined with spec.aimId, spec.source,
-            spec.discovery, spec.defaultServiceTemplate, spec.runtimeConfigName, spec.env,
-            or spec.imageMetadata
+        - message: spec.profiles cannot be combined with spec.aimId or spec.source
           rule: (!has(self.spec.profiles) && !has(self.spec.derivedFrom)) || (!has(self.spec.aimId)
-            && !has(self.spec.source) && !has(self.spec.discovery) && !has(self.spec.defaultServiceTemplate)
+            && !has(self.spec.source))
+        - message: spec.discovery, spec.defaultServiceTemplate, spec.runtimeConfigName,
+            spec.env, and spec.imageMetadata require spec.image when spec.profiles
+            is set
+          rule: (!has(self.spec.profiles) && !has(self.spec.derivedFrom)) || (has(self.spec.image)
+            && size(self.spec.image) > 0) || (!has(self.spec.discovery) && !has(self.spec.defaultServiceTemplate)
             && !has(self.spec.runtimeConfigName) && !has(self.spec.env) && !has(self.spec.imageMetadata))
+        - message: image-backed spec.profiles uses this model's discovery cache; do
+            not set profiles.derivedFrom.sourceRef or profiles.derivedFrom.selector.modelRef
+          rule: '!has(self.spec.profiles) || !has(self.spec.image) || size(self.spec.image)
+            == 0 || !has(self.spec.profiles.derivedFrom) || (!has(self.spec.profiles.derivedFrom.sourceRef)
+            && !has(self.spec.profiles.derivedFrom.selector.modelRef))'
+        - message: image-backed spec.profiles requires discovery.extractMetadata to
+            be true
+          rule: '!has(self.spec.profiles) || !has(self.spec.image) || size(self.spec.image)
+            == 0 || !has(self.spec.discovery) || !has(self.spec.discovery.extractMetadata)
+            || self.spec.discovery.extractMetadata'
     served: true
     storage: true
     subresources:

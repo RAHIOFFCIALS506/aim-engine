@@ -36,6 +36,7 @@ import (
 // +kubebuilder:printcolumn:name="Managed",type=integer,JSONPath=`.status.managedProfiles.total`
 // +kubebuilder:printcolumn:name="Ready",type=integer,JSONPath=`.status.managedProfiles.ready`
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
+// +kubebuilder:validation:XValidation:rule="!has(self.spec.sourceRef) || !has(self.spec.sourceRef.kind) || self.spec.sourceRef.kind != 'AIMModel'",message="AIMClusterProfileSet cannot reference a namespace-scoped AIMModel; use AIMClusterModel or ConfigMap"
 type AIMClusterProfileSet struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`
