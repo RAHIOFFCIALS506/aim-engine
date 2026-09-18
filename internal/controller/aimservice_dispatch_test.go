@@ -23,11 +23,21 @@
 package controller
 
 import (
+	"context"
+	"strings"
 	"testing"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/record"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	aimv1alpha1 "github.com/amd-enterprise-ai/aim-engine/api/v1alpha1"
+	aimv1alpha2 "github.com/amd-enterprise-ai/aim-engine/api/v1alpha2"
+	servicepolicy "github.com/amd-enterprise-ai/aim-engine/internal/aimservice"
 	"github.com/amd-enterprise-ai/aim-engine/internal/constants"
 )
 
@@ -82,12 +92,12 @@ func TestSelectPipeline(t *testing.T) {
 			want: profile,
 		},
 		{
-			name:        "annotation forces template pipeline on a profile-shaped spec",
+			name:        "grandfathered template annotation on profile-only spec falls back to profile",
 			annotations: map[string]string{constants.AnnotationReconcilerPipeline: template},
 			spec: aimv1alpha1.AIMServiceSpec{
 				Profile: &aimv1alpha1.AIMServiceProfileConfig{Name: "p"},
 			},
-			want: template,
+			want: profile,
 		},
 		{
 			name:        "unknown annotation value falls through to spec shape",
@@ -152,9 +162,329 @@ func TestSelectPipeline(t *testing.T) {
 				ObjectMeta: metav1.ObjectMeta{Annotations: tc.annotations},
 				Spec:       tc.spec,
 			}
-			if got := selectPipeline(svc); got != tc.want {
-				t.Fatalf("selectPipeline = %q, want %q", got, tc.want)
+			if got := servicepolicy.SelectPipeline(svc); string(got) != tc.want {
+				t.Fatalf("SelectPipeline = %q, want %q", got, tc.want)
 			}
 		})
 	}
+}
+
+type recordingServicePipeline struct {
+	runs int
+}
+
+func (p *recordingServicePipeline) Run(
+	_ context.Context,
+	_ *aimv1alpha2.AIMService,
+) (ctrl.Result, error) {
+	p.runs++
+	return ctrl.Result{}, nil
+}
+
+type recordingStatusWriter struct {
+	client.StatusWriter
+	updated client.Object
+}
+
+func (w *recordingStatusWriter) Update(
+	_ context.Context,
+	obj client.Object,
+	_ ...client.SubResourceUpdateOption,
+) error {
+	w.updated = obj.DeepCopyObject().(client.Object)
+	return nil
+}
+
+func TestCanonicalAIMServiceStatusWriterUsesV1Alpha2(t *testing.T) {
+	canonical := &aimv1alpha2.AIMService{
+		ObjectMeta: metav1.ObjectMeta{Name: "service", Namespace: "default"},
+	}
+	legacy := servicepolicy.LegacyView(canonical)
+	legacy.Status.Conditions = []metav1.Condition{{Type: "Ready", Reason: "Updated"}}
+
+	recorder := &recordingStatusWriter{}
+	writer := &canonicalAIMServiceStatusWriter{
+		StatusWriter: recorder,
+		service:      canonical,
+	}
+	if err := writer.Update(context.Background(), legacy); err != nil {
+		t.Fatalf("Update() error = %v", err)
+	}
+	if _, ok := recorder.updated.(*aimv1alpha2.AIMService); !ok {
+		t.Fatalf("status update object = %T, want *v1alpha2.AIMService", recorder.updated)
+	}
+	legacy.Status.Conditions[0].Reason = "MutatedAfterWrite"
+	if got := canonical.Status.Conditions[0].Reason; got != "Updated" {
+		t.Fatalf("canonical status shared legacy memory: reason = %q", got)
+	}
+}
+
+func TestAIMServiceReconcilerPersistsTransitionBeforeDispatch(t *testing.T) {
+	modelName := "model"
+	tests := []struct {
+		name               string
+		service            *aimv1alpha2.AIMService
+		wantPipeline       servicepolicy.Pipeline
+		inactiveConditions []string
+	}{
+		{
+			name: "template to profile",
+			service: &aimv1alpha2.AIMService{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:       "template-to-profile",
+					Namespace:  "default",
+					Finalizers: []string{finalizerCacheCleanup},
+				},
+				Spec: aimv1alpha1.AIMServiceSpec{
+					Profile: &aimv1alpha1.AIMServiceProfileConfig{Name: "profile"},
+				},
+				Status: aimv1alpha1.AIMServiceStatus{
+					ReconcilerPipeline: constants.ReconcilerPipelineTemplate,
+					Conditions: []metav1.Condition{
+						{Type: "ModelReady", Status: metav1.ConditionTrue},
+						{Type: "TemplateReady", Status: metav1.ConditionTrue},
+						{Type: "InferenceServiceReady", Status: metav1.ConditionTrue},
+					},
+					ResolvedModel:    &aimv1alpha1.AIMResolvedReference{Name: "model"},
+					ResolvedTemplate: &aimv1alpha1.AIMResolvedReference{Name: "template"},
+					Cache: &aimv1alpha1.AIMServiceCacheStatus{
+						TemplateCacheRef: &aimv1alpha1.AIMResolvedReference{Name: "template-cache"},
+					},
+				},
+			},
+			wantPipeline:       servicepolicy.PipelineProfile,
+			inactiveConditions: []string{"ModelReady", "TemplateReady"},
+		},
+		{
+			name: "profile to template",
+			service: &aimv1alpha2.AIMService{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:       "profile-to-template",
+					Namespace:  "default",
+					Finalizers: []string{finalizerCacheCleanup},
+					Annotations: map[string]string{
+						constants.AnnotationReconcilerPipeline: constants.ReconcilerPipelineTemplate,
+					},
+				},
+				Spec: aimv1alpha1.AIMServiceSpec{
+					Model: &aimv1alpha1.AIMServiceModel{Name: &modelName},
+				},
+				Status: aimv1alpha1.AIMServiceStatus{
+					ReconcilerPipeline: constants.ReconcilerPipelineProfile,
+					Conditions: []metav1.Condition{
+						{Type: "ProfileReady", Status: metav1.ConditionTrue},
+						{Type: "ProfileRuntimeReady", Status: metav1.ConditionTrue},
+						{Type: "HTTPRouteReady", Status: metav1.ConditionTrue},
+					},
+					ResolvedModel:   &aimv1alpha1.AIMResolvedReference{Name: "model-id"},
+					ResolvedProfile: &aimv1alpha1.AIMResolvedReference{Name: "profile"},
+					Cache: &aimv1alpha1.AIMServiceCacheStatus{
+						ProfileCacheRef: &aimv1alpha1.AIMResolvedReference{Name: "profile-cache"},
+					},
+				},
+			},
+			wantPipeline:       servicepolicy.PipelineTemplate,
+			inactiveConditions: []string{"ProfileReady", "ProfileRuntimeReady"},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			scheme := runtime.NewScheme()
+			if err := aimv1alpha2.AddToScheme(scheme); err != nil {
+				t.Fatalf("register v1alpha2: %v", err)
+			}
+			cl := fake.NewClientBuilder().
+				WithScheme(scheme).
+				WithStatusSubresource(&aimv1alpha2.AIMService{}).
+				WithObjects(test.service).
+				Build()
+			templatePipeline := &recordingServicePipeline{}
+			profilePipeline := &recordingServicePipeline{}
+			reconciler := &AIMServiceReconciler{
+				Client:           cl,
+				templatePipeline: templatePipeline,
+				profilePipeline:  profilePipeline,
+			}
+			request := ctrl.Request{NamespacedName: types.NamespacedName{
+				Name:      test.service.Name,
+				Namespace: test.service.Namespace,
+			}}
+
+			result, err := reconciler.Reconcile(context.Background(), request)
+			if err != nil {
+				t.Fatalf("cleanup reconcile: %v", err)
+			}
+			if result == (ctrl.Result{}) {
+				t.Fatal("transition cleanup did not request requeue")
+			}
+			if templatePipeline.runs != 0 || profilePipeline.runs != 0 {
+				t.Fatal("pipeline ran before transition cleanup was persisted")
+			}
+
+			var cleaned aimv1alpha2.AIMService
+			if err := cl.Get(context.Background(), request.NamespacedName, &cleaned); err != nil {
+				t.Fatalf("get cleaned service: %v", err)
+			}
+			if cleaned.Status.ReconcilerPipeline != string(test.wantPipeline) {
+				t.Fatalf(
+					"ReconcilerPipeline = %q, want %q",
+					cleaned.Status.ReconcilerPipeline,
+					test.wantPipeline,
+				)
+			}
+			if cleaned.Status.Status != constants.AIMStatusPending {
+				t.Fatalf("status = %q, want Pending during pipeline transition", cleaned.Status.Status)
+			}
+			for _, conditionType := range test.inactiveConditions {
+				if findServiceCondition(cleaned.Status.Conditions, conditionType) != nil {
+					t.Errorf("%s condition survived transition", conditionType)
+				}
+			}
+			if cleaned.Status.ResolvedModel != nil || cleaned.Status.Cache != nil {
+				t.Fatal("pipeline-specific model or cache lineage survived transition")
+			}
+
+			if _, err := reconciler.Reconcile(context.Background(), request); err != nil {
+				t.Fatalf("dispatch reconcile: %v", err)
+			}
+			switch test.wantPipeline {
+			case servicepolicy.PipelineTemplate:
+				if templatePipeline.runs != 1 || profilePipeline.runs != 0 {
+					t.Fatalf("pipeline runs = template:%d profile:%d", templatePipeline.runs, profilePipeline.runs)
+				}
+			case servicepolicy.PipelineProfile:
+				if templatePipeline.runs != 0 || profilePipeline.runs != 1 {
+					t.Fatalf("pipeline runs = template:%d profile:%d", templatePipeline.runs, profilePipeline.runs)
+				}
+			}
+		})
+	}
+}
+
+func TestAIMServiceReconcilerGrandfatheredMarkersRemainOperational(t *testing.T) {
+	modelName := "model"
+	tests := []struct {
+		name         string
+		marker       string
+		spec         aimv1alpha1.AIMServiceSpec
+		wantPipeline servicepolicy.Pipeline
+	}{
+		{
+			name:   "unknown marker follows profile shape",
+			marker: "historical",
+			spec: aimv1alpha1.AIMServiceSpec{
+				Profile: &aimv1alpha1.AIMServiceProfileConfig{Name: "profile"},
+			},
+			wantPipeline: servicepolicy.PipelineProfile,
+		},
+		{
+			name:   "empty marker follows model shape",
+			marker: "",
+			spec: aimv1alpha1.AIMServiceSpec{
+				Model: &aimv1alpha1.AIMServiceModel{Name: &modelName},
+			},
+			wantPipeline: servicepolicy.PipelineTemplate,
+		},
+		{
+			name:   "template marker without model follows profile shape",
+			marker: constants.ReconcilerPipelineTemplate,
+			spec: aimv1alpha1.AIMServiceSpec{
+				Profile: &aimv1alpha1.AIMServiceProfileConfig{Name: "profile"},
+			},
+			wantPipeline: servicepolicy.PipelineProfile,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			scheme := runtime.NewScheme()
+			if err := aimv1alpha2.AddToScheme(scheme); err != nil {
+				t.Fatalf("register v1alpha2: %v", err)
+			}
+			service := &aimv1alpha2.AIMService{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:       "grandfathered",
+					Namespace:  "default",
+					Finalizers: []string{finalizerCacheCleanup},
+					Annotations: map[string]string{
+						constants.AnnotationReconcilerPipeline: test.marker,
+					},
+				},
+				Spec: test.spec,
+				Status: aimv1alpha1.AIMServiceStatus{
+					ReconcilerPipeline: string(test.wantPipeline),
+				},
+			}
+			cl := fake.NewClientBuilder().
+				WithScheme(scheme).
+				WithStatusSubresource(&aimv1alpha2.AIMService{}).
+				WithObjects(service).
+				Build()
+			templatePipeline := &recordingServicePipeline{}
+			profilePipeline := &recordingServicePipeline{}
+			recorder := record.NewFakeRecorder(1)
+			reconciler := &AIMServiceReconciler{
+				Client:           cl,
+				Recorder:         recorder,
+				templatePipeline: templatePipeline,
+				profilePipeline:  profilePipeline,
+			}
+
+			if _, err := reconciler.Reconcile(context.Background(), ctrl.Request{
+				NamespacedName: types.NamespacedName{Name: service.Name, Namespace: service.Namespace},
+			}); err != nil {
+				t.Fatalf("Reconcile() error = %v", err)
+			}
+			var updated aimv1alpha2.AIMService
+			if err := cl.Get(
+				context.Background(),
+				types.NamespacedName{Name: service.Name, Namespace: service.Namespace},
+				&updated,
+			); err != nil {
+				t.Fatalf("get reconciled service: %v", err)
+			}
+			if updated.Status.Status == constants.AIMStatusFailed {
+				t.Fatal("grandfathered marker failed solely because of pipeline validation")
+			}
+			if updated.Status.ReconcilerPipeline != string(test.wantPipeline) {
+				t.Fatalf(
+					"ReconcilerPipeline = %q, want %q",
+					updated.Status.ReconcilerPipeline,
+					test.wantPipeline,
+				)
+			}
+			select {
+			case event := <-recorder.Events:
+				if !strings.Contains(event, invalidPipelineMarkerReason) ||
+					!strings.Contains(event, "using spec-shape pipeline selection") {
+					t.Fatalf("malformed marker event = %q", event)
+				}
+			default:
+				t.Fatal("malformed pipeline marker did not emit a warning event")
+			}
+			switch test.wantPipeline {
+			case servicepolicy.PipelineTemplate:
+				if templatePipeline.runs != 1 || profilePipeline.runs != 0 {
+					t.Fatalf("pipeline runs = template:%d profile:%d", templatePipeline.runs, profilePipeline.runs)
+				}
+			case servicepolicy.PipelineProfile:
+				if templatePipeline.runs != 0 || profilePipeline.runs != 1 {
+					t.Fatalf("pipeline runs = template:%d profile:%d", templatePipeline.runs, profilePipeline.runs)
+				}
+			}
+		})
+	}
+}
+
+func findServiceCondition(
+	conditions []metav1.Condition,
+	conditionType string,
+) *metav1.Condition {
+	for i := range conditions {
+		if conditions[i].Type == conditionType {
+			return &conditions[i]
+		}
+	}
+	return nil
 }

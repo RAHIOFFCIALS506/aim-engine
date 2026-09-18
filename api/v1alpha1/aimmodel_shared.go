@@ -685,6 +685,10 @@ func (s *AIMModelStatus) SetConditions(conditions []metav1.Condition) {
 	s.Conditions = conditions
 }
 
+func (s *AIMModelStatus) SetObservedGeneration(generation int64) {
+	s.ObservedGeneration = generation
+}
+
 func (s *AIMModelStatus) SetStatus(status string) {
 	s.Status = constants.AIMStatus(status)
 }

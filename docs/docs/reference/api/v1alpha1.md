@@ -2251,6 +2251,7 @@ _Appears in:_
 | Field | Description | Default | Validation |
 | --- | --- | --- | --- |
 | `observedGeneration` _integer_ | ObservedGeneration is the most recent generation observed by the controller. |  |  |
+| `reconcilerPipeline` _string_ | ReconcilerPipeline records which pipeline owns pipeline-specific status.<br />The controller persists this before dispatch so transitions can retire old<br />resolved references and conditions before the new pipeline fetches state. |  | Enum: [template profile] <br />Optional: \{\} <br /> |
 | `conditions` _[Condition](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.32/#condition-v1-meta) array_ | Conditions represent the latest observations of template state. |  |  |
 | `resolvedRuntimeConfig` _[AIMResolvedReference](#aimresolvedreference)_ | ResolvedRuntimeConfig captures metadata about the runtime config that was resolved. |  | Optional: \{\} <br /> |
 | `resolvedModel` _[AIMResolvedReference](#aimresolvedreference)_ | ResolvedModel captures metadata about the image that was resolved. |  | Optional: \{\} <br /> |

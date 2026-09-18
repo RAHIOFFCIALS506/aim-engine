@@ -61,6 +61,27 @@ Overall readiness — the aggregate of all other conditions and component health
 | `False` | `ComponentsNotReady` | One or more components are not ready |
 | `False` | `Progressing` | Waiting for components to become ready |
 
+## Migration condition
+
+### MigrationRequired
+
+`MigrationRequired=True` with reason `TemplateAPIDeprecated` identifies a live
+resource that still uses the deprecated template API or produces template
+outputs. It appears on template-pipeline `AIMService` objects, legacy-shaped
+`AIMModel` / `AIMClusterModel` objects (including deprecated `profileCopy` and
+flat `derivedFrom` shapes, plus image models that still emit templates),
+`AIMServiceTemplate`, `AIMClusterServiceTemplate`, and `AIMTemplateCache`.
+Follow the
+[bounded template migration runbook](../admin/template-migration.md) before
+removing the v1alpha1 template APIs.
+
+This condition is informational and does not participate in the `Ready`
+rollup. It is removed when an overlapping service uses the profile pipeline or
+a model uses only native profile inputs and no longer emits templates.
+`AIMArtifact`, `AIMRuntimeConfig`, `AIMClusterRuntimeConfig`, and
+`AIMClusterModelSource` do not report it because native profile pipelines still
+use those APIs or their outputs.
+
 ## AIMService conditions (v1alpha2)
 
 `AIMService` reports per-component conditions in addition to the framework conditions. The condition catalog covers profile resolution, cache, KServe runtime, routing, and autoscaling.
@@ -344,7 +365,10 @@ When an AIMModel still emits `AIMServiceTemplate` resources, its `Ready` rollup 
 
 ## Condition polarity
 
-All AIM conditions follow positive polarity — `status: True` means healthy. When building dashboards or alerting:
+Readiness and health conditions follow positive polarity — `status: True` means
+healthy. `MigrationRequired` is the explicit non-health exception: `True`
+means administrator action is still required, and it never gates readiness.
+When building dashboards or alerting:
 
 - **Green** — condition `status: True`
 - **Yellow** — condition `status: False` with reason containing `Progressing`, `Creating`, `Awaiting`, `Started`

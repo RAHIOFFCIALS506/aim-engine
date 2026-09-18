@@ -8,6 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 <!-- Populate this section during release-prep, then rename to the release version -->
+### Added
+- **v1alpha1 compatibility bridge and bounded migration tooling.** Legacy template-based services continue reconciling during v1alpha2 upgrades and report `MigrationRequired`; the new `aim-template-migration` Plan/Apply utility provides a safety-fenced cutover to profile-based serving.
 
 ## [0.2.6] - 2026-09-15
 

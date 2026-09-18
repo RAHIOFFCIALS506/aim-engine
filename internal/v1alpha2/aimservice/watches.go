@@ -42,6 +42,7 @@ import (
 
 	aimv1alpha1 "github.com/amd-enterprise-ai/aim-engine/api/v1alpha1"
 	aimv1alpha2 "github.com/amd-enterprise-ai/aim-engine/api/v1alpha2"
+	servicepolicy "github.com/amd-enterprise-ai/aim-engine/internal/aimservice"
 	"github.com/amd-enterprise-ai/aim-engine/internal/constants"
 	"github.com/amd-enterprise-ai/aim-engine/internal/v1alpha2/aimprofile"
 	"github.com/amd-enterprise-ai/aim-engine/internal/v1alpha2/profileyaml"
@@ -169,86 +170,98 @@ func registerServiceIndexes(ctx context.Context, mgr manager.Manager) error {
 		key    string
 		mapper func(client.Object) []string
 	}{
-		{aimv1alpha1.AIMServiceProfileIndexKey, func(obj client.Object) []string {
-			svc, ok := obj.(*aimv1alpha1.AIMService)
-			if !ok || svc.Spec.Profile == nil || svc.Spec.Profile.Name == "" {
-				return nil
-			}
-			return []string{svc.Spec.Profile.Name}
-		}},
-		{ServiceModelNameIndex, func(obj client.Object) []string {
-			svc, ok := obj.(*aimv1alpha1.AIMService)
-			if !ok || svc.Spec.Model == nil || svc.Spec.Model.Name == nil || *svc.Spec.Model.Name == "" {
-				return nil
-			}
-			return []string{*svc.Spec.Model.Name}
-		}},
-		{ServiceSelectorModelRefIndex, func(obj client.Object) []string {
-			svc, ok := obj.(*aimv1alpha1.AIMService)
-			if !ok || svc.Spec.Profile == nil || svc.Spec.Profile.Selector == nil ||
-				svc.Spec.Profile.Selector.ModelRef == nil || svc.Spec.Profile.Selector.ModelRef.Name == "" {
-				return nil
-			}
-			return []string{svc.Spec.Profile.Selector.ModelRef.Name}
-		}},
-		{ServiceSelectorAimIdIndex, func(obj client.Object) []string {
-			svc, ok := obj.(*aimv1alpha1.AIMService)
-			if !ok || svc.Spec.Profile == nil || svc.Spec.Profile.Selector == nil || svc.Spec.Profile.Selector.AimId == "" {
-				return nil
-			}
-			return []string{svc.Spec.Profile.Selector.AimId}
-		}},
-		{ServiceModelImageIndex, func(obj client.Object) []string {
-			svc, ok := obj.(*aimv1alpha1.AIMService)
-			if !ok || svc.Spec.Model == nil || svc.Spec.Model.Image == nil || *svc.Spec.Model.Image == "" {
-				return nil
-			}
-			return []string{*svc.Spec.Model.Image}
-		}},
-		{ServiceResourceNodeMatchIndex, func(obj client.Object) []string {
-			svc, ok := obj.(*aimv1alpha1.AIMService)
-			if !ok || svc.Spec.Resources == nil || !usesProfilePipeline(svc) {
-				return nil
-			}
-			return []string{serviceResourceNodeMatchIndexValue}
-		}},
-		// Index services by the names of the adapter artifacts they reference so
-		// an adapter artifact event fans out to its consuming services.
-		{aimv1alpha1.AIMServiceAdapterArtifactIndexKey, func(obj client.Object) []string {
-			svc, ok := obj.(*aimv1alpha1.AIMService)
-			if !ok || len(svc.Spec.Adapters) == 0 {
-				return nil
-			}
-			names := make([]string, 0, len(svc.Spec.Adapters))
-			for _, a := range svc.Spec.Adapters {
-				if a.Name != "" {
-					names = append(names, a.Name)
-				}
-			}
-			return names
-		}},
+		{aimv1alpha1.AIMServiceProfileIndexKey, indexServiceProfileName},
+		{ServiceModelNameIndex, indexServiceModelName},
+		{ServiceSelectorModelRefIndex, indexServiceSelectorModelRef},
+		{ServiceSelectorAimIdIndex, indexServiceSelectorAimID},
+		{ServiceModelImageIndex, indexServiceModelImage},
+		{ServiceResourceNodeMatchIndex, indexServiceResourceNodeMatch},
+		{aimv1alpha1.AIMServiceAdapterArtifactIndexKey, indexServiceAdapterArtifacts},
 	}
 
 	for _, idx := range indexers {
-		if err := mgr.GetFieldIndexer().IndexField(ctx, &aimv1alpha1.AIMService{}, idx.key, idx.mapper); err != nil {
+		if err := mgr.GetFieldIndexer().IndexField(ctx, &aimv1alpha2.AIMService{}, idx.key, idx.mapper); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-// usesProfilePipeline mirrors the top-level AIMService dispatch rule without
-// importing internal/controller (which would introduce a package cycle).
-func usesProfilePipeline(service *aimv1alpha1.AIMService) bool {
-	if override, ok := service.GetAnnotations()[constants.AnnotationReconcilerPipeline]; ok {
-		switch override {
-		case constants.ReconcilerPipelineProfile:
-			return true
-		case constants.ReconcilerPipelineTemplate:
-			return false
+func profilePipelineService(obj client.Object) (*aimv1alpha2.AIMService, bool) {
+	svc, ok := obj.(*aimv1alpha2.AIMService)
+	return svc, ok && usesProfilePipeline(svc)
+}
+
+func indexServiceProfileName(obj client.Object) []string {
+	svc, ok := profilePipelineService(obj)
+	if !ok || svc.Spec.Profile == nil || svc.Spec.Profile.Name == "" {
+		return nil
+	}
+	return []string{svc.Spec.Profile.Name}
+}
+
+func indexServiceModelName(obj client.Object) []string {
+	svc, ok := profilePipelineService(obj)
+	if !ok || svc.Spec.Model == nil || svc.Spec.Model.Name == nil || *svc.Spec.Model.Name == "" {
+		return nil
+	}
+	return []string{*svc.Spec.Model.Name}
+}
+
+func indexServiceSelectorModelRef(obj client.Object) []string {
+	svc, ok := profilePipelineService(obj)
+	if !ok || svc.Spec.Profile == nil || svc.Spec.Profile.Selector == nil ||
+		svc.Spec.Profile.Selector.ModelRef == nil || svc.Spec.Profile.Selector.ModelRef.Name == "" {
+		return nil
+	}
+	return []string{svc.Spec.Profile.Selector.ModelRef.Name}
+}
+
+func indexServiceSelectorAimID(obj client.Object) []string {
+	svc, ok := profilePipelineService(obj)
+	if !ok || svc.Spec.Profile == nil || svc.Spec.Profile.Selector == nil ||
+		svc.Spec.Profile.Selector.AimId == "" {
+		return nil
+	}
+	return []string{svc.Spec.Profile.Selector.AimId}
+}
+
+func indexServiceModelImage(obj client.Object) []string {
+	svc, ok := profilePipelineService(obj)
+	if !ok || svc.Spec.Model == nil || svc.Spec.Model.Image == nil || *svc.Spec.Model.Image == "" {
+		return nil
+	}
+	return []string{*svc.Spec.Model.Image}
+}
+
+func indexServiceResourceNodeMatch(obj client.Object) []string {
+	svc, ok := profilePipelineService(obj)
+	if !ok || svc.Spec.Resources == nil {
+		return nil
+	}
+	return []string{serviceResourceNodeMatchIndexValue}
+}
+
+// indexServiceAdapterArtifacts indexes adapter dependencies shared by both
+// reconciliation pipelines.
+func indexServiceAdapterArtifacts(obj client.Object) []string {
+	svc, ok := obj.(*aimv1alpha2.AIMService)
+	if !ok || len(svc.Spec.Adapters) == 0 {
+		return nil
+	}
+	names := make([]string, 0, len(svc.Spec.Adapters))
+	for _, adapter := range svc.Spec.Adapters {
+		if adapter.Name != "" {
+			names = append(names, adapter.Name)
 		}
 	}
-	return service.Spec.Profile != nil
+	return names
+}
+
+// usesProfilePipeline applies the same authoritative selection contract as
+// controller dispatch.
+func usesProfilePipeline(service *aimv1alpha2.AIMService) bool {
+	return servicepolicy.UsesPipeline(servicepolicy.LegacyView(service), servicepolicy.PipelineProfile)
 }
 
 // serviceResourceNodeChangePredicate fires only when data consumed by
@@ -477,9 +490,14 @@ func findServicesForProfile(c client.Client) handler.MapFunc {
 		// the event to that single service short-circuits the fan-out
 		// since no other service may select an overlay anyway.
 		if serviceName := profile.Annotations[AnnotationOverlayService]; serviceName != "" {
-			return []reconcile.Request{{
-				NamespacedName: types.NamespacedName{Name: serviceName, Namespace: profile.Namespace},
-			}}
+			requests := map[types.NamespacedName]struct{}{}
+			addProfileServiceRequest(
+				ctx,
+				c,
+				requests,
+				types.NamespacedName{Name: serviceName, Namespace: profile.Namespace},
+			)
+			return requestsFromSet(requests)
 		}
 		requests := map[types.NamespacedName]struct{}{}
 		collectServicesByField(ctx, c, requests, aimv1alpha1.AIMServiceProfileIndexKey, profile.Name, profile.Namespace)
@@ -607,7 +625,7 @@ func findServicesForAdapterArtifact(c client.Client) handler.MapFunc {
 
 		switch artifact.Spec.Type {
 		case aimv1alpha1.ArtifactTypeAdapter:
-			collectServicesByField(ctx, c, requests, aimv1alpha1.AIMServiceAdapterArtifactIndexKey, artifact.Name, artifact.Namespace)
+			collectAllServicesByField(ctx, c, requests, aimv1alpha1.AIMServiceAdapterArtifactIndexKey, artifact.Name, artifact.Namespace)
 		default:
 			// Exact-binding adapters whose parent is this concrete artifact.
 			var adapters aimv1alpha1.AIMArtifactList
@@ -620,7 +638,7 @@ func findServicesForAdapterArtifact(c client.Client) handler.MapFunc {
 				return nil
 			}
 			for i := range adapters.Items {
-				collectServicesByField(ctx, c, requests, aimv1alpha1.AIMServiceAdapterArtifactIndexKey, adapters.Items[i].Name, artifact.Namespace)
+				collectAllServicesByField(ctx, c, requests, aimv1alpha1.AIMServiceAdapterArtifactIndexKey, adapters.Items[i].Name, artifact.Namespace)
 			}
 
 			// Logical adapters compatible with this canonical model ID. A model
@@ -636,7 +654,7 @@ func findServicesForAdapterArtifact(c client.Client) handler.MapFunc {
 					return requestsFromSet(requests)
 				}
 				for i := range adapters.Items {
-					collectServicesByField(ctx, c, requests, aimv1alpha1.AIMServiceAdapterArtifactIndexKey, adapters.Items[i].Name, artifact.Namespace)
+					collectAllServicesByField(ctx, c, requests, aimv1alpha1.AIMServiceAdapterArtifactIndexKey, adapters.Items[i].Name, artifact.Namespace)
 				}
 			}
 		}
@@ -722,7 +740,30 @@ func addModelDrivenRequests(
 		collectServicesByField(ctx, c, requests, ServiceSelectorAimIdIndex, aimID, namespace)
 	}
 	if serviceName := annotations[AnnotationOverlayService]; serviceName != "" {
-		requests[types.NamespacedName{Name: serviceName, Namespace: namespace}] = struct{}{}
+		addProfileServiceRequest(
+			ctx,
+			c,
+			requests,
+			types.NamespacedName{Name: serviceName, Namespace: namespace},
+		)
+	}
+}
+
+func addProfileServiceRequest(
+	ctx context.Context,
+	c client.Client,
+	requests map[types.NamespacedName]struct{},
+	key types.NamespacedName,
+) {
+	var service aimv1alpha2.AIMService
+	if err := c.Get(ctx, key, &service); err != nil {
+		if !isNotFoundLike(err) {
+			log.FromContext(ctx).Error(err, "failed to fetch AIMService for profile watch", "service", key)
+		}
+		return
+	}
+	if usesProfilePipeline(&service) {
+		requests[key] = struct{}{}
 	}
 }
 
@@ -740,6 +781,27 @@ func collectServicesByField(
 	requests map[types.NamespacedName]struct{},
 	indexKey, value, namespace string,
 ) {
+	collectServicesByFieldForPipeline(ctx, c, requests, indexKey, value, namespace, true)
+}
+
+// collectAllServicesByField is reserved for watches shared by both pipelines,
+// such as adapter artifacts.
+func collectAllServicesByField(
+	ctx context.Context,
+	c client.Client,
+	requests map[types.NamespacedName]struct{},
+	indexKey, value, namespace string,
+) {
+	collectServicesByFieldForPipeline(ctx, c, requests, indexKey, value, namespace, false)
+}
+
+func collectServicesByFieldForPipeline(
+	ctx context.Context,
+	c client.Client,
+	requests map[types.NamespacedName]struct{},
+	indexKey, value, namespace string,
+	profileOnly bool,
+) {
 	if value == "" {
 		return
 	}
@@ -747,14 +809,18 @@ func collectServicesByField(
 	if namespace != "" {
 		opts = append(opts, client.InNamespace(namespace))
 	}
-	var services aimv1alpha1.AIMServiceList
+	var services aimv1alpha2.AIMServiceList
 	if err := c.List(ctx, &services, opts...); err != nil {
 		log.FromContext(ctx).Error(err, "failed to list AIMServices",
 			"indexKey", indexKey, "value", value, "namespace", namespace)
 		return
 	}
-	for _, svc := range services.Items {
-		requests[types.NamespacedName{Name: svc.Name, Namespace: svc.Namespace}] = struct{}{}
+	for i := range services.Items {
+		service := &services.Items[i]
+		if profileOnly && !usesProfilePipeline(service) {
+			continue
+		}
+		requests[types.NamespacedName{Name: service.Name, Namespace: service.Namespace}] = struct{}{}
 	}
 }
 

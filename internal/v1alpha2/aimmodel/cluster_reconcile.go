@@ -87,6 +87,8 @@ type ClusterModelObservation struct {
 	ProfileSetRef                   *aimv1alpha1.ProfileSetReference
 	ManagedProfiles                 aimv1alpha1.ManagedProfileCounts
 	ExistingDesiredCount            int32
+	ProfileSetCurrent               bool
+	ProfileSetStatus                constants.AIMStatus
 	DesiredProfiles                 []desiredProfile
 	ProfileGeneration               *aimv1alpha1.AIMModelProfileGenerationStatus
 	ProfileGenerationFailureMessage string
@@ -201,6 +203,13 @@ func (r *ClusterModelReconciler) ComposeState(
 	obs.Kind = classifyModelKind(&fetch.model.Spec)
 	derivation := derivationSpec(&fetch.model.Spec)
 	desiredProfilesKnown := derivation != nil
+	obs.BuildErr = profileInventoryReadError(
+		fetch.existingClusterProfiles.Error,
+		fetch.childProfileSet.Error,
+		derivation != nil,
+		"failed to list cluster profiles managed by this AIMClusterModel",
+		"failed to read the child AIMClusterProfileSet",
+	)
 	if derivation != nil {
 		// For role=base derivations the target aimId lives on
 		// overrides.aimId (CEL forbids selector.aimId then); for
@@ -262,6 +271,7 @@ func (r *ClusterModelReconciler) ComposeState(
 	if fetch.model.Spec.ModelID != "" {
 		obs.ResolvedAimID = effectiveAimID(&fetch.model.Spec)
 		switch {
+		case obs.BuildErr != nil:
 		case fetch.runtimeConfig.Error != nil:
 			obs.BuildErr = fetch.runtimeConfig.Error
 		case fetch.nodes.Error != nil:
@@ -289,18 +299,32 @@ func (r *ClusterModelReconciler) ComposeState(
 			obs.ProfileSetRef = &aimv1alpha1.ProfileSetReference{Name: childName}
 			obs.DesiredProfileSet = buildDesiredClusterProfileSet(fetch.model, obs.DiscoveryCacheRef, childName)
 		}
-		if fetch.childProfileSet.OK() {
-			obs.ManagedProfiles = fetch.childProfileSet.Value.Status.ManagedProfiles
-			obs.ExistingDesiredCount = 1
-		}
+		obs.ManagedProfiles,
+			obs.ExistingDesiredCount,
+			obs.ProfileSetCurrent,
+			obs.ProfileSetStatus = observedClusterProfileSet(fetch.childProfileSet)
 	} else if fetch.existingClusterProfiles.OK() {
 		obs.ManagedProfiles, obs.ExistingDesiredCount = summarizeManagedProfiles(obs.DesiredProfiles, fetch.existingClusterProfiles.Value)
 	}
-	obs.pruneSafe = desiredProfilesKnown && obs.BuildErr == nil && fetch.existingClusterProfiles.Error == nil
+	obs.pruneSafe = profilePruneSafe(
+		desiredProfilesKnown,
+		obs.BuildErr,
+		fetch.existingClusterProfiles.Error,
+		derivation != nil,
+		obs.ProfileSetCurrent,
+		obs.ProfileSetStatus,
+		obs.ManagedProfiles,
+	)
 	obs.componentHealth = buildClusterModelComponentHealth(obs)
 	if obs.legacyObservation != nil {
 		obs.componentHealth = append(obs.componentHealth, obs.legacyObservation.GetComponentHealth()...)
 	}
+	applyModelServingPathPolicy(
+		&fetch.model.Spec,
+		obs.legacyObservation != nil,
+		componentClusterServiceTemplates,
+		obs.componentHealth,
+	)
 	return obs
 }
 
@@ -383,6 +407,15 @@ func (r *ClusterModelReconciler) DecorateStatus(
 	if obs.DiscoveryState != nil {
 		status.Discovery = obs.DiscoveryState
 	}
+	controllerutils.SetTemplateMigrationRequired(cm, requiresTemplateMigration(&obs.model.Spec))
+	retireRemovedModelPathState(
+		status,
+		cm,
+		&obs.model.Spec,
+		obs.legacyObservation != nil,
+		componentClusterServiceTemplates,
+		obs.componentHealth,
+	)
 	EnsureBaseImageBridge(&obs.model.Spec, status)
 }
 
@@ -396,6 +429,8 @@ func buildClusterModelComponentHealth(obs ClusterModelObservation) []controlleru
 		ProfileSetRef:                   obs.ProfileSetRef,
 		ManagedProfiles:                 obs.ManagedProfiles,
 		ExistingDesiredCount:            obs.ExistingDesiredCount,
+		ProfileSetCurrent:               obs.ProfileSetCurrent,
+		ProfileSetStatus:                obs.ProfileSetStatus,
 		ProfileGenerationFailureMessage: obs.ProfileGenerationFailureMessage,
 		BuildErr:                        obs.BuildErr,
 		componentHealth:                 obs.componentHealth,

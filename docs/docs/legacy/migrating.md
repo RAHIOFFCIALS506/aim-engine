@@ -3,7 +3,14 @@
 This guide maps v1alpha1 concepts to their v1alpha2 equivalents and provides conversion recipes for the common deployment patterns.
 
 :::{note}
-Read the [Legacy Overview](index.md) first for context on coexistence rules and the deprecation timeline.
+Read the [Legacy Overview](index.md) first for coexistence rules and the
+migration/removal boundary.
+:::
+:::{warning}
+This page maps fields and target shapes; it is not a migration execution or
+cleanup runbook. Install and verify the bridge first. The bounded
+administrator-run Plan/Apply behavior and manual outcomes are governed by
+[ADR-0002](https://github.com/amd-enterprise-ai/aim-engine/blob/main/ADR-0002-bounded-plan-apply-template-migration.md).
 :::
 ## Resource mapping
 
@@ -293,13 +300,11 @@ Cluster-scoped profiles cannot enable caching directly (cluster-scoped caches no
 
 ## Migration order
 
-The recommended sequence:
-
-1. **Cluster admins first** — onboard cluster-scoped models via `AIMClusterModel` with `spec.image`. Verify deployable profiles materialise.
-2. **Namespace admins** — migrate namespace-scoped `AIMServiceTemplate` to `AIMProfile` (or rebuild from a namespace `AIMModel`).
-3. **Services last** — switch `AIMService.spec.template` to `spec.profile` (or `spec.model.name`).
-4. **Verify** with `kubectl get aimservice <name> -o jsonpath='{.status.resolvedProfile}'`.
-5. **Clean up** — delete v1alpha1 templates after confirming no service references remain.
+Install the bridge CRDs before the matching operator and verify predecessor
+serving before planning any changes. Use ADR-0002 for operation ordering,
+dry-run, partial-failure recovery, and manual outcomes. These field mappings do
+not authorize template/cache deletion, storage rewriting, or automatic
+handling of custom and ambiguous resources.
 
 ## Validation traps
 

@@ -25,6 +25,7 @@ package aimservice
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -111,9 +112,9 @@ type ServiceFetchResult struct {
 
 	// legacyProfileConfigMap is the legacy inline-predictor service-owned profile
 	// ConfigMap (<service>-profile-<hash>), fetched so PlanResources can
-	// garbage-collect it when a service that predates the ServingRuntime-reference
-	// rewrite is reconciled by the new operator. Absent (IsNotFound) for
-	// services created after the rewrite, in which case cleanup is a no-op.
+	// garbage-collect it after the observed InferenceService has safely
+	// transitioned away from it. Absent (IsNotFound) for services created after
+	// the ServingRuntime-reference rewrite, in which case cleanup is a no-op.
 	legacyProfileConfigMap controllerutils.FetchResult[*corev1.ConfigMap]
 
 	// profileRuntime and profileRuntimeConfigMap must both exist before a new
@@ -561,39 +562,10 @@ func (obs ServiceObservation) getProfileHealth() controllerutils.ComponentHealth
 }
 
 func (obs ServiceObservation) getInferenceServiceHealth() controllerutils.ComponentHealth {
-	health := controllerutils.ComponentHealth{
-		Component:      "InferenceService",
-		DependencyType: controllerutils.DependencyTypeDownstream,
-	}
-
-	if !obs.inferenceService.OK() {
-		if obs.inferenceService.IsNotFound() {
-			health.State = constants.AIMStatusProgressing
-			health.Reason = aimv1alpha1.AIMServiceReasonCreatingRuntime
-			health.Message = "InferenceService not found"
-			return health
-		}
-		health.State = constants.AIMStatusFailed
-		health.Reason = reasonFetchError
-		health.Message = obs.inferenceService.Error.Error()
-		health.Errors = []error{obs.inferenceService.Error}
-		return health
-	}
-
-	isvc := obs.inferenceService.Value
-	for _, cond := range isvc.Status.Conditions {
-		if cond.Type == "Ready" && cond.Status == "True" {
-			health.State = constants.AIMStatusReady
-			health.Reason = aimv1alpha1.AIMServiceReasonRuntimeReady
-			health.Message = "InferenceService is ready"
-			return health
-		}
-	}
-
-	health.State = constants.AIMStatusProgressing
-	health.Reason = aimv1alpha1.AIMServiceReasonCreatingRuntime
-	health.Message = "InferenceService is not ready"
-	return health
+	return v1alpha1service.InferenceServiceComponentHealth(
+		obs.inferenceService,
+		obs.inferenceServicePods,
+	)
 }
 
 // FetchRemoteState fetches the profile, profile cache, AIMRuntimeConfig, and
@@ -856,6 +828,12 @@ func (r *ProfileServiceReconciler) ComposeState(
 			fetch.mergedRuntimeConfig.Value,
 			fetch.mergedRuntimeConfig.Error,
 		)
+	}
+
+	if migrationPreservationPinActive(fetch.service) {
+		if err := validateActiveMigrationPreservation(fetch.service, fetch.inferenceService); err != nil {
+			obs.configErr = err
+		}
 	}
 
 	return obs
@@ -1144,12 +1122,9 @@ func (r *ProfileServiceReconciler) PlanResources(
 		return planResult
 	}
 
-	// Migration cleanup (independent of profile/cache readiness): a service that
-	// predates the ServingRuntime-reference rewrite left behind an orphaned
-	// service-owned profile ConfigMap the new reconcile no longer plans. Delete
-	// it once, strictly guarded, so it does not linger for the life of the
-	// service. Runs on every reconcile that gets past config validation so the
-	// orphan is reclaimed on the first post-upgrade pass.
+	// Migration cleanup is independent of profile/cache readiness, but waits
+	// until the persisted InferenceService is current, Ready, and no longer
+	// references the legacy service-owned profile ConfigMap.
 	planLegacyProfileConfigMapCleanup(&planResult, obs, logger)
 
 	// v1alpha2 quick-start: a service authored with spec.model.image and
@@ -1280,7 +1255,15 @@ func (r *ProfileServiceReconciler) PlanResources(
 	// 2. Plan the InferenceService. When the service needs the adapter disk, mount
 	// the service's adapter subtree read-only at /adapters — present even at zero
 	// adapters in dynamic mode, so add/remove never restarts the pod.
-	if !deferInferenceService {
+	preserveMigratedInferenceService := shouldPreserveMigratedInferenceService(service, obs)
+	if preserveMigratedInferenceService {
+		logger.V(1).Info(
+			"Preserving legacy InferenceService for generation- and UID-pinned no-rollout migration",
+			"generation", service.Generation,
+			"inferenceServiceUID", service.Annotations[constants.AnnotationMigrationPreserveInferenceServiceUID],
+		)
+	}
+	if !deferInferenceService && !preserveMigratedInferenceService {
 		if isvc := buildInferenceServiceFromProfile(service, obs); isvc != nil {
 			switch {
 			case aimadapter.PreserveExistingMount(service, obs.adapterState) && isvcExists:
@@ -1321,16 +1304,74 @@ func (r *ProfileServiceReconciler) PlanResources(
 	return planResult
 }
 
-// planLegacyProfileConfigMapCleanup queues the orphaned legacy inline-predictor
-// service-owned profile ConfigMap (<service>-profile-<hash>) for deletion when
-// it is still present in observed state. Before the ServingRuntime-reference
-// rewrite an AIMService built its own profile ConfigMap; the referenced KServe
-// ServingRuntime now carries the colocated one, so the old object is dead state
-// that lingers for the life of the service. It is deleted only when ALL of the
-// following hold, so a coincidentally-named user ConfigMap is never touched:
+func shouldPreserveMigratedInferenceService(
+	service *aimv1alpha1.AIMService,
+	obs ServiceObservation,
+) bool {
+	return migrationPreservationPinActive(service) &&
+		validateActiveMigrationPreservation(service, obs.inferenceService) == nil
+}
+
+func migrationPreservationPinActive(service *aimv1alpha1.AIMService) bool {
+	return service != nil &&
+		service.Annotations[constants.AnnotationMigrationPreserveInferenceServiceGeneration] ==
+			strconv.FormatInt(service.Generation, 10)
+}
+
+func validateActiveMigrationPreservation(
+	service *aimv1alpha1.AIMService,
+	inferenceService controllerutils.FetchResult[*servingv1beta1.InferenceService],
+) error {
+	expectedUID := service.Annotations[constants.AnnotationMigrationPreserveInferenceServiceUID]
+	if expectedUID == "" {
+		return fmt.Errorf(
+			"active migration preservation requires annotation %q to contain the captured InferenceService UID",
+			constants.AnnotationMigrationPreserveInferenceServiceUID,
+		)
+	}
+	if inferenceService.Value == nil {
+		if inferenceService.Error != nil && !inferenceService.IsNotFound() {
+			return fmt.Errorf("active migration preservation cannot observe the captured InferenceService: %w", inferenceService.Error)
+		}
+		return fmt.Errorf(
+			"active migration preservation requires InferenceService UID %q to exist; restore it or update the AIMService spec to expire the pin",
+			expectedUID,
+		)
+	}
+	if inferenceService.Value.DeletionTimestamp != nil {
+		return fmt.Errorf("active migration preservation requires the captured InferenceService to be non-terminating")
+	}
+	if string(inferenceService.Value.UID) != expectedUID {
+		return fmt.Errorf(
+			"active migration preservation expected InferenceService UID %q, observed %q; restore the captured object or update the AIMService spec to expire the pin",
+			expectedUID,
+			inferenceService.Value.UID,
+		)
+	}
+	labels := inferenceService.Value.Labels
+	if labels[constants.LabelTemplate] == "" {
+		return fmt.Errorf("active migration preservation requires the captured InferenceService to have a nonempty legacy template label")
+	}
+	if labels[constants.LabelProfile] != "" {
+		return fmt.Errorf("active migration preservation requires the captured InferenceService to have no profile label")
+	}
+	return nil
+}
+
+// planLegacyProfileConfigMapCleanup queues the legacy inline-predictor
+// service-owned profile ConfigMap (<service>-profile-<hash>) for deletion only
+// after the observed InferenceService has safely transitioned away from it.
+// Before the ServingRuntime-reference rewrite an AIMService built its own
+// profile ConfigMap; the referenced KServe ServingRuntime now carries the
+// colocated one. The old ConfigMap is deleted only when ALL of the following
+// hold, so a coincidentally-named user ConfigMap or an active dependency is
+// never touched:
 //   - it exists (fetched by the deterministic legacy name — the name shape), and
 //   - it is owner-ref'd by THIS AIMService (UID match), and
 //   - it carries AIM Engine's managed-by label.
+//   - the observed InferenceService was fetched successfully and exists,
+//   - its status is current and Ready=True, and
+//   - none of its predictor volumes reference this ConfigMap.
 //
 // The delete is idempotent: the framework ignores NotFound, so once the object
 // is gone the next reconcile observes IsNotFound and queues nothing.
@@ -1344,6 +1385,14 @@ func planLegacyProfileConfigMapCleanup(plan *controllerutils.PlanResult, obs Ser
 	}
 	if configMap.Labels[constants.LabelK8sManagedBy] != constants.LabelValueManagedBy {
 		return
+	}
+	if !v1alpha1service.InferenceServiceReady(obs.inferenceService) {
+		return
+	}
+	for _, volume := range obs.inferenceService.Value.Spec.Predictor.Volumes {
+		if volume.ConfigMap != nil && volume.ConfigMap.Name == configMap.Name {
+			return
+		}
 	}
 
 	logger.V(1).Info("garbage-collecting orphaned legacy profile ConfigMap",
@@ -1377,6 +1426,8 @@ func (r *ProfileServiceReconciler) DecorateStatus(
 	cm *controllerutils.ConditionManager,
 	obs ServiceObservation,
 ) {
+	controllerutils.SetTemplateMigrationRequired(cm, false)
+
 	// Report-only: whether KEDA can read the scale-from-zero activation
 	// trigger. Shared with v1alpha1; never gates readiness.
 	v1alpha1service.SetActivationMetricCondition(

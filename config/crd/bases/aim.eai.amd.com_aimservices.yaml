@@ -2530,6 +2530,15 @@ spec:
                   by the controller.
                 format: int64
                 type: integer
+              reconcilerPipeline:
+                description: |-
+                  ReconcilerPipeline records which pipeline owns pipeline-specific status.
+                  The controller persists this before dispatch so transitions can retire old
+                  resolved references and conditions before the new pipeline fetches state.
+                enum:
+                - template
+                - profile
+                type: string
               resolvedModel:
                 description: ResolvedModel captures metadata about the image that
                   was resolved.
@@ -5235,6 +5244,15 @@ spec:
                   by the controller.
                 format: int64
                 type: integer
+              reconcilerPipeline:
+                description: |-
+                  ReconcilerPipeline records which pipeline owns pipeline-specific status.
+                  The controller persists this before dispatch so transitions can retire old
+                  resolved references and conditions before the new pipeline fetches state.
+                enum:
+                - template
+                - profile
+                type: string
               resolvedModel:
                 description: ResolvedModel captures metadata about the image that
                   was resolved.

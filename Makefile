@@ -177,6 +177,10 @@ vet: ## Run go vet against code.
 test: manifests generate fmt vet test-artifact-downloader ## Run tests.
 	go test $$(go list ./... | grep -v /e2e) -coverprofile cover.out
 
+.PHONY: test-bridge-contract
+test-bridge-contract: ## Verify the minimal v1alpha1 bridge contract.
+	go test ./internal/bridgecontract -run '^TestBridgeContract$$' -count=1
+
 .PHONY: test-artifact-downloader
 test-artifact-downloader: ## Run dependency-free artifact-downloader script tests.
 	PYTHONPATH=images/artifact-downloader python3 -m unittest discover \

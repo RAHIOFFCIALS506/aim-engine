@@ -190,6 +190,30 @@ func hasLegacyInputs(spec aimv1alpha1.AIMModelSpec) bool {
 	return false
 }
 
+// requiresTemplateMigration reports whether a model still emits deprecated
+// templates or carries a model field whose v1alpha2 replacement is
+// profile-based. RuntimeConfigRef, image pull secrets, and service accounts
+// are intentionally excluded because native model/profile flows use them too.
+func requiresTemplateMigration(spec *aimv1alpha1.AIMModelSpec) bool {
+	if spec == nil {
+		return false
+	}
+	emitsDeprecatedTemplates := spec.Image != "" && spec.ShouldCreateTemplates()
+	usesDeprecatedShape := spec.ProfileCopy != nil ||
+		spec.DerivedFrom != nil ||
+		spec.Custom != nil ||
+		len(spec.CustomTemplates) > 0 ||
+		len(spec.ModelSources) > 0 ||
+		(spec.AimId != "" && spec.ModelID == "") ||
+		spec.DefaultServiceTemplate != "" ||
+		len(spec.Env) > 0 ||
+		len(spec.Resources.Limits) > 0 ||
+		len(spec.Resources.Requests) > 0 ||
+		len(spec.Resources.Claims) > 0 ||
+		spec.ImageMetadata != nil
+	return emitsDeprecatedTemplates || usesDeprecatedShape
+}
+
 // shouldRunNativeDiscovery reports whether the v1alpha2 native discovery
 // pipeline (in-cluster Job → DiscoveryCatalog → AIMProfile) should run for
 // this spec. It honours the legacy spec.discovery.extractMetadata=false
