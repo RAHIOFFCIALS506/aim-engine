@@ -53,6 +53,7 @@ import (
 	aimv1alpha1 "github.com/amd-enterprise-ai/aim-engine/api/v1alpha1"
 	"github.com/amd-enterprise-ai/aim-engine/internal/constants"
 	controllerutils "github.com/amd-enterprise-ai/aim-engine/internal/controller/utils"
+	"github.com/amd-enterprise-ai/aim-engine/internal/trust"
 	"github.com/amd-enterprise-ai/aim-engine/internal/utils"
 	"github.com/amd-enterprise-ai/aim-engine/internal/v1alpha1/aimartifact"
 	"github.com/amd-enterprise-ai/aim-engine/internal/v1alpha1/aimruntimeconfig"
@@ -77,8 +78,12 @@ type Observation struct {
 	ModelID     string
 	BaseModelID string
 	Rank        *int32
-	State       aimv1alpha1.AIMAdapterState
-	LastError   string
+	// RankResolved distinguishes a rank read from a fetched artifact (including
+	// the omitted-rank default) from one left unknown by a lookup gap. Static
+	// max-rank resolution only trusts the former.
+	RankResolved bool
+	State        aimv1alpha1.AIMAdapterState
+	LastError    string
 }
 
 // Dependencies holds the fetched inputs the engine needs. Each pipeline
@@ -122,6 +127,10 @@ type State struct {
 	AdapterDiskPVC        string
 	AdapterDiskPVCUID     string
 	StorageBindingChanged bool
+	// MaxRank is the AIM_ADAPTER_MAX_RANK value resolved for the serving
+	// workload. Dynamic mode uses service/runtime configuration; static mode
+	// infers the value from the declared adapter artifacts.
+	MaxRank int32
 
 	// DesiredKey is a hash of the adapter-disk PVC and sorted declared adapter
 	// set. It is recorded on status once the subtree-sync Job has reconciled that
@@ -281,6 +290,20 @@ func Fetch(
 // Compose validates the declared adapters against the resolved parent and
 // computes each adapter's disk-side state.
 func Compose(service *aimv1alpha1.AIMService, deps Dependencies) State {
+	return ComposeWithRuntimeConfig(service, deps, nil, nil)
+}
+
+// ComposeWithRuntimeConfig validates adapters with namespace/cluster runtime
+// defaults available for resolving the dynamic max-rank ceiling. A failed
+// RuntimeConfig fetch leaves a dynamic service's last resolved ceiling in place;
+// the caller's RuntimeConfig component health owns reporting and retrying the
+// fetch error.
+func ComposeWithRuntimeConfig(
+	service *aimv1alpha1.AIMService,
+	deps Dependencies,
+	runtimeConfig *aimv1alpha1.AIMRuntimeConfigCommon,
+	runtimeConfigFetchErr error,
+) State {
 	var st State
 
 	// Resolve the parent adapter disk.
@@ -306,11 +329,11 @@ func Compose(service *aimv1alpha1.AIMService, deps Dependencies) State {
 	st.StorageBindingChanged = st.AdapterDiskPVC != service.Status.AdapterDiskPersistentVolumeClaim ||
 		st.AdapterDiskPVCUID != service.Status.AdapterDiskPersistentVolumeClaimUID
 
-	// Gate on the runtime contract: the image only loads adapters when its profile
-	// advertises the LoRA feature, so reject up front when it's known-absent.
-	if service.Spec.AdaptersEnabled() && deps.ProfileSupportsAdapters != nil && !*deps.ProfileSupportsAdapters {
-		st.ConfigErr = fmt.Errorf(
-			"resolved profile does not advertise LoRA adapter support; set spec.features: [\"adapters\"] on the profile")
+	// Gate on the runtime contract: the image only loads adapters when its
+	// effective profile advertises the LoRA feature. An explicit
+	// spec.profileOverrides.features entry is applied before this validation.
+	if err := profileAdapterSupportError(service, deps); err != nil {
+		st.ConfigErr = err
 	}
 
 	// Surface a terminal base-model resolution error as ConfigValid=False.
@@ -357,6 +380,17 @@ func Compose(service *aimv1alpha1.AIMService, deps Dependencies) State {
 		st.Adapters = append(st.Adapters, ad)
 	}
 
+	var rankErr error
+	st.MaxRank, rankErr = resolveValidatedMaxAdapterRank(
+		service,
+		st.Adapters,
+		runtimeConfig,
+		runtimeConfigFetchErr,
+	)
+	if st.ConfigErr == nil {
+		st.ConfigErr = rankErr
+	}
+
 	st.Adapters = append(st.Adapters, deletingAdapters(service, specNames, pruneConfirmed)...)
 
 	// AllStaged is informational (every declared adapter Downloaded). Deleting
@@ -376,6 +410,129 @@ func Compose(service *aimv1alpha1.AIMService, deps Dependencies) State {
 	}
 
 	return st
+}
+
+func resolveValidatedMaxAdapterRank(
+	service *aimv1alpha1.AIMService,
+	adapters []Observation,
+	runtimeConfig *aimv1alpha1.AIMRuntimeConfigCommon,
+	runtimeConfigFetchErr error,
+) (int32, error) {
+	if service.Spec.AdapterModeDynamic() && runtimeConfigFetchErr != nil {
+		// The dynamic ceiling may come from RuntimeConfig, so a failed fetch
+		// cannot be interpreted as "unset" and replaced by the built-in default.
+		// Preserve the last resolved value until the fetch succeeds. The service
+		// reconciler surfaces the fetch error and requeues infrastructure errors.
+		return service.Status.AdapterMaxRank, nil
+	}
+
+	maxRank, err := resolveMaxAdapterRank(service, adapters, runtimeConfig)
+	if err != nil {
+		return maxRank, err
+	}
+	return maxRank, dynamicAdapterRankError(service, adapters, maxRank)
+}
+
+func profileAdapterSupportError(service *aimv1alpha1.AIMService, deps Dependencies) error {
+	if service.Spec.AdaptersEnabled() && deps.ProfileSupportsAdapters != nil && !*deps.ProfileSupportsAdapters {
+		return fmt.Errorf(
+			"resolved profile does not advertise LoRA adapter support; select an adapter-capable profile or set spec.profileOverrides.features: [\"adapters\"] on the AIMService")
+	}
+	return nil
+}
+
+func dynamicAdapterRankError(
+	service *aimv1alpha1.AIMService,
+	adapters []Observation,
+	maxRank int32,
+) error {
+	if !service.Spec.AdapterModeDynamic() {
+		return nil
+	}
+	for _, ad := range adapters {
+		if ad.Rank != nil && *ad.Rank > maxRank {
+			return fmt.Errorf(
+				"adapter %s rank %d exceeds dynamic adapterRuntime.maxRank %d; increase spec.adapterRuntime.maxRank or the referenced RuntimeConfig value",
+				ad.Name, *ad.Rank, maxRank)
+		}
+	}
+	return nil
+}
+
+// resolveMaxAdapterRank computes the startup-time rank capacity exposed to the
+// inference image. Dynamic services need a ceiling that also covers future
+// adapters, so the service setting wins over RuntimeConfig and then the
+// conservative built-in default. Static services have an immutable adapter set
+// and round the largest resolved adapter rank up to a runtime-supported ceiling.
+func resolveMaxAdapterRank(
+	service *aimv1alpha1.AIMService,
+	adapters []Observation,
+	runtimeConfig *aimv1alpha1.AIMRuntimeConfigCommon,
+) (int32, error) {
+	if service.Spec.AdapterModeDynamic() {
+		maxRank := int32(0)
+		if service.Spec.AdapterRuntime != nil && service.Spec.AdapterRuntime.MaxRank != nil {
+			maxRank = *service.Spec.AdapterRuntime.MaxRank
+		} else if runtimeConfig != nil && runtimeConfig.AdapterRuntime != nil &&
+			runtimeConfig.AdapterRuntime.MaxRank != nil {
+			maxRank = *runtimeConfig.AdapterRuntime.MaxRank
+		} else {
+			maxRank = constants.DefaultAIMAdapterMaxRank
+		}
+
+		// Do not lower a running workload until every declared rank has been
+		// resolved. A transient artifact lookup gap must not make an unsafe
+		// decrease look valid.
+		if maxRank < service.Status.AdapterMaxRank && hasUnresolvedRank(adapters) {
+			return service.Status.AdapterMaxRank, nil
+		}
+		return maxRank, nil
+	}
+
+	// Static mode provisions exactly for the declared set. Recompute from the
+	// current artifacts so a downward rank correction actually takes effect —
+	// seeding from status.AdapterMaxRank would make the ceiling monotonic and a
+	// 64 -> 16 change would never land.
+	//
+	// status is consulted only across a genuine lookup gap: if any adapter's rank
+	// is unresolved this cycle, the recomputed value would be an undercount, so
+	// the last resolved ceiling is retained rather than rolling a running
+	// workload down to the compatibility default.
+	var maxRank int32
+	resolved := true
+	for _, ad := range adapters {
+		if !ad.RankResolved {
+			resolved = false
+			continue
+		}
+		if ad.Rank != nil && *ad.Rank > maxRank {
+			maxRank = *ad.Rank
+		}
+	}
+	if !resolved && service.Status.AdapterMaxRank > maxRank {
+		maxRank = service.Status.AdapterMaxRank
+	}
+	if maxRank == 0 {
+		maxRank = constants.DefaultAIMAdapterRank
+	}
+	// Keep these rounding ceilings synchronized with the MaxRank CEL allow-list
+	// in api/v1alpha1/aimruntimeconfig_shared.go. CEL remains the API and
+	// generated-documentation source of truth; this copy drives runtime rounding.
+	for _, supported := range []int32{1, 8, 16, 32, 64, 128, 256, 320, 512} {
+		if maxRank <= supported {
+			return supported, nil
+		}
+	}
+	return maxRank, fmt.Errorf("adapter rank %d exceeds the maximum supported rank 512", maxRank)
+}
+
+func hasUnresolvedRank(adapters []Observation) bool {
+	for _, ad := range adapters {
+		if !ad.RankResolved {
+			return true
+		}
+	}
+	return false
 }
 
 // evalAdapter resolves a single declared adapter against its artifact and the
@@ -416,30 +573,64 @@ func evalAdapter(ref aimv1alpha1.AIMServiceAdapterReference, deps Dependencies, 
 
 	ad.SourceURI = effectiveAdapterSourceURI(artifact)
 	ad.ModelID = artifact.Spec.ModelID
-	ad.Rank = artifact.Spec.Rank
+	rank := int32(constants.DefaultAIMAdapterRank)
+	if artifact.Spec.Rank != nil {
+		rank = *artifact.Spec.Rank
+	}
+	ad.Rank = ptr.To(rank)
+	ad.RankResolved = true
 	ad.AdapterPath = artifact.Status.AdapterPath
 	if ad.AdapterPath == "" {
 		ad.AdapterPath = artifact.Name
 	}
-	ad.State = adapterDiskState(ref.Name, artifact, deps)
+	ad.State, ad.LastError = adapterDiskState(ref.Name, artifact, deps)
 	return ad, cfgErr
 }
 
 // adapterDiskState derives an adapter's disk-side state: the artifact must be
 // Ready (lineage validated) before staging, then the staging Job drives
-// Downloading/Downloaded.
-func adapterDiskState(name string, artifact *aimv1alpha1.AIMArtifact, deps Dependencies) aimv1alpha1.AIMAdapterState {
+// Downloading/Downloaded/Failed. Terminal Job failure details are returned for
+// status.adapters[].lastError.
+func adapterDiskState(
+	name string,
+	artifact *aimv1alpha1.AIMArtifact,
+	deps Dependencies,
+) (aimv1alpha1.AIMAdapterState, string) {
 	if artifact.Status.Status != constants.AIMStatusReady {
-		return aimv1alpha1.AdapterStatePending
+		return aimv1alpha1.AdapterStatePending, ""
 	}
 	jf, jok := deps.StagingJobs[name]
 	if !jok || !jf.OK() || jf.Value == nil {
-		return aimv1alpha1.AdapterStatePending
+		return aimv1alpha1.AdapterStatePending, ""
 	}
 	if utils.IsJobSucceeded(jf.Value) {
-		return aimv1alpha1.AdapterStateDownloaded
+		return aimv1alpha1.AdapterStateDownloaded, ""
 	}
-	return aimv1alpha1.AdapterStateDownloading
+	if utils.IsJobFailed(jf.Value) {
+		return aimv1alpha1.AdapterStateFailed, stagingJobFailure(jf.Value)
+	}
+	return aimv1alpha1.AdapterStateDownloading, ""
+}
+
+func stagingJobFailure(job *batchv1.Job) string {
+	for _, condition := range job.Status.Conditions {
+		if condition.Type != batchv1.JobFailed || condition.Status != corev1.ConditionTrue {
+			continue
+		}
+		reason := strings.TrimSpace(condition.Reason)
+		message := strings.TrimSpace(condition.Message)
+		switch {
+		case reason != "" && message != "":
+			return fmt.Sprintf("%s: %s", reason, message)
+		case message != "":
+			return message
+		case reason != "":
+			return reason
+		default:
+			return "Adapter staging Job failed"
+		}
+	}
+	return "Adapter staging Job failed"
 }
 
 // deletingAdapters returns observations for adapters still recorded on status
@@ -570,6 +761,7 @@ func Plan(
 	deps Dependencies,
 	st State,
 	runtimeConfig *aimv1alpha1.AIMRuntimeConfigCommon,
+	additionalCABundleAvailable ...bool,
 ) {
 	if st.ConfigErr != nil || st.AdapterDiskPVC == "" || st.AdapterDiskPVCUID == "" {
 		return
@@ -593,10 +785,14 @@ func Plan(
 		))
 	}
 
+	includeAdditionalCABundle := len(additionalCABundleAvailable) > 0 && additionalCABundleAvailable[0]
+
 	// Stage adapters independently of the subtree gate (the staging Job creates
 	// the subtree itself if needed before promoting).
 	for _, ad := range st.Adapters {
-		if ad.State == aimv1alpha1.AdapterStateDownloaded || ad.State == aimv1alpha1.AdapterStateDeleting {
+		if ad.State == aimv1alpha1.AdapterStateDownloaded ||
+			ad.State == aimv1alpha1.AdapterStateFailed ||
+			ad.State == aimv1alpha1.AdapterStateDeleting {
 			continue
 		}
 
@@ -630,6 +826,7 @@ func Plan(
 			st.AdapterDiskPVCUID,
 			ad,
 			stagingRuntimeConfig,
+			includeAdditionalCABundle,
 		))
 	}
 }
@@ -780,12 +977,14 @@ func BuildStagingJob(
 	adapterDiskPVCUID string,
 	ad Observation,
 	runtimeConfig *aimv1alpha1.AIMRuntimeConfigCommon,
+	additionalCABundleAvailable ...bool,
 ) *batchv1.Job {
+	includeAdditionalCABundle := len(additionalCABundleAvailable) > 0 && additionalCABundleAvailable[0]
 	image := aimartifact.ResolveDownloadImage(artifact, runtimeConfig)
 	serviceID := ServiceSubtreeID(service)
 	jobID, _ := utils.GenerateDerivedName([]string{ad.AdapterPath}, utils.WithHashSource(serviceID, ad.AdapterPath))
 
-	rank := int32(16)
+	rank := int32(constants.DefaultAIMAdapterRank)
 	if ad.Rank != nil {
 		rank = *ad.Rank
 	}
@@ -835,7 +1034,7 @@ func BuildStagingJob(
 		constants.LabelKeyComponent: "adapter-stage",
 	}
 
-	return &batchv1.Job{
+	job := &batchv1.Job{
 		TypeMeta: metav1.TypeMeta{
 			APIVersion: batchv1.SchemeGroupVersion.String(),
 			Kind:       "Job",
@@ -889,12 +1088,23 @@ func BuildStagingJob(
 			},
 		},
 	}
+	trust.ApplyToPod(
+		&job.Spec.Template.Spec,
+		&job.Spec.Template.Spec.Containers[0],
+		aimartifact.ResolveTrustProjection(runtimeConfig, ad.SourceURI, includeAdditionalCABundle, image),
+	)
+	return job
 }
 
 // AddVolumeMount mounts the shared adapter disk into the inference container,
 // scoped read-only to this service's subtree via subPath at /adapters, and sets
 // the adapter container-contract env vars on the container.
-func AddVolumeMount(isvc *servingv1beta1.InferenceService, service *aimv1alpha1.AIMService, adapterDiskPVC string) {
+func AddVolumeMount(
+	isvc *servingv1beta1.InferenceService,
+	service *aimv1alpha1.AIMService,
+	adapterDiskPVC string,
+	maxRank int32,
+) {
 	container := predictorInferenceContainer(isvc)
 	if adapterDiskPVC == "" || container == nil {
 		return
@@ -919,21 +1129,21 @@ func AddVolumeMount(isvc *servingv1beta1.InferenceService, service *aimv1alpha1.
 
 	// Set the adapter container contract on the inference container. AIM_ADAPTER_SOURCE
 	// points the image at the mounted subtree; AIM_ADAPTER_MODE mirrors the service's
-	// (lowercase) adapterMode; the MAX_* caps and the dynamic-only refresh interval are
-	// emitted as uniform built-in defaults so they are observable in the pod spec.
-	//
-	// TODO(adapter-runtime): source the MAX_* caps from the resolved profile / runtime
-	// config instead of built-in defaults once the image honours them.
+	// (lowercase) adapterMode; the MAX_* caps and the dynamic-only refresh
+	// interval are emitted explicitly so they are observable in the pod spec.
 	mode := service.Spec.AdapterMode
 	if mode == "" {
 		mode = aimv1alpha1.AdapterModeStatic
+	}
+	if maxRank < 1 {
+		maxRank = constants.DefaultAIMAdapterMaxRank
 	}
 	env := []corev1.EnvVar{
 		{Name: constants.EnvAIMAdapterSource, Value: constants.AIMAdapterMountPath},
 		{Name: constants.EnvAIMAdapterMode, Value: string(mode)},
 		{Name: constants.EnvAIMAdapterMaxCount, Value: strconv.Itoa(constants.DefaultAIMAdapterMaxCount)},
 		{Name: constants.EnvAIMAdapterMaxCPUCount, Value: strconv.Itoa(constants.DefaultAIMAdapterMaxCPUCount)},
-		{Name: constants.EnvAIMAdapterMaxRank, Value: strconv.Itoa(constants.DefaultAIMAdapterMaxRank)},
+		{Name: constants.EnvAIMAdapterMaxRank, Value: strconv.Itoa(int(maxRank))},
 	}
 	if mode == aimv1alpha1.AdapterModeDynamic {
 		env = append(env, corev1.EnvVar{
@@ -994,6 +1204,11 @@ func DecorateStatus(status *aimv1alpha1.AIMServiceStatus, st State) {
 		})
 	}
 	status.Adapters = adapters
+	// Report the valid startup ceiling resolved for this service. Configuration
+	// errors preserve the last valid value.
+	if st.MaxRank > 0 && st.ConfigErr == nil {
+		status.AdapterMaxRank = st.MaxRank
+	}
 
 	// Record the declared set and concrete PVC generation once its subtree-sync
 	// Job succeeds. Until then status continues to describe the mountable

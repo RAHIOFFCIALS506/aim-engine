@@ -46,7 +46,10 @@ TLS certificate. The test target builds `aim-dummy` once, pushes every fixture
 tag through a temporary localhost port-forward, and kind-loads the exact
 in-cluster references used by workload pods. The operator trusts the private CA
 through `hack/kind/operator-values.yaml`; normal public certificate roots remain
-available.
+available. Those values also select the Envoy Gateway activation contract with
+external collector management, reusing the single standalone collector and
+Gateway policy installed by `make kind-create`. The development `EnvoyProxy`
+pushes source-side counter deltas to that collector over OTLP.
 
 The Zot service name is only resolvable inside the cluster. Run this target
 against an operator installed in Kind, rather than an operator started on the
@@ -83,7 +86,7 @@ kubectl create secret docker-registry dockerhub-regcred \
 
 Or create the same-named pull secret in the `default` namespace and the helper will copy it in.
 
-Useful overrides: `PULL_SECRET_SOURCE_NS` changes the copy-from namespace, and `PULL_SECRET_REQUIRED=1` makes a missing pull secret fail instead of warn.
+Useful overrides: `PULL_SECRET_SOURCE_NS` changes the copy-from namespace, `PULL_SECRET_TARGET_NAME` copies a pull secret under a temporary test-owned name, and `PULL_SECRET_REQUIRED=1` makes a missing pull secret fail instead of warn.
 
 #### Authenticated Hugging Face tests
 
@@ -111,11 +114,69 @@ make test-chainsaw \
   CHAINSAW_ENV_SELECTOR=
 ```
 
-### Runtime projection mode tests (`Reduced`)
+#### WAN 2.2 vLLM-Omni live reference
 
-Eager runtime projection is governed by the operator flag `--runtime-projection-mode` (`Exhaustive` default / `Reduced` / `Both`; see [ADR 0008](../../adr/0008-runtime-projection-from-profiles.md)). The default lane always runs the operator in `Exhaustive`, so tests whose assertions only hold in a non-default mode are gated with `requires: reduced-mode` (Reduced) and excluded from both ENV selectors.
+`tests/e2e/aimservice/gpu/wan22-vllm-omni-live` is an opt-in,
+executable reference for deploying the private WAN 2.2 T2V image through the
+complete v1alpha2 path. It demonstrates:
 
-`Both` mode has no dedicated e2e coverage of its own: it is the pure additive union of Exhaustive + Reduced (there is no `Both`-only code path — the per-profile and model-slug plan branches fire independently), so the `Exhaustive` and `Reduced` legs already exercise both projection outputs, and each additionally asserts the mutually-exclusive *absence* of the other mode's runtime — something a `Both` run structurally cannot. `Both`'s one unique property (both runtimes coexist for a single profile) is pinned cheaply by the Both-mode unit tests in `internal/v1alpha2/aimprofile/runtime_projection_test.go`.
+- copying a private-registry pull secret into both the test namespace and
+  `aim-system`, where `AIMClusterModel` discovery runs;
+- discovering and pinning the exact 1-GPU USP1 profile;
+- preserving the embedded vLLM-Omni profile filename and projecting
+  `AIM_ENGINE=vllm_omni`, `AIM_PROFILE_ID`, and a 32 GiB `/dev/shm`;
+- downloading the complete Diffusers repository with `downloadFilter: {}`;
+- generating a three-second MP4 through `/v1/videos/sync` and validating its
+  frame count and duration.
+
+Prerequisites are one available MI300X, Longhorn, the vLLM-Omni-capable
+operator build under test, and credentials for `docker.io/silogenai`. A cold
+namespace downloads approximately 118 GiB, so allow substantial storage and up
+to 90 minutes for the cache:
+
+```bash
+make test-chainsaw \
+  ENV=gpu \
+  CHAINSAW_TEST_DIR=tests/e2e/aimservice/gpu/wan22-vllm-omni-live \
+  CHAINSAW_ENV_SELECTOR=
+```
+
+By default the helper looks for `dockerhub-regcred` in `default` or at the
+documented local manifest path. To reuse a differently named cluster secret,
+set the source name and namespace; the test copies it to a unique temporary
+name and removes only that copy:
+
+```bash
+PULL_SECRET_NAME=silogenai-pull \
+PULL_SECRET_SOURCE_NS=aim-testing \
+make test-chainsaw \
+  ENV=gpu \
+  CHAINSAW_TEST_DIR=tests/e2e/aimservice/gpu/wan22-vllm-omni-live \
+  CHAINSAW_ENV_SELECTOR=
+```
+
+For a development cluster that already has the WAN artifact ready in a
+long-lived namespace, pass that namespace to Chainsaw to reuse the existing
+artifact rather than downloading another copy. The test's service, runtime
+config, profile cache, cluster model, generated profiles, and temporary secrets
+use reserved `wan22-vllm-omni-live` names and are removed at the end; an
+already-existing shared artifact is not deleted:
+
+```bash
+PULL_SECRET_NAME=silogenai-pull \
+PULL_SECRET_SOURCE_NS=aim-testing \
+make test-chainsaw \
+  ENV=gpu \
+  CHAINSAW_TEST_DIR=tests/e2e/aimservice/gpu/wan22-vllm-omni-live \
+  CHAINSAW_ENV_SELECTOR= \
+  CHAINSAW_ARGS="--namespace aim-testing"
+```
+
+### Runtime projection mode tests (`Both` and `Reduced`)
+
+Eager runtime projection is governed by the operator flag `--runtime-projection-mode` (`Exhaustive` / `Reduced` / `Both` default). The default lane runs the operator in `Both`. Tests whose mutually-exclusive assertions only hold in `Reduced` are gated with `requires: reduced-mode` and excluded from the normal ENV selectors.
+
+The default `mode-both` smoke asserts that the per-profile and model-slug runtimes coexist. `Exhaustive` has no dedicated cluster lane because its per-profile branch is already exercised by `Both`; its unique property (absence of the model-slug runtime) remains covered by unit tests. The `Reduced` lane additionally asserts the complementary shape: the model-slug runtime exists and the per-profile runtime does not.
 
 To run the Reduced tests, first redeploy the operator in Reduced (no rebuild needed — the flag is compiled in), then point `CHAINSAW_TEST_DIR` at the specific mode directory with the selector cleared:
 
@@ -127,16 +188,16 @@ make test-chainsaw \
   CHAINSAW_ENV_SELECTOR=
 
 # Restore the operator to the default when finished
-make set-projection-mode MODE=Exhaustive
+make set-projection-mode MODE=Both
 ```
 
-`make set-projection-mode` patches the in-cluster operator Deployment's `--runtime-projection-mode` arg and waits for the rollout, so it works against a kustomize/Tilt dev deploy as well as a Helm install (override `OPERATOR_NAMESPACE` / `OPERATOR_DEPLOYMENT` if they differ). Point `CHAINSAW_TEST_DIR` at exactly one mode directory: the `mode-reduced` fixture asserts the Reduced shape and only passes against a Reduced operator. The `mode-exhaustive` smoke needs no gate and runs in the default lane.
+`make set-projection-mode` patches the in-cluster operator Deployment's `--runtime-projection-mode` arg and waits for the rollout, so it works against a kustomize/Tilt dev deploy as well as a Helm install (override `OPERATOR_NAMESPACE` / `OPERATOR_DEPLOYMENT` if they differ). Point `CHAINSAW_TEST_DIR` at exactly one mode directory: the `mode-reduced` fixture asserts the Reduced shape and only passes against a Reduced operator. The `mode-both` smoke needs no gate and runs in the default lane.
 
 For a Helm install, set the equivalent value instead: `--set manager.runtimeProjectionMode=Reduced`.
 
 To run **all** the gated tests for the mode in one shot (instead of pointing `CHAINSAW_TEST_DIR` at each directory), use `make test-chainsaw-projection-mode MODE=Reduced`. It is the inverse of the default lanes' exclusion: it points at `tests/e2e/v1alpha2/runtime-projection` and flips the selector to *include* `requires in (reduced-mode)`, so only the matching gated tests load. Set the operator to that mode first (Helm value or `make set-projection-mode`).
 
-CI exercises these otherwise-CI-dark paths: `.github/workflows/test-e2e.yml` runs the e2e job as a matrix over `runtime-projection-mode: [Exhaustive, Reduced]`. The `Exhaustive` leg is the full default suite (gated tests excluded); the `Reduced` leg installs the operator with `manager.runtimeProjectionMode` set, asserts the live arg, and runs only the mode-gated tests via `make test-chainsaw-projection-mode`.
+CI exercises both shapes: `.github/workflows/test-e2e.yml` runs the e2e job as a matrix over `runtime-projection-mode: [Both, Reduced]`. The `Both` leg is the full default suite (gated tests excluded); the `Reduced` leg installs the operator with `manager.runtimeProjectionMode` set, asserts the live arg, and runs only the mode-gated tests via `make test-chainsaw-projection-mode`.
 
 ### Test Reports
 

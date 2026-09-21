@@ -17,6 +17,8 @@ kind: AIMService
 metadata:
   name: qwen-chat
   namespace: ml-team
+  annotations:
+    aim.eai.amd.com/reconciler-pipeline: profile
 spec:
   model:
     name: qwen-qwen3-32b
@@ -33,7 +35,7 @@ v1alpha2 supports five ways to reach an `AIMProfile`. Pick the shape that matche
 | Shape | Spec | Use when |
 |---|---|---|
 | [By name](#by-name) | `spec.profile.name` | You know the exact profile to deploy |
-| [By model name](#by-model) | `spec.model.name` | You know the model; let the controller pick |
+| [By model name](#by-model) | `spec.model.name` + migration annotation | You know the model; let the controller pick |
 | [Model + selector](#model--selector) | `spec.model.name` + `spec.profile.selector` | Narrow a model's pool by hardware or precision |
 | [Global selector](#global-selector) | `spec.profile.selector` | Reach profiles via labels alone |
 | [By image](#by-image) | `spec.model.image` + annotation | One-shot deploy from just an AIM container image |
@@ -44,19 +46,29 @@ See [Services concept](../concepts/services.md#resolution-shapes) for the full m
 
 Every shape except **By name** produces a candidate pool that the controller filters and ranks. The pipeline:
 
-1. **Selector filter** — keep only candidates that match every field set on `spec.profile.selector` (`aimId`, `modelRef`, `precision`, `metric`, `acceleratorModel`, `acceleratorCount`, `acceleratorType`, `engine`, `engineArgs`). The selector is an AND — every field provided must match the candidate exactly.
-2. **Hardware filter** — drop candidates whose `acceleratorModel` is not present in the cluster (via the AcceleratorDetector node labels).
-3. **Deployable filter** — drop profiles with `status.deployable=false` (base profiles).
-4. **Scope preference** — namespace `AIMProfile` outranks cluster `AIMClusterProfile` when both match.
-5. **Rank** — order the survivors by `primary > type > version > name`, where:
+1. **Optimized selector pass** — keep candidates that match every field set on `spec.profile.selector`, including the effective `minimumType` floor. The selector is an AND — every field provided must match the candidate.
+2. **Any-tier pass** — only when the service did not explicitly set `minimumType` and no optimized candidate matched in either scope, retry without the implicit floor and admit only profiles with `autoSelectionPolicy: any`.
+3. **Hardware filter** — drop candidates whose `acceleratorModel` is not present in the cluster (via the AcceleratorDetector node labels).
+4. **Deployable filter** — drop profiles with `status.deployable=false` (base profiles).
+5. **Scope preference** — namespace `AIMProfile` outranks cluster `AIMClusterProfile` when both match within the selected pass.
+6. **Rank** — compare survivors in this order:
     - `primary: true` beats `primary: false`.
     - `type` ranks `optimized > general > preview > unoptimized`.
+    - `acceleratorModel` follows the built-in hardware preference order.
+    - `metric` ranks `latency > throughput`.
+    - `precision` ranks `fp4 > int4 > fp8 > int8 > fp16 > bf16 > fp32 > fp64`.
+    - A lower positive `acceleratorCount` wins; zero or unspecified ranks last.
+    - `acceleratorType: gpu` ranks ahead of other accelerator types.
     - `version` is the highest semver from the profile's container-image tag.
     - Alphabetical name is the final, deterministic tiebreaker.
 
-A single winner is selected. If two profiles tie on every ranking axis, the alphabetical name tiebreak makes the choice deterministic. The fields a user typically narrows on (`metric`, `precision`, `acceleratorModel`, `acceleratorCount`) are **filters**, not ranking axes — the way to influence the choice is to constrain the selector until exactly the desired profile survives, then let ranking pick among any remaining ties.
+A single winner is selected. Fields set on `spec.profile.selector` are filters;
+the same profile properties can also act as ranking axes among the candidates
+that survive filtering. Constrain the selector when a specific hardware,
+metric, or precision choice is required rather than relying on default ranking.
 
-The v1alpha1 template selector performs the same filtering (availability → unoptimized → service overrides → GPU availability → namespace-over-cluster) and applies an analogous tier-based preference. The v1alpha2 ranking just centralises it on profile primary/type/version metadata.
+The v1alpha1 template selector has its own analogous filtering and preference
+logic. The order above describes the v1alpha2 profile pipeline.
 
 ### By name
 
@@ -80,6 +92,11 @@ spec:
   model:
     name: qwen-qwen3-32b
 ```
+
+During the v1alpha1 → v1alpha2 migration window, a complete model-only
+`AIMService` must also set
+`aim.eai.amd.com/reconciler-pipeline: profile`. A service that includes
+`spec.profile.*` selects the profile pipeline by spec shape.
 
 The candidate pool is every deployable profile produced by `AIMModel/qwen-qwen3-32b` (or `AIMClusterModel` of the same name). Ranking picks the best.
 
@@ -221,7 +238,9 @@ spec:
       memory: 128Gi
 ```
 
-Service-level resources are merged on top of the resolved profile's `status.resources`. Service values win where both set the same key.
+Service-level resources are merged on top of the resolved profile's `status.resources`. Service values win where both set the same key. The controller writes the fully merged block to KServe, so a one-sided override cannot retain an incompatible request or limit from the profile runtime.
+
+Node matching uses that same merged service footprint. A smaller service override can therefore deploy from a profile whose own generated defaults do not fit a node; the base profile can remain `NotAvailable` while the service reports `ProfileReady=True`. If the merged service resources do not fit any node matching the profile's accelerator labels and partition mode, service planning remains gated.
 
 ## Image pull secrets
 

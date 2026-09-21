@@ -43,9 +43,12 @@ ZOT_CLUSTER_REGISTRY ?= $(ZOT_SERVICE).$(ZOT_NAMESPACE).svc.cluster.local:5000
 ZOT_AIM_DUMMY_REPO ?= $(ZOT_CLUSTER_REGISTRY)/aim-dummy
 # Zot creates an inotify watcher for configuration hot-reload at startup.
 # Shared CI hosts can exhaust the kernel's per-user instance limit while
-# multiple Kind clusters are running, so ensure a modest minimum before Zot
+# multiple Kind clusters are running, so ensure sufficient headroom before Zot
 # starts. Override this if the host has a stricter policy or a larger workload.
-ZOT_INOTIFY_MAX_USER_INSTANCES ?= 1024
+ZOT_INOTIFY_MAX_USER_INSTANCES ?= 8192
+
+# NVIDIA Kubernetes dependency versions
+NVIDIA_DEVICE_PLUGIN_VERSION ?= 0.19.3
 
 # --- ttl.sh ephemeral-registry fallback for external GPU clusters ------------
 # AIMModel discovery reads a model image's OCI labels *inside the operator* via
@@ -171,8 +174,17 @@ vet: ## Run go vet against code.
 	go vet ./...
 
 .PHONY: test
-test: manifests generate fmt vet ## Run tests.
+test: manifests generate fmt vet test-artifact-downloader ## Run tests.
 	go test $$(go list ./... | grep -v /e2e) -coverprofile cover.out
+
+.PHONY: test-bridge-contract
+test-bridge-contract: ## Verify the minimal v1alpha1 bridge contract.
+	go test ./internal/bridgecontract -run '^TestBridgeContract$$' -count=1
+
+.PHONY: test-artifact-downloader
+test-artifact-downloader: ## Run dependency-free artifact-downloader script tests.
+	PYTHONPATH=images/artifact-downloader python3 -m unittest discover \
+		-s images/artifact-downloader/tests -p 'test_combine_ca.py'
 
 # TODO(user): To use a different vendor for e2e tests, modify the setup under 'tests/e2e'.
 # The default setup assumes Kind is pre-installed and builds/loads the Manager Docker image locally.
@@ -194,6 +206,11 @@ setup-test-e2e: ## Set up a Kind cluster for e2e tests if it does not exist
 			$(KIND) create cluster --name $(KIND_CLUSTER) ;; \
 	esac
 
+.PHONY: install-nvidia-dependencies
+install-nvidia-dependencies: ## Install the NVIDIA device plugin and its bundled NFD.
+	NVIDIA_DEVICE_PLUGIN_VERSION=$(NVIDIA_DEVICE_PLUGIN_VERSION) \
+		helmfile sync -f hack/nvidia/helmfile.yaml.gotmpl
+
 .PHONY: kind-create
 kind-create: manifests ## Create kind cluster with all dependencies for local development.
 	@echo "=== Setting up kind cluster for local development ==="
@@ -209,16 +226,15 @@ kind-create: manifests ## Create kind cluster with all dependencies for local de
 	@# Create aim-system namespace (needed for cluster-scoped resources)
 	@echo "Creating aim-system namespace..."
 	@kubectl create namespace aim-system --dry-run=client -o yaml | kubectl apply -f -
-	@# Install core dependencies (cert-manager, kgateway, kserve)
+	@# Install core dependencies (cert-manager, Envoy Gateway, kserve)
 	@echo "Installing core dependencies..."
 	@helmfile sync -f hack/dependencies/helmfile.yaml.gotmpl
+	@# Install the OTLP receiver before verifying the gateway's configured sink.
+	@$(MAKE) install-dev-envoy-collector
+	@# Verify the gateway data plane came up and the default Gateway is programmed.
+	@$(MAKE) verify-gateway
 	@# Install the Kind-local TLS registry after cert-manager is ready.
 	@$(MAKE) kind-zot-install KIND_CLUSTER=aim-engine
-	@# Install scale-from-zero activation prereq (kgateway-metrics-collector).
-	@# Cluster-wide OpenTelemetryCollector that scrapes Envoy from kgateway
-	@# data-plane pods and forwards the request counter to keda-otel-scaler;
-	@# required for AIMServices with spec.minReplicas: 0 to ever activate.
-	@$(MAKE) install-scale-from-zero-prereq
 	@# Install kind-specific dependencies (NFS server + csi-driver-nfs)
 	@echo "Installing kind-specific dependencies..."
 	@helmfile sync -f hack/kind/helmfile.yaml.gotmpl
@@ -242,12 +258,22 @@ seaweedfs-init-bucket: ## Create the aim-cache S3 bucket in SeaweedFS.
 		--image=alpine/curl:latest -- \
 		sh -c 'curl -sf -X PUT http://seaweedfs-s3.seaweedfs-system:8333/aim-cache -o /dev/null -w "bucket created (HTTP %{http_code})\n"' || true
 
-.PHONY: install-scale-from-zero-prereq
-install-scale-from-zero-prereq: ## Install kgateway-metrics-collector (scale-from-zero activation prereq).
-	@echo "Installing scale-from-zero prereq (kgateway-metrics-collector)..."
-	@kubectl apply -f config/prereqs/scale-from-zero/kgateway-metrics-collector.yaml
-	@echo "Waiting for kgateway-metrics-collector deployment..."
-	@kubectl -n keda rollout status deploy/kgateway-metrics-collector --timeout=180s
+.PHONY: install-dev-envoy-collector
+install-dev-envoy-collector: ## Install the externally managed Envoy collector used by local development.
+	@echo "Installing local development Envoy collector (envoy-gateway-metrics-collector)..."
+	@kubectl apply -f config/prereqs/scale-from-zero/envoy-gateway-metrics-collector.yaml
+	@echo "Waiting for envoy-gateway-metrics-collector deployment..."
+	@kubectl -n keda rollout status deploy/envoy-gateway-metrics-collector --timeout=180s
+	@COLLECTOR_HOST=envoy-gateway-metrics-collector.keda.svc.cluster.local \
+		bash hack/configure-envoy-collector-sink.sh
+
+.PHONY: verify-gateway
+verify-gateway: ## Verify Envoy Gateway is installed and the default Gateway is programmed.
+	@echo "Verifying Envoy Gateway installation..."
+	@kubectl wait --for=condition=Available deploy/envoy-gateway -n envoy-gateway-system --timeout=300s
+	@kubectl wait --for=condition=Accepted gatewayclass/envoy-gateway --timeout=120s
+	@kubectl wait --for=condition=Programmed gateway/kserve-ingress-gateway -n envoy-gateway-system --timeout=300s
+	@echo "Envoy Gateway is ready."
 
 .PHONY: kind-zot-inotify-limit
 kind-zot-inotify-limit: ## Ensure Kind's host kernel has enough inotify instances for Zot.
@@ -323,15 +349,19 @@ CHAINSAW_CONFIG_DIR := tests/chainsaw/config
 # opt in through a dedicated target or by overriding the selector.
 CHAINSAW_NEEDS_SECRET_EXCLUDE := needs-secret notin (hf_token,dockerhub_pull_secret)
 
-# reduced-mode gates the eager-runtime-projection-mode tests, which only pass
-# against an operator started with a non-default --runtime-projection-mode
-# (Reduced). The default lanes run the operator in Exhaustive, so these are
-# excluded from every selector; run them via `make set-projection-mode MODE=...`
-# then point CHAINSAW_TEST_DIR at the specific mode dir with the selector cleared
-# (see docs/docs/contributing/testing.md). Both mode has no dedicated e2e leg: it
-# is the additive union of Exhaustive + Reduced (covered by those legs plus the
-# Both-mode unit tests), so there is no both-mode gate.
+# reduced-mode gates eager-runtime-projection tests whose mutually-exclusive
+# assertions only pass against an operator started in Reduced. The default lanes
+# run the operator in Both, so these are excluded from every selector; run them
+# via `make set-projection-mode MODE=...` then point CHAINSAW_TEST_DIR at the
+# specific mode dir with the selector cleared (see
+# docs/docs/contributing/testing.md). The ungated mode-both smoke runs in the
+# default suite and asserts that both projection outputs coexist.
 CHAINSAW_PROJECTION_MODE_EXCLUDE := reduced-mode
+
+# The upgrade compatibility setup and verify phases share resources across an
+# operator replacement. They are run explicitly by test-upgrade.yml and must
+# not be discovered as independent tests by the regular Chainsaw lanes.
+CHAINSAW_UPGRADE_WORKFLOW_EXCLUDE := upgrade-workflow
 
 # The mode-gated projection tests all live under one tree. The
 # `test-chainsaw-projection-mode` target below is the inverse entry point of the
@@ -352,25 +382,25 @@ CHAINSAW_PROJECTION_MODE_DIR := tests/e2e/v1alpha2/runtime-projection
 # longhorn storage and NFD-gated tests. Expensive / operator-gated
 # tests (e.g. multi-hundred-GiB live model downloads) gate themselves via one of
 # these `requires` values rather than a separate tier axis.
-CHAINSAW_SELECTOR_KIND := requires notin (gpu,gpu-amd,gpu-nvidia,longhorn,nfd,$(CHAINSAW_PROJECTION_MODE_EXCLUDE)),$(CHAINSAW_NEEDS_SECRET_EXCLUDE)
+CHAINSAW_SELECTOR_KIND := requires notin (gpu,gpu-amd,gpu-nvidia,longhorn,nfd,$(CHAINSAW_PROJECTION_MODE_EXCLUDE),$(CHAINSAW_UPGRADE_WORKFLOW_EXCLUDE)),$(CHAINSAW_NEEDS_SECRET_EXCLUDE)
 
 # AMD GPU environment: runs AMD GPU tests (gpu, gpu-amd) end-to-end. Excludes
 # Kind-only tests (mocked node labels), NVIDIA-only tests, and NFD-gated
 # tests. Run an excluded test explicitly by invoking chainsaw directly against
 # its dir without a selector.
-CHAINSAW_SELECTOR_GPU := requires notin (kind,gpu-nvidia,nfd,$(CHAINSAW_PROJECTION_MODE_EXCLUDE)),$(CHAINSAW_NEEDS_SECRET_EXCLUDE)
+CHAINSAW_SELECTOR_GPU := requires notin (kind,gpu-nvidia,nfd,$(CHAINSAW_PROJECTION_MODE_EXCLUDE),$(CHAINSAW_UPGRADE_WORKFLOW_EXCLUDE)),$(CHAINSAW_NEEDS_SECRET_EXCLUDE)
 
 # NVIDIA GPU environment: runs only NVIDIA GPU tests (gpu-nvidia). Excludes
 # Kind-only tests and the AMD GPU values (bare gpu is AMD-built today), plus
 # NFD-gated tests.
-CHAINSAW_SELECTOR_NVIDIA := requires notin (kind,gpu,gpu-amd,nfd,$(CHAINSAW_PROJECTION_MODE_EXCLUDE)),$(CHAINSAW_NEEDS_SECRET_EXCLUDE)
+CHAINSAW_SELECTOR_NVIDIA := requires notin (kind,gpu,gpu-amd,nfd,$(CHAINSAW_PROJECTION_MODE_EXCLUDE),$(CHAINSAW_UPGRADE_WORKFLOW_EXCLUDE)),$(CHAINSAW_NEEDS_SECRET_EXCLUDE)
 
 # Dedicated authenticated lane for tests whose model/size makes a token a hard
 # prerequisite. Normal trusted suites also receive HF_TOKEN and exercise all
 # other hf-access=live tests.
-CHAINSAW_HF_SELECTOR_KIND := needs-secret in (hf_token),requires notin (gpu,gpu-amd,gpu-nvidia,longhorn,nfd,$(CHAINSAW_PROJECTION_MODE_EXCLUDE))
-CHAINSAW_HF_SELECTOR_GPU := needs-secret in (hf_token),requires notin (kind,gpu-nvidia,nfd,$(CHAINSAW_PROJECTION_MODE_EXCLUDE))
-CHAINSAW_HF_SELECTOR_NVIDIA := needs-secret in (hf_token),requires notin (kind,gpu,gpu-amd,nfd,$(CHAINSAW_PROJECTION_MODE_EXCLUDE))
+CHAINSAW_HF_SELECTOR_KIND := needs-secret in (hf_token),requires notin (gpu,gpu-amd,gpu-nvidia,longhorn,nfd,$(CHAINSAW_PROJECTION_MODE_EXCLUDE),$(CHAINSAW_UPGRADE_WORKFLOW_EXCLUDE))
+CHAINSAW_HF_SELECTOR_GPU := needs-secret in (hf_token),requires notin (kind,gpu-nvidia,nfd,$(CHAINSAW_PROJECTION_MODE_EXCLUDE),$(CHAINSAW_UPGRADE_WORKFLOW_EXCLUDE))
+CHAINSAW_HF_SELECTOR_NVIDIA := needs-secret in (hf_token),requires notin (kind,gpu,gpu-amd,nfd,$(CHAINSAW_PROJECTION_MODE_EXCLUDE),$(CHAINSAW_UPGRADE_WORKFLOW_EXCLUDE))
 
 # Select appropriate config based on ENV and CI detection
 # CI is detected via CI env var (set by GitHub Actions, GitLab CI, etc.)
@@ -555,18 +585,26 @@ lint-config: ## Verify golangci-lint linter configuration
 
 # vCluster naming convention: aim-{username}-dev
 VCLUSTER_NAME := aim-$(shell whoami)-dev
+# The local development stack deliberately uses Envoy Gateway even though the
+# distributable Helm chart defaults gatewayProvider to none. Helmfile installs
+# the Envoy Gateway dependencies and make watch passes the matching controller
+# metric scope explicitly instead of relying on the binary's legacy fallback.
+DEV_GATEWAY_PROVIDER := envoyGateway
+DEV_GATEWAY_ACTIVATION_SCOPE := httproute
 
 .PHONY: vcluster-create
 vcluster-create: ## Create personal vcluster, install dependencies, and connect.
-	@echo "Creating vcluster '$(VCLUSTER_NAME)'..."
+	@# Disconnect first to avoid creating a nested vcluster.
+	@echo "Disconnecting from any active vcluster (returns to host context)..."
+	@vcluster disconnect || true
+	@echo "Creating vcluster '$(VCLUSTER_NAME)' on host context '$$(kubectl config current-context)'..."
 	vcluster create $(VCLUSTER_NAME) --namespace $(VCLUSTER_NAME) -f hack/dependencies/vcluster.yaml
-	@echo "Installing dependencies..."
+	@echo "Installing development dependencies for $(DEV_GATEWAY_PROVIDER) (including Envoy Gateway Helm charts)..."
 	helmfile sync -f hack/dependencies/helmfile.yaml.gotmpl
-	@# Install scale-from-zero activation prereq (kgateway-metrics-collector).
-	@# Cluster-wide OpenTelemetryCollector that scrapes Envoy from kgateway
-	@# data-plane pods and forwards the request counter to keda-otel-scaler;
-	@# required for AIMServices with spec.minReplicas: 0 to ever activate.
-	@$(MAKE) install-scale-from-zero-prereq
+	@# Verify the gateway data plane came up and the default Gateway is programmed.
+	@$(MAKE) verify-gateway
+	@# Install the standalone collector used by the explicit Envoy dev stack.
+	@$(MAKE) install-dev-envoy-collector
 	@echo "Creating aim-system namespace..."
 	@kubectl create namespace aim-system --dry-run=client -o yaml | kubectl apply -f -
 	@echo "Installing CRDs..."
@@ -601,15 +639,15 @@ build: manifests generate fmt vet ## Build manager binary.
 
 .PHONY: run
 run: manifests generate fmt vet ## Run a controller from your host.
-	go run -ldflags "$(LDFLAGS)" ./cmd/main.go
+	AIM_GATEWAY_ACTIVATION_SCOPE=$(DEV_GATEWAY_ACTIVATION_SCOPE) go run -ldflags "$(LDFLAGS)" ./cmd/main.go
 
 .PHONY: run-debug
 run-debug: manifests generate fmt vet ## Run a controller with debug logging enabled.
-	go run -ldflags "$(LDFLAGS)" ./cmd/main.go --zap-log-level=debug
+	AIM_GATEWAY_ACTIVATION_SCOPE=$(DEV_GATEWAY_ACTIVATION_SCOPE) go run -ldflags "$(LDFLAGS)" ./cmd/main.go --zap-log-level=debug
 
 .PHONY: watch
 watch: manifests generate install ## Run controller with live reload on file changes.
-	air
+	AIM_GATEWAY_ACTIVATION_SCOPE=$(DEV_GATEWAY_ACTIVATION_SCOPE) air
 
 .PHONY: tilt-up
 tilt-up: ## Run controller in cluster with Tilt (live reload, in-container builds).
@@ -788,7 +826,7 @@ endif
 .PHONY: install
 install: manifests ## Install CRDs into the K8s cluster specified in ~/.kube/config.
 	@out="$$( kustomize build config/crd 2>/dev/null || true )"; \
-	if [ -n "$$out" ]; then echo "$$out" | kubectl apply -f -; else echo "No CRDs to install; skipping."; fi
+	if [ -n "$$out" ]; then echo "$$out" | kubectl apply --server-side -f -; else echo "No CRDs to install; skipping."; fi
 
 .PHONY: uninstall
 uninstall: manifests ## Uninstall CRDs from the K8s cluster specified in ~/.kube/config. Call with ignore-not-found=true to ignore resource not found errors during deletion.

@@ -35,6 +35,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	aimv1alpha1 "github.com/amd-enterprise-ai/aim-engine/api/v1alpha1"
+	aimv1alpha2 "github.com/amd-enterprise-ai/aim-engine/api/v1alpha2"
 	"github.com/amd-enterprise-ai/aim-engine/internal/constants"
 	controllerutils "github.com/amd-enterprise-ai/aim-engine/internal/controller/utils"
 	"github.com/amd-enterprise-ai/aim-engine/internal/utils"
@@ -232,7 +233,7 @@ func generateAdapterReaperJobName(mc *aimv1alpha1.AIMArtifact) string {
 // failed" from "no live services": an empty keep-list on the reaper means delete
 // every subtree, so a transient List error must skip the reaper, not reap.
 func listLiveAdapterServiceIDs(ctx context.Context, c client.Client, namespace string) ([]string, error) {
-	var services aimv1alpha1.AIMServiceList
+	var services aimv1alpha2.AIMServiceList
 	if err := c.List(ctx, &services, client.InNamespace(namespace)); err != nil {
 		return nil, err
 	}
@@ -248,7 +249,7 @@ func listLiveAdapterServiceIDs(ctx context.Context, c client.Client, namespace s
 
 // buildAdapterReaperJob builds the periodic subtree-reclaim Job owned by the model
 // artifact. It mounts the adapter disk RW and removes subtrees of services no
-// longer present (plus crash-orphaned staging dirs).
+// longer present, crash-orphaned staging dirs, and atomically-unloaded bytes.
 func buildAdapterReaperJob(
 	mc *aimv1alpha1.AIMArtifact,
 	adapterPVC string,

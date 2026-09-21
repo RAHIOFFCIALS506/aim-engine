@@ -38,7 +38,7 @@ const (
 
 // AIMProfileSpecCommon contains spec fields shared between AIMProfile and AIMClusterProfile.
 // A profile answers five questions without consulting any other resource: model architecture
-// (aimId), accelerator (acceleratorModel/Type/Count), K8s resources (status.resources),
+// (aimId), accelerator (acceleratorVendor/Model/Type/Count), K8s resources (status.resources),
 // runtime config (engineArgs, engineEnv), and container image (image).
 type AIMProfileSpecCommon struct {
 	// AimId is the model architecture identifier (e.g., "qwen/qwen3-32b").
@@ -63,14 +63,23 @@ type AIMProfileSpecCommon struct {
 
 	// ProfileId is the on-disk profile identifier from the AIM image
 	// (e.g., "vllm-mi300x-fp8-tp1-latency"). Populated during discovery to link this
-	// CRD back to the profile YAML inside the container. Not required for manually
-	// created profiles.
+	// CRD back to the profile YAML inside the container. Runtime projection retains
+	// this identifier as the mounted YAML filename. Not required for manually created
+	// profiles, which receive an engine-aware generated filename when omitted.
 	// +optional
 	ProfileId string `json:"profileId,omitempty"`
 
-	// Engine identifies the inference engine (e.g., "vllm", "tgi").
+	// Engine identifies the inference engine (e.g., "vllm", "vllm_omni").
 	// +optional
 	Engine string `json:"engine,omitempty"`
+
+	// Variant distinguishes profiles that share the same engine, accelerator,
+	// precision, count, and metric but use a different runtime recipe (for
+	// example, "usp4"). Discovered profiles preserve metadata.variant here so
+	// the projected profile YAML and filename retain the image's identity.
+	// +optional
+	// +kubebuilder:validation:Pattern=`^[a-z][a-z0-9-]*$`
+	Variant string `json:"variant,omitempty"`
 
 	// Metric is the optimization target for this profile.
 	// +optional
@@ -79,13 +88,26 @@ type AIMProfileSpecCommon struct {
 
 	// Precision is the numeric precision used by this profile.
 	// +optional
-	// +kubebuilder:validation:Enum=fp4;fp8;fp16;fp32;bf16;int4;int8
+	// +kubebuilder:validation:Enum=fp4;fp8;fp16;fp32;fp64;bf16;int4;int8
 	Precision AIMPrecision `json:"precision,omitempty"`
 
 	// Type indicates the optimization level. Hierarchy: optimized > general > preview > unoptimized.
 	// +optional
 	// +kubebuilder:validation:Enum=optimized;general;preview;unoptimized
 	Type AIMProfileType `json:"type,omitempty"`
+
+	// AutoSelectionPolicy controls which optimization tiers may participate in
+	// automatic selection when the AIMService does not explicitly set
+	// minimumType.
+	//
+	// "optimized" applies the implicit optimized floor. "any" permits the
+	// profile to participate in a second selection pass regardless of its type,
+	// but only when no optimized candidate matched. It never overrides an
+	// explicitly authored minimumType. Explicit spec.profile.name resolution is
+	// unaffected.
+	// +optional
+	// +kubebuilder:default=optimized
+	AutoSelectionPolicy AIMProfileAutoSelectionPolicy `json:"autoSelectionPolicy,omitempty"`
 
 	// Primary marks this as a default/recommended profile. When true, the profile is
 	// advertised for standard deployment and copied automatically for custom weight models.
@@ -95,14 +117,15 @@ type AIMProfileSpecCommon struct {
 
 	// ManualSelectionOnly is DEPRECATED and no longer honored by the resolver.
 	// It was a binary gate excluding a profile from automatic AIMService
-	// selection; that intent is now expressed through the graded `type`
-	// hierarchy (optimized > general > preview > unoptimized) combined with the
-	// selector's `minimumType` floor. The field is retained for backward
-	// compatibility (existing objects and aim-build profile YAMLs still set it)
-	// but has no effect on selection; it will be removed in a future API
-	// version. Use `type: unoptimized` (+ a selector `minimumType`) instead.
+	// selection. Optimization-tier consent is now expressed through the graded
+	// `type` hierarchy combined with the selector's `minimumType` floor, while
+	// eligibility for implicit any-tier automatic selection is expressed through
+	// `autoSelectionPolicy`. The field is retained for backward compatibility
+	// (existing objects and aim-build profile YAMLs still set it) but has no
+	// effect on selection; it will be removed in a future API version.
 	//
-	// Deprecated: superseded by `type` + selector `minimumType`; ignored by the resolver.
+	// Deprecated: superseded by `type`, selector `minimumType`, and
+	// `autoSelectionPolicy`; ignored by the resolver.
 	// +kubebuilder:default=false
 	ManualSelectionOnly bool `json:"manualSelectionOnly,omitempty"`
 
@@ -117,6 +140,16 @@ type AIMProfileSpecCommon struct {
 	// Applied via os.execv, distinct from container-level ContainerEnv.
 	// +optional
 	EngineEnv map[string]string `json:"engineEnv,omitempty"`
+
+	// AcceleratorVendor selects the vendor-specific device-plugin resource and
+	// vendor node label used for this profile. A generic NVIDIA profile can set
+	// this to "nvidia" without declaring an acceleratorModel; AIM Engine then
+	// requests nvidia.com/gpu and matches NVIDIA GPU nodes of any model.
+	//
+	// Empty preserves the legacy AMD behavior for profiles created before this
+	// field existed.
+	// +optional
+	AcceleratorVendor AcceleratorVendor `json:"acceleratorVendor,omitempty"`
 
 	// AcceleratorModel is the accelerator identifier for node selection.
 	// Maps to a node label key using the Exists operator:
@@ -146,7 +179,11 @@ type AIMProfileSpecCommon struct {
 	// For AcceleratorType=gpu, the per-unit interpretation depends on
 	// AcceleratorPartitioningMode: under "unpartitioned" (default) one unit is
 	// one whole GPU; under "partitioned" or a specific scheme one unit is one
-	// partition slice (e.g. CPX-NPS4 = 1/8 of a GPU).
+	// partition slice (e.g. CPX-NPS4 = 1/8 of a GPU). Host CPU and memory
+	// defaults are scaled by the recognized compute partition density
+	// (SPX=1, DPX=2, QPX=4, CPX=8). Geometry-agnostic "partitioned" and unknown
+	// schemes require explicit host resources because a safe scale cannot be
+	// inferred.
 	// +optional
 	// +kubebuilder:validation:Minimum=0
 	AcceleratorCount int32 `json:"acceleratorCount,omitempty"`
@@ -184,6 +221,8 @@ type AIMProfileSpecCommon struct {
 	// Resources is an optional override for K8s resource requests/limits.
 	// When set, merged on top of the defaults that AIM Engine computes from
 	// AcceleratorType, AcceleratorCount, and cluster-level configuration.
+	// Generated values account for an explicit opposite-side value so partial
+	// overrides cannot produce a request above its limit.
 	// The resolved result is written to status.resources.
 	// +optional
 	Resources *corev1.ResourceRequirements `json:"resources,omitempty"`
@@ -307,6 +346,7 @@ type AIMProfileStatus struct {
 	//   - discovered: emitted by image discovery (AIMModel.spec.image).
 	//   - derived: emitted by an AIMProfileSet or
 	//     AIMModel.spec.profiles.derivedFrom.
+	//   - generated: emitted from AIMModel.spec.modelId and a RuntimeConfig fallback.
 	//   - user-authored: created independently by a user.
 	//
 	// Backfilled by the AIMProfile reconciler when not stamped at creation
@@ -384,6 +424,10 @@ func (s *AIMProfileStatus) SetConditions(conditions []metav1.Condition) {
 	s.Conditions = conditions
 }
 
+func (s *AIMProfileStatus) SetObservedGeneration(generation int64) {
+	s.ObservedGeneration = generation
+}
+
 func (s *AIMProfileStatus) SetStatus(status string) {
 	s.Status = sanitizeAIMStatus(status)
 }
@@ -404,10 +448,11 @@ const (
 	AIMProfileConditionDeployable = "Deployable"
 
 	// AIMProfileConditionRuntimeProjected reflects the eager runtime projection:
-	// True when a runtime is projected for this profile, False (RuntimeDegraded)
-	// when the projection gate later flips but the existing runtime is kept
-	// rather than deleted. Not a "*Ready" component condition, so it is
-	// informational and does not gate the aggregated Ready status.
+	// True when a runtime is projected for this profile; False when runtime
+	// construction fails, or when the projection gate later flips but the
+	// existing runtime is kept rather than deleted. Not a "*Ready" component
+	// condition, so it is informational; construction failures separately feed
+	// component health and do gate the aggregated Ready status.
 	AIMProfileConditionRuntimeProjected = "RuntimeProjected"
 )
 
@@ -435,4 +480,8 @@ const (
 	// satisfied (e.g. matching nodes vanished) but a previously-projected runtime
 	// is kept rather than deleted (asymmetric teardown).
 	AIMProfileReasonRuntimeDegraded = "RuntimeDegraded"
+
+	// AIMProfileReasonRuntimeProjectionFailed indicates the profile passed the
+	// projection gates but its runtime configuration could not be rendered.
+	AIMProfileReasonRuntimeProjectionFailed = "RuntimeProjectionFailed"
 )

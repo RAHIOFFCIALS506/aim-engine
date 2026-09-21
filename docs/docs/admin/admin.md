@@ -13,6 +13,10 @@ Operate and maintain an AIM Engine installation.
 - [GPU Management](gpu-management.md) — GPU allocation, node selectors, topology
 - [Storage Configuration](storage-configuration.md) — PVCs, shared storage for caching
 - [Upgrading](upgrading.md) — Version migration and CRD upgrades
+- [Bounded v1alpha1 Template Migration](template-migration.md) — Review, dry-run, commit, and manually recover the local Plan/Apply utility
 - [Monitoring](monitoring.md) — Metrics, observability, log formats
 - [Troubleshooting](troubleshooting.md) — Common issues and diagnostic steps
 - [Security](security.md) — RBAC, network policies, secrets management
+- [Envoy Gateway Scale-from-Zero](envoy-gateway-scale-from-zero.md) — Optionally enable Envoy-backed activation from zero replicas
+- [Migrate from kgateway to Envoy Gateway](migrating-kgateway-to-envoy-gateway.md) — Move routing and scale-from-zero activation between providers
+- [kgateway Setup](kgateway-setup.md) — Configure kgateway routing and scale-from-zero metrics

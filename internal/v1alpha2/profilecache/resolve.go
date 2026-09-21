@@ -28,17 +28,44 @@ package profilecache
 
 import (
 	"context"
+	"fmt"
+	"sort"
 
+	"k8s.io/apimachinery/pkg/api/meta"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	aimv1alpha1 "github.com/amd-enterprise-ai/aim-engine/api/v1alpha1"
 	aimv1alpha2 "github.com/amd-enterprise-ai/aim-engine/api/v1alpha2"
 	"github.com/amd-enterprise-ai/aim-engine/internal/constants"
+	controllerutils "github.com/amd-enterprise-ai/aim-engine/internal/controller/utils"
+	"github.com/amd-enterprise-ai/aim-engine/internal/utils"
 )
+
+// StatusStaleError reports that a matching cache exists, but its status has not
+// caught up to the current spec generation. Callers should preserve their last
+// known-good projection and retry rather than treating this convergence state
+// as an infrastructure failure or as proof that no cache exists.
+type StatusStaleError struct {
+	Namespace          string
+	Name               string
+	Generation         int64
+	ObservedGeneration int64
+}
+
+func (e *StatusStaleError) Error() string {
+	return fmt.Sprintf(
+		"AIMProfileCache %s/%s status has not observed metadata generation %d (observedGeneration=%d)",
+		e.Namespace,
+		e.Name,
+		e.Generation,
+		e.ObservedGeneration,
+	)
+}
 
 // FindReadyShared returns a Ready, profile-owned (Shared) AIMProfileCache in
 // namespace that caches the profile named profileName at the given scope, or nil
-// when none exists.
+// when none exists. It returns an error instead of nil when a matching cache's
+// readiness is unknown, preventing callers from treating an outage as no cache.
 //
 // This is the single cache-resolution used by BOTH runtime-projection paths: the
 // eager profile reconciler (which mounts the cache on the per-profile / model-slug
@@ -73,27 +100,117 @@ func FindReadyShared(
 	if err := c.List(ctx, &caches, client.InNamespace(namespace)); err != nil {
 		return nil, err
 	}
-	wantScope := normalizeScope(scope)
+
+	var ready *aimv1alpha2.AIMProfileCache
+	var unknown *aimv1alpha2.AIMProfileCache
+	var stale *aimv1alpha2.AIMProfileCache
 	for i := range caches.Items {
 		cache := &caches.Items[i]
-		if cache.Spec.ProfileName != profileName {
+		if !matchesShared(cache, profileName, scope) {
 			continue
 		}
-		if normalizeScope(cache.Spec.ProfileScope) != wantScope {
+		if !cacheStatusCurrent(cache) {
+			if stale == nil || cache.Name < stale.Name {
+				stale = cache
+			}
 			continue
 		}
+		if cacheReadinessUnknown(cache) {
+			if unknown == nil || cache.Name < unknown.Name {
+				unknown = cache
+			}
+			continue
+		}
+		if cache.Status.Status == constants.AIMStatusReady &&
+			(ready == nil || cache.Name < ready.Name) {
+			ready = cache
+		}
+	}
+	if ready != nil {
+		return ready, nil
+	}
+	if unknown != nil {
+		return nil, fmt.Errorf(
+			"AIMProfileCache %s/%s readiness is unknown because reconciliation has an active error condition",
+			unknown.Namespace,
+			unknown.Name,
+		)
+	}
+	if stale != nil {
+		return nil, &StatusStaleError{
+			Namespace:          stale.Namespace,
+			Name:               stale.Name,
+			Generation:         stale.Generation,
+			ObservedGeneration: stale.Status.ObservedGeneration,
+		}
+	}
+	return nil, nil
+}
+
+func matchesShared(
+	cache *aimv1alpha2.AIMProfileCache,
+	profileName string,
+	scope aimv1alpha1.AIMResolutionScope,
+) bool {
+	if cache.Spec.ProfileName != profileName {
+		return false
+	}
+	if normalizeScope(cache.Spec.ProfileScope) != normalizeScope(scope) {
+		return false
+	}
+	return cache.Spec.Mode == aimv1alpha2.ProfileCacheModeShared
+}
+
+func cacheReadinessUnknown(cache *aimv1alpha2.AIMProfileCache) bool {
+	for _, conditionType := range []string{
+		controllerutils.ConditionTypeDependenciesReachable,
+		controllerutils.ConditionTypeAuthValid,
+		controllerutils.ConditionTypeConfigValid,
+	} {
+		if meta.IsStatusConditionFalse(cache.Status.Conditions, conditionType) {
+			return true
+		}
+	}
+	return false
+}
+
+func cacheStatusCurrent(cache *aimv1alpha2.AIMProfileCache) bool {
+	return cache.Status.ObservedGeneration == cache.Generation
+}
+
+// SelectBestShared returns the healthiest Shared cache matching the profile and
+// scope whose status describes its current spec generation. Equal-health
+// candidates are ordered by name before selection so every projection producer
+// and consumer chooses the same cache independently of API list order.
+func SelectBestShared(
+	caches []aimv1alpha2.AIMProfileCache,
+	profileName string,
+	scope aimv1alpha1.AIMResolutionScope,
+) *aimv1alpha2.AIMProfileCache {
+	if profileName == "" {
+		return nil
+	}
+
+	matching := make([]aimv1alpha2.AIMProfileCache, 0, len(caches))
+	for i := range caches {
+		cache := caches[i]
 		// Only a profile-owned (Shared) cache belongs on the shared runtime. A
 		// service-owned (Dedicated) cache is overlaid on its own consuming ISVC
 		// instead, so mounting it here too would duplicate the volume.
-		if cache.Spec.Mode != aimv1alpha2.ProfileCacheModeShared {
+		if !matchesShared(&cache, profileName, scope) {
 			continue
 		}
-		if cache.Status.Status != constants.AIMStatusReady {
+		if !cacheStatusCurrent(&cache) {
 			continue
 		}
-		return cache, nil
+		matching = append(matching, cache)
 	}
-	return nil, nil
+	sort.Slice(matching, func(i, j int) bool {
+		return matching[i].Name < matching[j].Name
+	})
+	return utils.SelectBestPtr(matching, func(cache *aimv1alpha2.AIMProfileCache) constants.AIMStatus {
+		return cache.Status.GetAIMStatus()
+	})
 }
 
 // normalizeScope treats an empty scope as Namespace, matching the AIMService

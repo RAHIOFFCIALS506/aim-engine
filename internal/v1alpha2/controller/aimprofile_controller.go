@@ -80,6 +80,7 @@ type AIMProfileReconciler struct {
 // +kubebuilder:rbac:groups=aim.eai.amd.com,resources=aimprofilecaches,verbs=get;list;watch
 // +kubebuilder:rbac:groups=serving.kserve.io,resources=servingruntimes,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=nodes,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 
 func (r *AIMProfileReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -162,16 +163,58 @@ func (r *AIMProfileReconciler) SetupWithManager(mgr ctrl.Manager) error {
 			},
 			"failed to list AIMProfiles for Node event",
 			func(profile *aimv1alpha2.AIMProfile) bool {
-				return aimprofile.HasAcceleratorRequirement(profile.Spec.AcceleratorModel, profile.Spec.AcceleratorCount, profile.Spec.Resources)
+				return aimprofile.HasProfileAcceleratorRequirement(profile.Spec.AIMProfileSpecCommon)
 			},
 		)
 	})
 
+	// A model-slug runtime is elected across every primary profile sharing an
+	// aimId. Reconcile the peers when one candidate changes or is deleted so a
+	// rank/status transition immediately converges on the new winner. The
+	// primary For watch already enqueues the changed profile itself; this map
+	// intentionally returns only its peers.
+	modelSlugElectionHandler := handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []reconcile.Request {
+		if !r.ProjectionMode.ProjectsModelSlug() {
+			return nil
+		}
+		profile, ok := obj.(*aimv1alpha2.AIMProfile)
+		if !ok || profile.Spec.AimId == "" {
+			return nil
+		}
+
+		var peers aimv1alpha2.AIMProfileList
+		if err := r.List(
+			ctx,
+			&peers,
+			client.InNamespace(profile.Namespace),
+			client.MatchingFields{aimv1alpha2.ProfileAimIdIndexKey: profile.Spec.AimId},
+		); err != nil {
+			ctrl.LoggerFrom(ctx).Error(err, "failed to list AIMProfile peers for runtime projection election",
+				"namespace", profile.Namespace, "aimId", profile.Spec.AimId)
+			return nil
+		}
+
+		requests := make([]reconcile.Request, 0, len(peers.Items))
+		for i := range peers.Items {
+			peer := &peers.Items[i]
+			if peer.Name == profile.Name {
+				continue
+			}
+			requests = append(requests, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(peer)})
+		}
+		return requests
+	})
+
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&aimv1alpha2.AIMProfile{}).
-		// Own the projected ServingRuntime so drift (hand-edits) and
-		// node-inventory changes (via the Node watch) self-heal through reconcile.
+		// Re-elect the model-slug owner when a same-model candidate changes or
+		// disappears. This same-kind secondary watch fans the event out to peers.
+		Watches(&aimv1alpha2.AIMProfile{}, modelSlugElectionHandler).
+		// Own both siblings of the eager projection so deleting or editing either
+		// the ServingRuntime or its colocated ConfigMap re-enqueues the profile
+		// and authoritatively restores the complete pair.
 		Owns(&kservev1alpha1.ServingRuntime{}).
+		Owns(&corev1.ConfigMap{}).
 		Watches(&corev1.Node{}, nodeHandler, builder.WithPredicates(utils.NodeGPUChangePredicate())).
 		// Re-project when the profile's cache reaches Ready (or its artifacts
 		// change), so the eager per-profile / model-slug runtime gains the cache

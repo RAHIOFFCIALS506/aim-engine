@@ -33,6 +33,7 @@ import (
 	"github.com/amd-enterprise-ai/aim-engine/internal/constants"
 	"github.com/amd-enterprise-ai/aim-engine/internal/utils"
 	"github.com/amd-enterprise-ai/aim-engine/internal/v1alpha2/aimprofile"
+	"github.com/amd-enterprise-ai/aim-engine/internal/v1alpha2/profileyaml"
 )
 
 // AnnotationOverlayService records the AIMService that owns a service overlay
@@ -57,7 +58,13 @@ func hasProfileOverrides(o *aimv1alpha1.AIMServiceProfileOverrides) bool {
 	if len(o.ModelSources) > 0 {
 		return true
 	}
+	if len(o.Features) > 0 {
+		return true
+	}
 	if o.AcceleratorModel != "" {
+		return true
+	}
+	if o.AcceleratorVendor != "" {
 		return true
 	}
 	if o.AcceleratorCount != nil {
@@ -78,6 +85,14 @@ func hasProfileOverrides(o *aimv1alpha1.AIMServiceProfileOverrides) bool {
 	return false
 }
 
+// needsServiceOverlay is the single decision used by both fetch and compose.
+// Keeping it shared is important: if ComposeState can plan an overlay that
+// FetchRemoteState never observes, the overlay remains perpetually "not ready"
+// and the service never advances to its profile cache or InferenceService.
+func needsServiceOverlay(service *aimv1alpha1.AIMService) bool {
+	return hasProfileOverrides(service.Spec.ProfileOverrides)
+}
+
 // asProfileOverrides reshapes the service-level override block onto the shared
 // aimv1alpha1.ProfileOverrides type that aimprofile.ApplyProfileCopyOverrides
 // expects. The two types intentionally have the same field set; this is a
@@ -89,7 +104,9 @@ func asProfileOverrides(o *aimv1alpha1.AIMServiceProfileOverrides) *aimv1alpha1.
 	}
 	return &aimv1alpha1.ProfileOverrides{
 		ModelSources:                o.ModelSources,
+		Features:                    o.Features,
 		AcceleratorModel:            o.AcceleratorModel,
+		AcceleratorVendor:           o.AcceleratorVendor,
 		AcceleratorCount:            o.AcceleratorCount,
 		AcceleratorPartitioningMode: o.AcceleratorPartitioningMode,
 		ContainerEnv:                o.ContainerEnv,
@@ -159,6 +176,11 @@ func buildServiceOverlayProfile(
 	overlaySpec.ImagePullSecrets = inheritedOverlayPullSecrets(*obs.resolvedProfileSpec)
 	overlaySpec.ServiceAccountName = inheritedOverlayServiceAccount(*obs.resolvedProfileSpec)
 
+	yamlContract, err := seedProfileYAMLContract(obs)
+	if err != nil {
+		return nil, aimv1alpha2.AIMProfileSpecCommon{}, err
+	}
+
 	overlay := &aimv1alpha2.AIMProfile{
 		TypeMeta: metav1.TypeMeta{
 			APIVersion: aimv1alpha2.GroupVersion.String(),
@@ -167,9 +189,9 @@ func buildServiceOverlayProfile(
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      overlayName,
 			Namespace: service.Namespace,
-			Annotations: map[string]string{
+			Annotations: profileyaml.Mark(map[string]string{
 				AnnotationOverlayService: service.Name,
-			},
+			}, yamlContract),
 		},
 		Spec: aimv1alpha2.AIMProfileSpec{
 			AIMProfileSpecCommon: overlaySpec,
@@ -203,6 +225,43 @@ func buildServiceOverlayProfile(
 	)
 
 	return overlay, overlaySpec, nil
+}
+
+func seedProfileYAMLContract(obs ServiceObservation) (profileyaml.Contract, error) {
+	switch {
+	case obs.profile.OK() && obs.profile.Value != nil:
+		spec := obs.profile.Value.Spec.AIMProfileSpecCommon
+		contract, err := profileyaml.ForProfile(
+			obs.profile.Value.Annotations,
+			profileyaml.EffectiveOrigin(obs.profile.Value.Labels, obs.profile.Value.Status.Origin),
+			&spec,
+		)
+		if err != nil {
+			return profileyaml.Contract{}, fmt.Errorf(
+				"parse profile YAML contract on seed AIMProfile %q: %w",
+				obs.profile.Value.Name,
+				err,
+			)
+		}
+		return contract, nil
+	case obs.clusterProfile.OK() && obs.clusterProfile.Value != nil:
+		spec := obs.clusterProfile.Value.Spec.AIMProfileSpecCommon
+		contract, err := profileyaml.ForProfile(
+			obs.clusterProfile.Value.Annotations,
+			profileyaml.EffectiveOrigin(obs.clusterProfile.Value.Labels, obs.clusterProfile.Value.Status.Origin),
+			&spec,
+		)
+		if err != nil {
+			return profileyaml.Contract{}, fmt.Errorf(
+				"parse profile YAML contract on seed AIMClusterProfile %q: %w",
+				obs.clusterProfile.Value.Name,
+				err,
+			)
+		}
+		return contract, nil
+	default:
+		return profileyaml.CanonicalContract(obs.resolvedProfileSpec), nil
+	}
 }
 
 func inheritedOverlayPullSecrets(seed aimv1alpha2.AIMProfileSpecCommon) []corev1.LocalObjectReference {

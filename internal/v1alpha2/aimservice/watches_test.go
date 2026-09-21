@@ -39,6 +39,7 @@ import (
 	aimv1alpha1 "github.com/amd-enterprise-ai/aim-engine/api/v1alpha1"
 	aimv1alpha2 "github.com/amd-enterprise-ai/aim-engine/api/v1alpha2"
 	"github.com/amd-enterprise-ai/aim-engine/internal/constants"
+	"github.com/amd-enterprise-ai/aim-engine/internal/v1alpha2/profileyaml"
 )
 
 // TestProfileRelevantChangePredicate_StatusTransition is the baseline case:
@@ -159,6 +160,36 @@ func TestProfileRelevantChangePredicate_ProvenanceLabelsFire(t *testing.T) {
 	}
 }
 
+func TestProfileRelevantChangePredicate_YAMLContractAnnotationChange(t *testing.T) {
+	pred := profileRelevantChangePredicate()
+
+	base := &aimv1alpha2.AIMProfile{
+		ObjectMeta: metav1.ObjectMeta{Name: "p", Namespace: "ns"},
+		Status:     aimv1alpha2.AIMProfileStatus{Status: constants.AIMStatusReady},
+	}
+	backfilled := base.DeepCopy()
+	backfilled.Annotations = map[string]string{
+		profileyaml.AnnotationContract: profileyaml.DefaultContract().Encode(),
+	}
+	corrected := backfilled.DeepCopy()
+	corrected.Annotations[profileyaml.AnnotationContract] = `{"codec":"aim-profile/v1","metadataFields":["engine","gpu","gpu_count","metric","precision","type"]}`
+
+	for _, tc := range []struct {
+		name string
+		old  *aimv1alpha2.AIMProfile
+		new  *aimv1alpha2.AIMProfile
+	}{
+		{name: "backfill", old: base, new: backfilled},
+		{name: "correction", old: backfilled, new: corrected},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if !pred.Update(event.UpdateEvent{ObjectOld: tc.old, ObjectNew: tc.new}) {
+				t.Fatal("expected profile YAML contract annotation change to fire the predicate")
+			}
+		})
+	}
+}
+
 // newWatchTestScheme builds a scheme with both AIM versions registered for
 // the watch fan-out tests.
 func newWatchTestScheme(t *testing.T) *runtime.Scheme {
@@ -180,38 +211,45 @@ func newWatchTestClient(t *testing.T, scheme *runtime.Scheme, objs ...client.Obj
 	return fakeclient.NewClientBuilder().
 		WithScheme(scheme).
 		WithObjects(objs...).
-		WithIndex(&aimv1alpha1.AIMService{}, aimv1alpha1.AIMServiceProfileIndexKey, func(obj client.Object) []string {
-			svc, ok := obj.(*aimv1alpha1.AIMService)
+		WithIndex(&aimv1alpha2.AIMService{}, aimv1alpha1.AIMServiceProfileIndexKey, func(obj client.Object) []string {
+			svc, ok := obj.(*aimv1alpha2.AIMService)
 			if !ok || svc.Spec.Profile == nil || svc.Spec.Profile.Name == "" {
 				return nil
 			}
 			return []string{svc.Spec.Profile.Name}
 		}).
-		WithIndex(&aimv1alpha1.AIMService{}, ServiceModelNameIndex, func(obj client.Object) []string {
-			svc, ok := obj.(*aimv1alpha1.AIMService)
+		WithIndex(&aimv1alpha2.AIMService{}, ServiceModelNameIndex, func(obj client.Object) []string {
+			svc, ok := obj.(*aimv1alpha2.AIMService)
 			if !ok || svc.Spec.Model == nil || svc.Spec.Model.Name == nil || *svc.Spec.Model.Name == "" {
 				return nil
 			}
 			return []string{*svc.Spec.Model.Name}
 		}).
-		WithIndex(&aimv1alpha1.AIMService{}, ServiceSelectorModelRefIndex, func(obj client.Object) []string {
-			svc, ok := obj.(*aimv1alpha1.AIMService)
+		WithIndex(&aimv1alpha2.AIMService{}, ServiceSelectorModelRefIndex, func(obj client.Object) []string {
+			svc, ok := obj.(*aimv1alpha2.AIMService)
 			if !ok || svc.Spec.Profile == nil || svc.Spec.Profile.Selector == nil ||
 				svc.Spec.Profile.Selector.ModelRef == nil || svc.Spec.Profile.Selector.ModelRef.Name == "" {
 				return nil
 			}
 			return []string{svc.Spec.Profile.Selector.ModelRef.Name}
 		}).
-		WithIndex(&aimv1alpha1.AIMService{}, ServiceSelectorAimIdIndex, func(obj client.Object) []string {
-			svc, ok := obj.(*aimv1alpha1.AIMService)
+		WithIndex(&aimv1alpha2.AIMService{}, ServiceSelectorAimIdIndex, func(obj client.Object) []string {
+			svc, ok := obj.(*aimv1alpha2.AIMService)
 			if !ok || svc.Spec.Profile == nil || svc.Spec.Profile.Selector == nil ||
 				svc.Spec.Profile.Selector.AimId == "" {
 				return nil
 			}
 			return []string{svc.Spec.Profile.Selector.AimId}
 		}).
-		WithIndex(&aimv1alpha1.AIMService{}, aimv1alpha1.AIMServiceAdapterArtifactIndexKey, func(obj client.Object) []string {
-			svc, ok := obj.(*aimv1alpha1.AIMService)
+		WithIndex(&aimv1alpha2.AIMService{}, ServiceResourceNodeMatchIndex, func(obj client.Object) []string {
+			svc, ok := obj.(*aimv1alpha2.AIMService)
+			if !ok || svc.Spec.Resources == nil || !usesProfilePipeline(svc) {
+				return nil
+			}
+			return []string{serviceResourceNodeMatchIndexValue}
+		}).
+		WithIndex(&aimv1alpha2.AIMService{}, aimv1alpha1.AIMServiceAdapterArtifactIndexKey, func(obj client.Object) []string {
+			svc, ok := obj.(*aimv1alpha2.AIMService)
 			if !ok {
 				return nil
 			}
@@ -240,6 +278,156 @@ func newWatchTestClient(t *testing.T, scheme *runtime.Scheme, objs ...client.Obj
 		Build()
 }
 
+func TestServiceResourceNodeChangePredicate(t *testing.T) {
+	pred := serviceResourceNodeChangePredicate()
+	base := &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "node",
+			Labels: map[string]string{
+				"feature.node.kubernetes.io/aim-accelerator.MI300X": "1",
+				"kubernetes.io/hostname":                            "node",
+			},
+		},
+		Status: corev1.NodeStatus{
+			Allocatable: corev1.ResourceList{
+				corev1.ResourceCPU:    resource.MustParse("8"),
+				corev1.ResourceMemory: resource.MustParse("24Gi"),
+			},
+		},
+	}
+
+	if !pred.Create(event.CreateEvent{Object: base}) {
+		t.Fatal("Node creation must trigger service resource matching")
+	}
+	if !pred.Delete(event.DeleteEvent{Object: base}) {
+		t.Fatal("Node deletion must trigger service resource matching")
+	}
+
+	t.Run("accelerator label change", func(t *testing.T) {
+		updated := base.DeepCopy()
+		updated.Labels["feature.node.kubernetes.io/aim-accelerator.MI300X"] = "2"
+		if !pred.Update(event.UpdateEvent{ObjectOld: base, ObjectNew: updated}) {
+			t.Fatal("accelerator label change must trigger")
+		}
+	})
+
+	t.Run("memory allocatable change", func(t *testing.T) {
+		updated := base.DeepCopy()
+		updated.Status.Allocatable[corev1.ResourceMemory] = resource.MustParse("32Gi")
+		if !pred.Update(event.UpdateEvent{ObjectOld: base, ObjectNew: updated}) {
+			t.Fatal("allocatable resource change must trigger")
+		}
+	})
+
+	t.Run("unrelated label change", func(t *testing.T) {
+		updated := base.DeepCopy()
+		updated.Labels["kubernetes.io/hostname"] = "renamed"
+		if pred.Update(event.UpdateEvent{ObjectOld: base, ObjectNew: updated}) {
+			t.Fatal("unrelated label change must be filtered")
+		}
+	})
+}
+
+func TestFindServicesForResourceNodeChange(t *testing.T) {
+	scheme := newWatchTestScheme(t)
+	resources := &corev1.ResourceRequirements{
+		Requests: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("16Gi")},
+	}
+
+	profileService := &aimv1alpha2.AIMService{
+		ObjectMeta: metav1.ObjectMeta{Name: "profile", Namespace: "alpha"},
+		Spec: aimv1alpha1.AIMServiceSpec{
+			Profile:   &aimv1alpha1.AIMServiceProfileConfig{Name: "p"},
+			Resources: resources,
+		},
+	}
+	forcedProfileService := &aimv1alpha2.AIMService{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "forced-profile",
+			Namespace: "beta",
+			Annotations: map[string]string{
+				constants.AnnotationReconcilerPipeline: constants.ReconcilerPipelineProfile,
+			},
+		},
+		Spec: aimv1alpha1.AIMServiceSpec{
+			Model:     &aimv1alpha1.AIMServiceModel{Name: ptr.To("model")},
+			Resources: resources,
+		},
+	}
+	noOverride := &aimv1alpha2.AIMService{
+		ObjectMeta: metav1.ObjectMeta{Name: "no-override", Namespace: "alpha"},
+		Spec: aimv1alpha1.AIMServiceSpec{
+			Profile: &aimv1alpha1.AIMServiceProfileConfig{Name: "p"},
+		},
+	}
+	templateService := &aimv1alpha2.AIMService{
+		ObjectMeta: metav1.ObjectMeta{Name: "template", Namespace: "alpha"},
+		Spec: aimv1alpha1.AIMServiceSpec{
+			Template:  &aimv1alpha1.AIMServiceTemplateConfig{Name: "template"},
+			Resources: resources,
+		},
+	}
+	forcedTemplateService := &aimv1alpha2.AIMService{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "forced-template",
+			Namespace: "alpha",
+			Annotations: map[string]string{
+				constants.AnnotationReconcilerPipeline: constants.ReconcilerPipelineTemplate,
+			},
+		},
+		Spec: aimv1alpha1.AIMServiceSpec{
+			Model:     &aimv1alpha1.AIMServiceModel{Name: ptr.To("model")},
+			Profile:   &aimv1alpha1.AIMServiceProfileConfig{Name: "p"},
+			Resources: resources,
+		},
+	}
+	grandfatheredProfileService := &aimv1alpha2.AIMService{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "grandfathered-profile",
+			Namespace: "alpha",
+			Annotations: map[string]string{
+				constants.AnnotationReconcilerPipeline: "historical",
+			},
+		},
+		Spec: aimv1alpha1.AIMServiceSpec{
+			Profile:   &aimv1alpha1.AIMServiceProfileConfig{Name: "p"},
+			Resources: resources,
+		},
+	}
+
+	c := newWatchTestClient(
+		t,
+		scheme,
+		profileService,
+		forcedProfileService,
+		noOverride,
+		templateService,
+		forcedTemplateService,
+		grandfatheredProfileService,
+	)
+	requests := findServicesForResourceNodeChange(c)(
+		context.Background(),
+		&corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node"}},
+	)
+
+	got := map[types.NamespacedName]struct{}{}
+	for _, request := range requests {
+		got[request.NamespacedName] = struct{}{}
+	}
+	for _, want := range []types.NamespacedName{
+		{Name: "profile", Namespace: "alpha"},
+		{Name: "forced-profile", Namespace: "beta"},
+		{Name: "grandfathered-profile", Namespace: "alpha"},
+	} {
+		if _, exists := got[want]; !exists {
+			t.Errorf("missing Node-event enqueue for %s", want)
+		}
+	}
+	if len(got) != 3 {
+		t.Fatalf("Node event enqueued unexpected services: %#v", got)
+	}
+}
+
 // TestFindServicesForProfile_FansOutByNameModelAndAimId exercises the three
 // lookup paths a single AIMProfile event takes:
 //  1. profile name (services authored as spec.profile.name=foo)
@@ -252,19 +440,25 @@ func newWatchTestClient(t *testing.T, scheme *runtime.Scheme, objs ...client.Obj
 func TestFindServicesForProfile_FansOutByNameModelAndAimId(t *testing.T) {
 	scheme := newWatchTestScheme(t)
 
-	byName := &aimv1alpha1.AIMService{
+	byName := &aimv1alpha2.AIMService{
 		ObjectMeta: metav1.ObjectMeta{Name: "svc-by-name", Namespace: "ns"},
 		Spec: aimv1alpha1.AIMServiceSpec{
 			Profile: &aimv1alpha1.AIMServiceProfileConfig{Name: "p"},
 		},
 	}
-	byModelShortcut := &aimv1alpha1.AIMService{
-		ObjectMeta: metav1.ObjectMeta{Name: "svc-by-model", Namespace: "ns"},
+	byModelShortcut := &aimv1alpha2.AIMService{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "svc-by-model",
+			Namespace: "ns",
+			Annotations: map[string]string{
+				constants.AnnotationReconcilerPipeline: constants.ReconcilerPipelineProfile,
+			},
+		},
 		Spec: aimv1alpha1.AIMServiceSpec{
 			Model: &aimv1alpha1.AIMServiceModel{Name: ptr.To("source-model")},
 		},
 	}
-	bySelectorModelRef := &aimv1alpha1.AIMService{
+	bySelectorModelRef := &aimv1alpha2.AIMService{
 		ObjectMeta: metav1.ObjectMeta{Name: "svc-by-modelref", Namespace: "ns"},
 		Spec: aimv1alpha1.AIMServiceSpec{
 			Profile: &aimv1alpha1.AIMServiceProfileConfig{
@@ -274,7 +468,7 @@ func TestFindServicesForProfile_FansOutByNameModelAndAimId(t *testing.T) {
 			},
 		},
 	}
-	bySelectorAimId := &aimv1alpha1.AIMService{
+	bySelectorAimId := &aimv1alpha2.AIMService{
 		ObjectMeta: metav1.ObjectMeta{Name: "svc-by-aimid", Namespace: "ns"},
 		Spec: aimv1alpha1.AIMServiceSpec{
 			Profile: &aimv1alpha1.AIMServiceProfileConfig{
@@ -284,7 +478,7 @@ func TestFindServicesForProfile_FansOutByNameModelAndAimId(t *testing.T) {
 	}
 	// Service in a different namespace must NOT be enqueued — namespace
 	// AIMProfile events fan out within the namespace only.
-	otherNamespace := &aimv1alpha1.AIMService{
+	otherNamespace := &aimv1alpha2.AIMService{
 		ObjectMeta: metav1.ObjectMeta{Name: "svc-other-ns", Namespace: "other"},
 		Spec: aimv1alpha1.AIMServiceSpec{
 			Profile: &aimv1alpha1.AIMServiceProfileConfig{Name: "p"},
@@ -334,13 +528,13 @@ func TestFindServicesForProfile_FansOutByNameModelAndAimId(t *testing.T) {
 func TestFindServicesForClusterProfile_SpansAllNamespaces(t *testing.T) {
 	scheme := newWatchTestScheme(t)
 
-	nsAlpha := &aimv1alpha1.AIMService{
+	nsAlpha := &aimv1alpha2.AIMService{
 		ObjectMeta: metav1.ObjectMeta{Name: "svc-alpha", Namespace: "alpha"},
 		Spec: aimv1alpha1.AIMServiceSpec{
 			Profile: &aimv1alpha1.AIMServiceProfileConfig{Name: "cluster-p"},
 		},
 	}
-	nsBeta := &aimv1alpha1.AIMService{
+	nsBeta := &aimv1alpha2.AIMService{
 		ObjectMeta: metav1.ObjectMeta{Name: "svc-beta", Namespace: "beta"},
 		Spec: aimv1alpha1.AIMServiceSpec{
 			Profile: &aimv1alpha1.AIMServiceProfileConfig{Name: "cluster-p"},
@@ -370,13 +564,19 @@ func TestFindServicesForClusterProfile_SpansAllNamespaces(t *testing.T) {
 func TestFindServicesForModel_FansOutByShortcutAndSelector(t *testing.T) {
 	scheme := newWatchTestScheme(t)
 
-	byShortcut := &aimv1alpha1.AIMService{
-		ObjectMeta: metav1.ObjectMeta{Name: "svc-shortcut", Namespace: "ns"},
+	byShortcut := &aimv1alpha2.AIMService{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "svc-shortcut",
+			Namespace: "ns",
+			Annotations: map[string]string{
+				constants.AnnotationReconcilerPipeline: constants.ReconcilerPipelineProfile,
+			},
+		},
 		Spec: aimv1alpha1.AIMServiceSpec{
 			Model: &aimv1alpha1.AIMServiceModel{Name: ptr.To("my-model")},
 		},
 	}
-	byExplicit := &aimv1alpha1.AIMService{
+	byExplicit := &aimv1alpha2.AIMService{
 		ObjectMeta: metav1.ObjectMeta{Name: "svc-explicit", Namespace: "ns"},
 		Spec: aimv1alpha1.AIMServiceSpec{
 			Profile: &aimv1alpha1.AIMServiceProfileConfig{
@@ -386,13 +586,19 @@ func TestFindServicesForModel_FansOutByShortcutAndSelector(t *testing.T) {
 			},
 		},
 	}
-	unrelated := &aimv1alpha1.AIMService{
+	unrelated := &aimv1alpha2.AIMService{
 		ObjectMeta: metav1.ObjectMeta{Name: "svc-unrelated", Namespace: "ns"},
 		Spec: aimv1alpha1.AIMServiceSpec{
 			Model: &aimv1alpha1.AIMServiceModel{Name: ptr.To("other-model")},
 		},
 	}
-	c := newWatchTestClient(t, scheme, byShortcut, byExplicit, unrelated)
+	inactiveTemplate := &aimv1alpha2.AIMService{
+		ObjectMeta: metav1.ObjectMeta{Name: "svc-template", Namespace: "ns"},
+		Spec: aimv1alpha1.AIMServiceSpec{
+			Model: &aimv1alpha1.AIMServiceModel{Name: ptr.To("my-model")},
+		},
+	}
+	c := newWatchTestClient(t, scheme, byShortcut, byExplicit, unrelated, inactiveTemplate)
 
 	model := &aimv1alpha2.AIMModel{
 		ObjectMeta: metav1.ObjectMeta{Name: "my-model", Namespace: "ns"},
@@ -412,13 +618,16 @@ func TestFindServicesForModel_FansOutByShortcutAndSelector(t *testing.T) {
 	if _, ok := got["svc-unrelated"]; ok {
 		t.Errorf("unrelated service must not be enqueued")
 	}
+	if _, ok := got["svc-template"]; ok {
+		t.Errorf("profile watch must not enqueue a template-pipeline service")
+	}
 }
 
 func TestFindServicesForAdapterArtifact_FansOutByExactAndLogicalCompatibility(t *testing.T) {
 	scheme := newWatchTestScheme(t)
 
-	serviceFor := func(name, adapterName, namespace string) *aimv1alpha1.AIMService {
-		return &aimv1alpha1.AIMService{
+	serviceFor := func(name, adapterName, namespace string) *aimv1alpha2.AIMService {
+		return &aimv1alpha2.AIMService{
 			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace},
 			Spec: aimv1alpha1.AIMServiceSpec{
 				Adapters: []aimv1alpha1.AIMServiceAdapterReference{{
@@ -492,4 +701,45 @@ func TestFindServicesForAdapterArtifact_FansOutByExactAndLogicalCompatibility(t 
 			t.Errorf("unexpected enqueue for %s", notWanted)
 		}
 	}
+}
+
+// TestAdapterArtifactRelevantChangePredicate_RankChange covers the gap that let
+// a mutable spec.rank edit go unnoticed: rank feeds the resolved
+// AIM_ADAPTER_MAX_RANK for static services, so a change must enqueue consumers
+// rather than waiting for an unrelated event to requeue them.
+func TestAdapterArtifactRelevantChangePredicate_RankChange(t *testing.T) {
+	pred := adapterArtifactRelevantChangePredicate()
+
+	oldA := &aimv1alpha1.AIMArtifact{
+		ObjectMeta: metav1.ObjectMeta{Name: "lora-a", Namespace: "ns"},
+		Spec: aimv1alpha1.AIMArtifactSpec{
+			Type: aimv1alpha1.ArtifactTypeAdapter,
+			Rank: ptr.To[int32](16),
+		},
+	}
+
+	t.Run("rank raised", func(t *testing.T) {
+		newA := oldA.DeepCopy()
+		newA.Spec.Rank = ptr.To[int32](64)
+		if !pred.Update(event.UpdateEvent{ObjectOld: oldA, ObjectNew: newA}) {
+			t.Error("expected a rank change to fire the predicate")
+		}
+	})
+
+	t.Run("rank cleared", func(t *testing.T) {
+		newA := oldA.DeepCopy()
+		newA.Spec.Rank = nil
+		if !pred.Update(event.UpdateEvent{ObjectOld: oldA, ObjectNew: newA}) {
+			t.Error("expected clearing rank to fire the predicate")
+		}
+	})
+
+	t.Run("rank unchanged is still filtered", func(t *testing.T) {
+		newA := oldA.DeepCopy()
+		newA.Spec.Rank = ptr.To[int32](16)
+		newA.ResourceVersion = "2"
+		if pred.Update(event.UpdateEvent{ObjectOld: oldA, ObjectNew: newA}) {
+			t.Error("an equal rank must not fire the predicate")
+		}
+	})
 }

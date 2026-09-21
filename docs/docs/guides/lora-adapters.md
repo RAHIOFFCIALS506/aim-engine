@@ -34,24 +34,63 @@ template pipeline through the `AIMTemplateCache`. On `v1alpha2`, adapters
 still require `spec.profile`.
 :::
 
+:::{admonition} The resolved profile must advertise adapter capability
+:class: warning
+
+`metadata.features` in the runtime profile YAML is what the image gates LoRA
+loading on. `spec.adapters` declares what the service should serve; the profile
+feature declares that the selected image can honour the adapter contract. AIM
+Engine does not infer image capability from service intent.
+
+Discovered adapter-capable profiles advertise `features: ["adapters"]`
+automatically. A legacy or custom profile whose image is known to support
+adapters can be asserted explicitly on a service-owned overlay:
+
+```yaml
+spec:
+  profile:
+    name: custom-qwen-profile
+  profileOverrides:
+    features:
+      - adapters
+  adapters:
+    - name: medical-lora
+      kind: AIMArtifact
+```
+
+Without either the profile feature or this explicit override, the service is
+rejected with `ConfigValid=False`. Feature overrides are additive: they cannot
+remove capabilities advertised by the source profile.
+:::
+
+:::{admonition} Image prerequisite
+:class: warning
+
+Serving adapters still requires an inference image that honours the
+`AIM_ADAPTER_*` container contract — **AIM images from 0.13 onwards**. Older
+images ignore the adapter env vars entirely: the disk is mounted and the bytes
+are staged, but no adapter is ever loaded. AIM Engine cannot inspect an image to
+verify this, so the container remains the final authority.
+:::
+
 :::{admonition} Minimal MVP scope
 :class: warning
 
 This release ships **reference-only** adapter support: adapters are plain
 references to existing `AIMArtifact` objects, and status reflects disk-side
-staging only (`Pending` / `Downloading` / `Downloaded`). The list is editable
+staging only (`Pending` / `Downloading` / `Downloaded` / `Failed`). The list is editable
 — adding an adapter stages it and the runtime hot-loads it. Removing an entry
-is reconciled: a controller-managed subtree-sync Job prunes the removed
-adapter's directory from the service subtree (the model-artifact reaper still
-reclaims the *whole* subtree when the service is deleted). Note the in-pod
-effect of a removal depends on the image running in dynamic mode (watcher);
+is reconciled: a controller-managed subtree-sync Job atomically moves the
+removed adapter's directory out of the service subtree, then deletes it (the
+model-artifact reaper retries any leftover cleanup and still reclaims the
+*whole* subtree when the service is deleted). Note the in-pod effect of a
+removal depends on the image running in dynamic mode (watcher);
 in static mode the bytes are removed from disk but the running pod keeps the
-adapter until restart. The controller already sets the `AIM_ADAPTER_*`
-container env (`AIM_ADAPTER_SOURCE`, `AIM_ADAPTER_MODE`, the `MAX_*` caps, and
-a dynamic-mode refresh interval), but the image honouring them (the in-pod
-watcher), inline self-healing (`sourceUri` on the service), engine-reported
-`Loaded` / `LoadRejected` states, dynamic namespace opt-in, and
-`AIMProfileCache → adapterDisk` auto-propagation are deferred.
+adapter until restart. The controller sets the `AIM_ADAPTER_*` container env
+(`AIM_ADAPTER_SOURCE`, `AIM_ADAPTER_MODE`, the `MAX_*` caps, and a dynamic-mode
+refresh interval), which images from 0.13 onwards honour. Inline self-healing
+(`sourceUri` on the service), engine-reported `Loaded` / `LoadRejected` states,
+and dynamic namespace opt-in are deferred.
 :::
 
 ## Concepts
@@ -61,6 +100,58 @@ watcher), inline self-healing (`sourceUri` on the service), engine-reported
 | `AIMArtifact` `type: model` with `adapterDisk` | The base model. Provisions **two** PVCs: the model cache PVC and a shared `ReadWriteMany` adapter disk. |
 | `AIMArtifact` `type: adapter` | A LoRA adapter using either logical compatibility (`spec.compatibleWith` model IDs) or an exact legacy binding (`spec.parentArtifact`). Defines `sourceUri`, its own `modelId`, and optional `rank`. |
 | `AIMService` `spec.adapters[]` | The list of adapters this service serves. Editable after creation; entries are pure references with unique `(kind, name)` pairs. |
+
+## Rank capacity
+
+The controller writes the resolved LoRA rank capacity to
+`AIM_ADAPTER_MAX_RANK`:
+
+- In `static` mode, the adapter set is immutable, so the controller infers the
+  value by rounding the largest declared `AIMArtifact.spec.rank` up to a
+  runtime-supported ceiling, recomputing it whenever those artifacts change —
+  including downwards. Ranks above `512` are rejected.
+- In `dynamic` mode, future adapters are unknown. The controller resolves a
+  startup ceiling from the service, namespace RuntimeConfig, cluster
+  RuntimeConfig, then the built-in default of `32`.
+
+```yaml
+spec:
+  adapterMode: dynamic
+  adapterRuntime:
+    maxRank: 64
+```
+
+`spec.adapterRuntime.maxRank` is only valid when `adapterMode` is `dynamic`.
+Static services infer their ceiling from the declared artifacts.
+
+The same default can be configured for a namespace or cluster:
+
+```yaml
+apiVersion: aim.eai.amd.com/v1alpha1
+kind: AIMRuntimeConfig
+metadata:
+  name: default
+spec:
+  adapterRuntime:
+    maxRank: 64
+```
+
+RuntimeConfig may carry this default for mixed service modes; static services
+ignore the inherited value.
+
+A dynamic adapter whose declared rank exceeds the resolved ceiling is rejected
+before staging. Changing the ceiling changes the inference container contract
+and rolls the serving workload. Increases take effect immediately. A decrease
+is deferred while any declared adapter artifact's rank is unresolved: the
+controller retains the previous higher ceiling until every rank can be checked
+against the lower value. An adapter artifact without a rank retains the
+compatibility default of `16`.
+
+The valid resolved startup ceiling is reported on `status.adapterMaxRank`. A
+rejected configuration leaves the last valid value in place. This field reports
+the controller's resolved container contract; it is not runtime-reported state.
+During a deferred dynamic decrease, it therefore continues to report the
+previous higher ceiling until rank resolution completes.
 
 ### Storage layout
 
@@ -73,6 +164,7 @@ service that serves adapters gets its own subtree keyed by the service UID:
     <adapter-path>/         # one directory per adapter
   .staging/                 # download scratch (PVC root, outside the pod mount)
   .aside/                   # pre-promote swap area
+  .unload-tmp/              # atomically removed adapters awaiting cleanup
 ```
 
 A per-`(service, adapter)` staging Job downloads the adapter into `.staging/`,
@@ -95,14 +187,15 @@ new disk. Staging Jobs run asynchronously and the runtime hot-loads each
 adapter as it lands. The controller sets `AIM_ADAPTER_SOURCE` to the mount path
 so the image finds the subtree.
 
-## MVP bootstrap contract
+## Storage and compatibility contract
 
-Because `AIMProfileCache → adapterDisk` propagation is deferred, the operator
-must satisfy the following before a service can serve adapters:
+Before a service can serve adapters:
 
-1. **Pre-create the base model artifact with `modelId` and `adapterDisk`.** A
-   service that declares adapters against a base without an adapter disk is gated with
-   `ParentLacksAdapterDisk`.
+1. **Configure RWX adapter storage.** An adapter-enabled profile cache
+   automatically requests an adapter disk on the base model artifact. Its size
+   and storage class resolve through `AIMRuntimeConfig.spec.storage` /
+   `AIMClusterRuntimeConfig.spec.storage` unless explicitly set on the artifact.
+   The storage class must support `ReadWriteMany`.
 2. **Use `Shared` caching and an exact `sourceUri` match.** The service resolves
    its parent base model by matching the resolved base model id against the
    cache's resolved artifacts — the `AIMProfileCache` on the profile pipeline,
@@ -124,7 +217,9 @@ of compatible base artifacts. Compatibility is evaluated only when an
 ## Worked example
 
 ```yaml
-# 1. Parent base model with an adapter disk (operator-created bootstrap).
+# 1. Optional pre-created parent base model with an adapter disk. Normally the
+#    adapter-enabled profile cache requests this disk automatically; it is shown
+#    explicitly so the example is standalone.
 apiVersion: aim.eai.amd.com/v1alpha1
 kind: AIMArtifact
 metadata:
@@ -165,7 +260,7 @@ spec:
 ```
 
 The full set of objects is also available under
-[`config/samples/aim_v1alpha2_lora_adapters.yaml`](https://github.com/silogen/aim-engine/blob/main/config/samples/aim_v1alpha2_lora_adapters.yaml).
+[`config/samples/aim_v1alpha2_lora_adapters.yaml`](https://github.com/amd-enterprise-ai/aim-engine/blob/main/config/samples/aim_v1alpha2_lora_adapters.yaml).
 
 The same adapters can be served from the **template pipeline** by declaring
 `spec.adapters` on a `v1alpha1` service (the parent base model is then resolved
@@ -191,13 +286,16 @@ The InferenceService is gated until the base model is `Ready` **and** the
 per-service adapter subtree exists (the subtree-sync Job has succeeded). The
 service checks each logical adapter's `compatibleWith` list against the
 resolved base artifact's `modelId`; exact adapters are checked against the
-resolved artifact name. Compatible adapters then stage asynchronously and the
-runtime loads them as they land — downloads never hold back serving. The service exposes a single aggregate
-`Adapters` condition (rather than one condition per adapter) and per-adapter
-disk-side states under `status.adapters[]`. Once the subtree exists the
-`Adapters` condition is `Ready` even while individual adapters are still
-downloading; a configuration error is the only adapter state that blocks the
-InferenceService:
+resolved artifact name. Compatible adapters then stage asynchronously. In
+dynamic mode the runtime loads them as they land without holding back base-model
+serving; in static mode the InferenceService waits until every declared adapter
+is `Downloaded`. The service exposes a single aggregate `Adapters` condition
+(rather than one condition per adapter) and per-adapter disk-side states under
+`status.adapters[]`. Once the subtree exists the aggregate condition is `Ready`
+even if an individual adapter is still downloading or has failed. A `Failed`
+entry carries the staging Job's reason and message in `lastError`. Configuration
+errors block both modes; in static mode any adapter not yet `Downloaded` also
+blocks InferenceService creation:
 
 ```yaml
 status:
@@ -213,7 +311,7 @@ status:
 | `ParentLacksAdapterDisk` | The resolved base model has no adapter disk yet (`Progressing`). |
 | `AdapterSubtreeProvisioning` | The per-service subtree is being created; the ISVC is gated on this (`Progressing`). |
 | `AdapterConfigInvalid` | Multiple model sources, an incompatible model ID, an exact-parent mismatch, a duplicate adapter path, or a non-adapter artifact was referenced (`Failed`, blocks the ISVC). |
-| `AdaptersStaging` | The subtree is ready and serving; one or more adapters are still downloading asynchronously (`Ready`). |
+| `AdaptersStaging` | The subtree is ready but one or more adapters are not `Downloaded` (`Ready` aggregate condition). Dynamic serving continues; static ISVC creation remains gated. |
 | `AdaptersStaged` | All declared adapters are staged (`Ready`). |
 
 ## Reclaim
@@ -226,22 +324,25 @@ collection cannot reclaim them. Cleanup is two-tier, split by ownership:
   owner reference and are cascade-deleted with that concrete parent artifact.
 
 - **Per-adapter unload (service alive)** — the AIMService-owned **subtree-sync**
-  Job prunes adapter directories no longer in `spec.adapters`. It is owned by the
-  service (garbage-collected with it) and runs whenever the declared set changes.
+  Job atomically moves adapter directories no longer in `spec.adapters` to
+  `.unload-tmp`, then deletes them as its final, best-effort step. It is owned by
+  the service (garbage-collected with it) and runs whenever the declared set
+  changes.
 - **Whole-subtree reclaim (service deleted)** — the base model artifact
   periodically launches a **reaper** Job that removes subtrees whose owning
-  `AIMService` no longer exists, plus crash-orphaned `.staging` / `.aside`
-  directories. This is owned by the model artifact (not the service) precisely so
-  it can run *after* the service — and its subtree-sync Job — are gone. Deleting
-  an adapter-serving service tears down its pods immediately; its on-disk subtree
-  is reclaimed by the next sweep.
+  `AIMService` no longer exists, crash-orphaned `.staging` / `.aside`
+  directories, and old `.unload-tmp` entries even for live services. This is
+  owned by the model artifact (not the service) precisely so it can run *after*
+  the service — and its subtree-sync Job — are gone. Deleting an adapter-serving
+  service tears down its pods immediately; its on-disk subtree is reclaimed by
+  the next sweep.
 
 ## Serving contract
 
 The container is expected to load every adapter directory it finds under
 `/adapters`. The controller sets the `AIM_ADAPTER_*` environment variables on the
 inference container (`AIM_ADAPTER_SOURCE`, `AIM_ADAPTER_MODE`, the `MAX_*` caps,
-and a dynamic-mode refresh interval); the `MAX_*` caps are currently uniform
-built-in defaults. The image honouring these variables, a profile
-LoRA-support gate, max-rank validation, and engine-reported load state remain to
-be completed alongside the inference container.
+and a dynamic-mode refresh interval). Static maximum rank is inferred from the
+declared artifacts; dynamic maximum rank is resolved from service/runtime
+configuration. Engine-reported load state remains to be completed alongside the
+inference container.

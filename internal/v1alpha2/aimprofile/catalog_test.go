@@ -26,6 +26,8 @@ import (
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
+
+	aimv1alpha1 "github.com/amd-enterprise-ai/aim-engine/api/v1alpha1"
 )
 
 // testAimIDCustomTransformer is reused by the custom-model base-profile
@@ -38,22 +40,31 @@ func TestParseDiscoveryCatalog_FromRawYAMLs(t *testing.T) {
 	profileYAML := `aim_id: meta-llama/Llama-3-8B-Instruct
 model_id: meta-llama/Llama-3-8B-Instruct
 metadata:
-  engine: vllm
+  engine: vllm_omni
+  variant: usp1
   metric: latency
   precision: fp8
   type: standard
   primary: true
+  capabilities:
+    tool_calling: true
+    structured_outputs: true
+    reasoning: true
+  future_runtime_hint:
+    mode: fast
   accelerator_model: MI300X
   accelerator_count: 1
   features:
     - adapters
 env_vars:
   VLLM_USE_TRITON_FLASH_ATTN: "1"
+future_top_level:
+  enabled: true
 `
 
 	configMap := &corev1.ConfigMap{
 		Data: map[string]string{
-			FlattenProfilePath("meta-llama/Llama-3-8B-Instruct/mi300x-fp8.yaml"): profileYAML,
+			FlattenProfilePath("meta-llama/Llama-3-8B-Instruct/vllm_omni-mi300x-fp8-tp1-latency-usp1.yaml"): profileYAML,
 			DiscoveryCacheMetadataKey: `{
   "aimId": "meta-llama/Llama-3-8B-Instruct",
   "sourceImage": "quay.io/amd/aim-llama:0.9.0",
@@ -78,8 +89,14 @@ env_vars:
 		t.Fatalf("len(parsed.Profiles) = %d, want 1", len(parsed.Profiles))
 	}
 	item := parsed.Profiles[0]
-	if item.Spec.ProfileId != "mi300x-fp8" {
-		t.Fatalf("ProfileId = %q, want mi300x-fp8", item.Spec.ProfileId)
+	if item.Spec.ProfileId != "vllm_omni-mi300x-fp8-tp1-latency-usp1" {
+		t.Fatalf("ProfileId = %q, want discovered vllm_omni filename stem", item.Spec.ProfileId)
+	}
+	if item.Spec.Engine != "vllm_omni" {
+		t.Fatalf("Engine = %q, want vllm_omni", item.Spec.Engine)
+	}
+	if item.Spec.Variant != "usp1" {
+		t.Fatalf("Variant = %q, want usp1", item.Spec.Variant)
 	}
 	if item.Spec.Image != "quay.io/amd/aim-llama:0.9.0" {
 		t.Fatalf("Image = %q, want metadata sourceImage", item.Spec.Image)
@@ -110,6 +127,113 @@ env_vars:
 	if candidates[0].BaseImage != "quay.io/amd/aim-base:0.9.0" {
 		t.Fatalf("candidate BaseImage = %q, want metadata baseImage", candidates[0].BaseImage)
 	}
+	contract := candidates[0].YAMLContract
+	for _, field := range []string{"accelerator_model", "accelerator_count", "primary", "features"} {
+		if !contract.HasMetadataField(field) {
+			t.Errorf("candidate YAML contract missing %q: %s", field, contract.Encode())
+		}
+	}
+	extensions := contract.Extensions()
+	if _, ok := extensions.Metadata["capabilities"]; !ok {
+		t.Errorf("candidate YAML contract dropped capabilities: %#v", extensions.Metadata)
+	}
+	if _, ok := extensions.Metadata["future_runtime_hint"]; !ok {
+		t.Errorf("candidate YAML contract dropped future_runtime_hint: %#v", extensions.Metadata)
+	}
+	if _, ok := extensions.TopLevel["future_top_level"]; !ok {
+		t.Errorf("candidate YAML contract dropped future_top_level: %#v", extensions.TopLevel)
+	}
+}
+
+func TestParseProfileYAMLIntoCatalogItem_InfersYAMLContract(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name     string
+		metadata string
+		present  []string
+		absent   []string
+	}{
+		{
+			name: "legacy GPU fields",
+			metadata: `
+  gpu: MI300X
+  gpu_count: 1
+  manual_selection_only: false`,
+			present: []string{"gpu", "gpu_count", "manual_selection_only"},
+			absent:  []string{"accelerator_model", "accelerator_type", "accelerator_count"},
+		},
+		{
+			name: "transitional accelerator fields",
+			metadata: `
+  accelerator_type: gpu
+  accelerator_model: MI300X
+  accelerator_count: 1
+  manual_selection_only: false`,
+			present: []string{"accelerator_model", "accelerator_type", "accelerator_count", "manual_selection_only"},
+			absent:  []string{"gpu", "gpu_count"},
+		},
+		{
+			name: "strict accelerator fields",
+			metadata: `
+  accelerator_type: gpu
+  accelerator_model: MI300X
+  accelerator_count: 1`,
+			present: []string{"accelerator_model", "accelerator_type", "accelerator_count"},
+			absent:  []string{"gpu", "gpu_count", "manual_selection_only"},
+		},
+		{
+			name: "mixed source fields",
+			metadata: `
+  gpu: MI300X
+  gpu_count: 1
+  accelerator_type: gpu
+  accelerator_model: MI300X
+  accelerator_count: 1
+  manual_selection_only: false`,
+			present: []string{
+				"gpu", "gpu_count",
+				"accelerator_model", "accelerator_type", "accelerator_count",
+				"manual_selection_only",
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			raw := []byte(`aim_id: org/model
+model_id: org/model
+metadata:
+  engine: vllm
+  metric: latency
+  precision: fp16
+  type: optimized` + tc.metadata + `
+engine_args: {}
+env_vars: {}
+`)
+			item, err := parseProfileYAMLIntoCatalogItem(
+				raw,
+				"org/model/vllm-mi300x-fp16-tp1-latency.yaml",
+				"org/model",
+				"registry.example/aim-model:test",
+				"registry.example/aim-base:test",
+				"test",
+			)
+			if err != nil {
+				t.Fatalf("parseProfileYAMLIntoCatalogItem: %v", err)
+			}
+			for _, field := range tc.present {
+				if !item.YAMLContract.HasMetadataField(field) {
+					t.Errorf("YAMLContract missing %q: %s", field, item.YAMLContract.Encode())
+				}
+			}
+			for _, field := range tc.absent {
+				if item.YAMLContract.HasMetadataField(field) {
+					t.Errorf("YAMLContract unexpectedly contains %q: %s", field, item.YAMLContract.Encode())
+				}
+			}
+		})
+	}
 }
 
 // TestParseDiscoveryCatalog_BoundProfilesWinOverGeneral pins the precedence
@@ -130,6 +254,7 @@ metadata:
   metric: latency
   precision: bf16
   type: unoptimized
+  auto_selection_policy: any
   primary: true
   manual_selection_only: true
   accelerator_model: CPU
@@ -175,6 +300,9 @@ env_vars: {}
 	}
 	if !got.Spec.Primary {
 		t.Fatal("Primary = false, want bound spec (Primary=true)")
+	}
+	if got.Spec.AutoSelectionPolicy != aimv1alpha1.AIMProfileAutoSelectionPolicyAny {
+		t.Fatalf("AutoSelectionPolicy = %q, want any", got.Spec.AutoSelectionPolicy)
 	}
 	if got.Spec.ModelId != "Qwen/Qwen3-0.6B" {
 		t.Fatalf("ModelId = %q, want Qwen/Qwen3-0.6B (bound item)", got.Spec.ModelId)

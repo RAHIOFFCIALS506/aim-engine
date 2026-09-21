@@ -29,13 +29,17 @@ import (
 
 	kservev1alpha1 "github.com/kserve/kserve/pkg/apis/serving/v1alpha1"
 	corev1 "k8s.io/api/core/v1"
+	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
+	aimv1alpha1 "github.com/amd-enterprise-ai/aim-engine/api/v1alpha1"
 	aimv1alpha2 "github.com/amd-enterprise-ai/aim-engine/api/v1alpha2"
 	"github.com/amd-enterprise-ai/aim-engine/internal/constants"
 	controllerutils "github.com/amd-enterprise-ai/aim-engine/internal/controller/utils"
+	"github.com/amd-enterprise-ai/aim-engine/internal/v1alpha2/profileyaml"
+	"github.com/amd-enterprise-ai/aim-engine/internal/v1alpha2/runtimeprojection"
 	"github.com/amd-enterprise-ai/aim-engine/internal/v1alpha2/serving"
 )
 
@@ -158,6 +162,7 @@ func TestProfilePlanResources_ProjectsNamespaceRuntime(t *testing.T) {
 		resolvedResources: ResolveResources(spec.AcceleratorType, spec.AcceleratorCount, nil, spec.AcceleratorModel, nil),
 		deployable:        true,
 		projectable:       true,
+		yamlContract:      profileyaml.CanonicalContract(&spec),
 	}
 	obs.profile = profile
 
@@ -203,8 +208,236 @@ func TestProfilePlanResources_ProjectsNamespaceRuntime(t *testing.T) {
 		t.Errorf("runtime missing %s framework env", constants.EnvAIMProfileID)
 	}
 	// The colocated ConfigMap is also force-applied and named after the runtime.
-	if !hasConfigMap(force, wantName, profile.Namespace) {
-		t.Errorf("expected colocated ConfigMap %q in force bucket", wantName)
+	cm := findConfigMap(t, force, wantName, profile.Namespace)
+
+	// AIMService and the lazy projection controller rebuild expected content
+	// from profile status. That independently-built projection must have exactly
+	// the same hash as the eager producer or the freshness gate cannot converge.
+	profile.Status.Resources = obs.resolvedResources
+	profile.Status.ResolvedNodeAffinity = affinity
+	lazy, err := runtimeprojection.DesiredForRuntime(
+		profile.Namespace,
+		wantName,
+		runtimeprojection.ProjectionState{AnnotatedProfile: profile},
+	)
+	if err != nil {
+		t.Fatalf("build equivalent lazy projection: %v", err)
+	}
+	if lazy.Runtime == nil || lazy.ConfigMap == nil {
+		t.Fatal("equivalent lazy projection did not produce both siblings")
+	}
+	for name, got := range map[string]string{
+		"eager ServingRuntime": sr.Annotations[constants.AnnotationRuntimeProjectionContentHash],
+		"eager ConfigMap":      cm.Annotations[constants.AnnotationRuntimeProjectionContentHash],
+		"lazy ServingRuntime":  lazy.Runtime.Annotations[constants.AnnotationRuntimeProjectionContentHash],
+		"lazy ConfigMap":       lazy.ConfigMap.Annotations[constants.AnnotationRuntimeProjectionContentHash],
+	} {
+		if got != sr.Annotations[constants.AnnotationRuntimeProjectionContentHash] {
+			t.Errorf("%s content hash = %q, want %q", name, got, sr.Annotations[constants.AnnotationRuntimeProjectionContentHash])
+		}
+	}
+}
+
+func TestProfileRuntimeProjectionBuildErrorSurfacesInStatusAndSkipsApply(t *testing.T) {
+	spec := gpuSpec()
+	spec.Engine = "vllm"
+	spec.AcceleratorVendor = aimv1alpha1.AcceleratorVendorNVIDIA
+	spec.ModelId = "org/model"
+	spec.ModelSources = []aimv1alpha1.AIMModelSource{{ModelID: "org/model", SourceURI: "hf://org/model"}}
+	spec.EngineArgs = &apiextensionsv1.JSON{Raw: []byte(`{"port": 9000}`)}
+	profile := &aimv1alpha2.AIMProfile{
+		ObjectMeta: metav1.ObjectMeta{Name: "invalid-vllm", Namespace: "team-a"},
+		Spec:       aimv1alpha2.AIMProfileSpec{AIMProfileSpecCommon: spec},
+	}
+	obs := ProfileObservation{
+		matchResult:       NodeMatchResult{MatchingNodes: 1},
+		resolvedResources: ResolveProfileResources(spec),
+		deployable:        true,
+		projectable:       true,
+	}
+	obs.profile = profile
+	obs.projectionErr = validateNamespaceRuntimeProjection(
+		aimv1alpha2.RuntimeProjectionModeBoth,
+		profile,
+		obs,
+	)
+	if obs.projectionErr == nil {
+		t.Fatal("expected invalid vLLM arguments to fail runtime construction")
+	}
+
+	r := &ProfileReconciler{ProjectionMode: aimv1alpha2.RuntimeProjectionModeBoth}
+	plan := r.PlanResources(
+		context.Background(),
+		controllerutils.ReconcileContext[*aimv1alpha2.AIMProfile]{Object: profile},
+		obs,
+	)
+	if got := len(plan.GetToApplyWithForce()); got != 0 {
+		t.Fatalf("invalid runtime must not be applied, got %d force-applied objects", got)
+	}
+
+	status := &aimv1alpha2.AIMProfileStatus{}
+	cm := controllerutils.NewConditionManager(nil)
+	r.DecorateStatus(status, cm, obs)
+	condition := cm.Get(aimv1alpha2.AIMProfileConditionRuntimeProjected)
+	if condition == nil ||
+		condition.Status != metav1.ConditionFalse ||
+		condition.Reason != aimv1alpha2.AIMProfileReasonRuntimeProjectionFailed {
+		t.Fatalf("RuntimeProjected condition = %+v, want False/%s", condition, aimv1alpha2.AIMProfileReasonRuntimeProjectionFailed)
+	}
+	if status.ProjectedRuntimeName != "" || status.ProjectedModelSlugRuntimeName != "" {
+		t.Fatalf("failed first projection must not publish runtime names: %+v", status)
+	}
+
+	staleStatus := &aimv1alpha2.AIMProfileStatus{
+		ProjectedRuntimeName:          serving.RuntimeName(profile.Name),
+		ProjectedModelSlugRuntimeName: serving.ModelSlugRuntimeName(spec.AimId),
+	}
+	r.DecorateStatus(staleStatus, controllerutils.NewConditionManager(nil), obs)
+	if staleStatus.ProjectedRuntimeName == "" || staleStatus.ProjectedModelSlugRuntimeName == "" {
+		t.Fatalf("builder failure must retain discoverability for stale runtimes kept by additive teardown: %+v", staleStatus)
+	}
+
+	health := obs.GetComponentHealth(context.Background(), nil)
+	var projectionHealth *controllerutils.ComponentHealth
+	for i := range health {
+		if health[i].Component == "RuntimeProjection" {
+			projectionHealth = &health[i]
+			break
+		}
+	}
+	if projectionHealth == nil || len(projectionHealth.Errors) != 1 {
+		t.Fatalf("missing runtime projection component health: %+v", health)
+	}
+	if got := controllerutils.CategorizeError(projectionHealth.Errors[0]).Category(); got != controllerutils.ErrorCategoryInvalidSpec {
+		t.Fatalf("projection error category = %v, want InvalidSpec", got)
+	}
+}
+
+func TestProjectionInfrastructureErrorPreservesRuntimeProjectedCondition(t *testing.T) {
+	prior := metav1.Condition{
+		Type:    aimv1alpha2.AIMProfileConditionRuntimeProjected,
+		Status:  metav1.ConditionTrue,
+		Reason:  aimv1alpha2.AIMProfileReasonRuntimeProjected,
+		Message: "Runtime projected for this profile",
+	}
+	cm := controllerutils.NewConditionManager([]metav1.Condition{prior})
+
+	decorateProjectionCondition(
+		cm,
+		aimv1alpha2.RuntimeProjectionModeExhaustive,
+		false,
+		true,
+		nil,
+		controllerutils.NewInfrastructureError(
+			"ProfileCacheLookupFailed",
+			"Failed to resolve the Shared AIMProfileCache",
+			nil,
+		),
+	)
+
+	got := cm.Get(aimv1alpha2.AIMProfileConditionRuntimeProjected)
+	if got == nil || got.Status != prior.Status || got.Reason != prior.Reason || got.Message != prior.Message {
+		t.Fatalf("RuntimeProjected condition = %+v, want prior condition preserved", got)
+	}
+}
+
+func TestRecoveredRuntimeProjectionElectionConditionIsRemoved(t *testing.T) {
+	cm := controllerutils.NewConditionManager([]metav1.Condition{{
+		Type:   runtimeProjectionElectionReadyCondition,
+		Status: metav1.ConditionFalse,
+		Reason: "InfrastructureError",
+	}})
+
+	clearRecoveredRuntimeProjectionElectionCondition(cm, nil)
+
+	if got := cm.Get(runtimeProjectionElectionReadyCondition); got != nil {
+		t.Fatalf("recovered election condition was not removed: %+v", got)
+	}
+}
+
+func TestSourceDerivedProfileMissingContractKeepsExistingProjectionUntouched(t *testing.T) {
+	spec := aimv1alpha2.AIMProfileSpecCommon{
+		AimId:   "org/model",
+		ModelId: "org/model",
+		Image:   "registry.io/model:1.0.0",
+		Engine:  "vllm",
+		ModelSources: []aimv1alpha1.AIMModelSource{{
+			ModelID:   "org/model",
+			SourceURI: "hf://org/model",
+		}},
+	}
+	profile := &aimv1alpha2.AIMProfile{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "legacy-profile",
+			Namespace: "team-a",
+			Labels: map[string]string{
+				constants.LabelKeyProfileOrigin: string(aimv1alpha1.ProfileOriginDiscovered),
+			},
+		},
+		Spec: aimv1alpha2.AIMProfileSpec{AIMProfileSpecCommon: spec},
+	}
+	r := &ProfileReconciler{ProjectionMode: aimv1alpha2.RuntimeProjectionModeExhaustive}
+	obs := r.ComposeState(
+		context.Background(),
+		controllerutils.ReconcileContext[*aimv1alpha2.AIMProfile]{Object: profile},
+		ProfileFetchResult{profile: profile},
+	)
+	if obs.projectionErr == nil {
+		t.Fatal("expected missing source-derived contract to block projection")
+	}
+
+	plan := r.PlanResources(
+		context.Background(),
+		controllerutils.ReconcileContext[*aimv1alpha2.AIMProfile]{Object: profile},
+		obs,
+	)
+	if len(plan.GetToApplyWithForce()) != 0 || len(plan.GetToDelete()) != 0 {
+		t.Fatalf("missing contract must leave existing projection untouched: apply=%d delete=%d",
+			len(plan.GetToApplyWithForce()), len(plan.GetToDelete()))
+	}
+
+	status := &aimv1alpha2.AIMProfileStatus{ProjectedRuntimeName: serving.RuntimeName(profile.Name)}
+	r.DecorateStatus(status, controllerutils.NewConditionManager(nil), obs)
+	if status.ProjectedRuntimeName == "" {
+		t.Fatal("missing contract must retain the previously published runtime name")
+	}
+}
+
+func TestClusterProfileRuntimeProjectionBuildErrorSkipsApply(t *testing.T) {
+	spec := gpuSpec()
+	spec.Engine = "vllm"
+	spec.AcceleratorVendor = aimv1alpha1.AcceleratorVendorNVIDIA
+	spec.ModelId = "org/model"
+	spec.ModelSources = []aimv1alpha1.AIMModelSource{{ModelID: "org/model", SourceURI: "hf://org/model"}}
+	spec.EngineArgs = &apiextensionsv1.JSON{Raw: []byte(`{"host": "127.0.0.1"}`)}
+	profile := &aimv1alpha2.AIMClusterProfile{
+		ObjectMeta: metav1.ObjectMeta{Name: "invalid-vllm"},
+		Spec:       aimv1alpha2.AIMClusterProfileSpec{AIMProfileSpecCommon: spec},
+	}
+	obs := ClusterProfileObservation{
+		matchResult:       NodeMatchResult{MatchingNodes: 1},
+		resolvedResources: ResolveProfileResources(spec),
+		deployable:        true,
+		projectable:       true,
+	}
+	obs.profile = profile
+	obs.projectionErr = validateClusterRuntimeProjection(
+		aimv1alpha2.RuntimeProjectionModeBoth,
+		profile,
+		obs,
+	)
+	if obs.projectionErr == nil {
+		t.Fatal("expected invalid vLLM arguments to fail cluster runtime construction")
+	}
+
+	r := &ClusterProfileReconciler{ProjectionMode: aimv1alpha2.RuntimeProjectionModeBoth}
+	plan := r.PlanResources(
+		context.Background(),
+		controllerutils.ReconcileContext[*aimv1alpha2.AIMClusterProfile]{Object: profile},
+		obs,
+	)
+	if got := len(plan.GetToApplyWithForce()); got != 0 {
+		t.Fatalf("invalid cluster runtime must not be applied, got %d force-applied objects", got)
 	}
 }
 
@@ -258,10 +491,12 @@ func TestProfilePlanResources_StampsEagerProjectionMarker(t *testing.T) {
 			}
 			affinity := BuildNodeAffinity(aimv1alpha2.AcceleratorTypeGPU, "MI300X", "unpartitioned")
 			obs := ProfileObservation{
-				matchResult:       NodeMatchResult{MatchingNodes: 3, NodeAffinity: affinity},
-				resolvedResources: ResolveResources(tc.spec.AcceleratorType, tc.spec.AcceleratorCount, nil, tc.spec.AcceleratorModel, nil),
-				deployable:        true,
-				projectable:       true,
+				ProfileFetchResult: ProfileFetchResult{modelSlugWinner: tc.mode.ProjectsModelSlug()},
+				matchResult:        NodeMatchResult{MatchingNodes: 3, NodeAffinity: affinity},
+				resolvedResources:  ResolveResources(tc.spec.AcceleratorType, tc.spec.AcceleratorCount, nil, tc.spec.AcceleratorModel, nil),
+				deployable:         true,
+				projectable:        true,
+				yamlContract:       profileyaml.CanonicalContract(&tc.spec),
 			}
 			obs.profile = profile
 
@@ -337,11 +572,9 @@ func TestProfilePlanResources_GatesBlockProjection(t *testing.T) {
 }
 
 // TestProfilePlanResources_AsymmetricTeardownIsAdditive pins the additive
-// asymmetric teardown: once the projection gate flips false the plan STOPS
-// emitting the runtime (it is not in the force-apply bucket) and never deletes
-// it. A previously-projected runtime survives because the apply pipeline prunes
-// only plan.Delete objects (reconciler.go Phase 5) — a kept runtime needs no
-// re-apply. Removal happens only via ownerRef GC on profile delete.
+// asymmetric teardown: a gate-false profile that never projected emits nothing,
+// while a retained projection is reasserted so its content cannot go stale.
+// Neither case deletes; removal happens only via ownerRef GC on profile delete.
 func TestProfilePlanResources_AsymmetricTeardownIsAdditive(t *testing.T) {
 	spec := gpuSpec()
 	profile := &aimv1alpha2.AIMProfile{
@@ -353,19 +586,43 @@ func TestProfilePlanResources_AsymmetricTeardownIsAdditive(t *testing.T) {
 		resolvedResources: ResolveResources(spec.AcceleratorType, spec.AcceleratorCount, nil, spec.AcceleratorModel, nil),
 		deployable:        true,
 		projectable:       false,
+		yamlContract:      profileyaml.CanonicalContract(&spec),
 	}
 	obs.profile = profile
 
 	r := &ProfileReconciler{ProjectionMode: aimv1alpha2.RuntimeProjectionModeExhaustive}
 	plan := r.PlanResources(context.Background(), controllerutils.ReconcileContext[*aimv1alpha2.AIMProfile]{Object: profile}, obs)
 	if n := countServingRuntimes(plan.GetToApplyWithForce()); n != 0 {
-		t.Fatalf("additive teardown: gate-false must stop emitting the runtime, got %d applies", n)
+		t.Fatalf("additive teardown: never-projected gate-false profile emitted %d runtimes", n)
 	}
 	if n := len(plan.GetToApply()); n != 0 {
 		t.Fatalf("additive teardown: gate-false must not queue the runtime for apply, got %d", n)
 	}
 	if n := len(plan.GetToDelete()); n != 0 {
 		t.Fatalf("asymmetric teardown must never delete the runtime, got %d deletes", n)
+	}
+
+	profile.Status.ProjectedRuntimeName = serving.RuntimeName(profile.Name)
+	obs = r.ComposeState(
+		context.Background(),
+		controllerutils.ReconcileContext[*aimv1alpha2.AIMProfile]{Object: profile},
+		ProfileFetchResult{profile: profile},
+	)
+	if obs.projectable {
+		t.Fatal("test precondition: retained profile must no longer be projectable")
+	}
+	if obs.projectionErr != nil {
+		t.Fatalf("retained projection contract/build validation failed: %v", obs.projectionErr)
+	}
+	if err := obs.yamlContract.Validate(); err != nil {
+		t.Fatalf("retained projection must compose a valid YAML contract: %v", err)
+	}
+	plan = r.PlanResources(context.Background(), controllerutils.ReconcileContext[*aimv1alpha2.AIMProfile]{Object: profile}, obs)
+	if n := countServingRuntimes(plan.GetToApplyWithForce()); n != 1 {
+		t.Fatalf("additive teardown: retained projection must be reasserted, got %d runtimes", n)
+	}
+	if n := len(plan.GetToDelete()); n != 0 {
+		t.Fatalf("asymmetric teardown must never delete the retained runtime, got %d deletes", n)
 	}
 }
 
@@ -416,8 +673,9 @@ func TestClusterProfilePlanResources_ProjectsClusterRuntime(t *testing.T) {
 }
 
 // TestClusterProfilePlanResources_GatesAndTeardown pins gate-blocking and
-// additive asymmetric teardown for the cluster path: a projectable profile
-// projects the CSR, and a gate flip stops emitting it without ever deleting it.
+// additive asymmetric teardown for the cluster path: a never-projected profile
+// emits nothing after a gate failure, while a retained CSR is reasserted and
+// never explicitly deleted.
 func TestClusterProfilePlanResources_GatesAndTeardown(t *testing.T) {
 	spec := gpuSpec()
 	build := func(projectable bool) (*ClusterProfileReconciler, controllerutils.ReconcileContext[*aimv1alpha2.AIMClusterProfile], ClusterProfileObservation) {
@@ -443,7 +701,7 @@ func TestClusterProfilePlanResources_GatesAndTeardown(t *testing.T) {
 		}
 	})
 
-	t.Run("gate false stops emitting and never deletes (additive teardown)", func(t *testing.T) {
+	t.Run("never-projected gate false stops emitting and never deletes", func(t *testing.T) {
 		r, rc, obs := build(false)
 		plan := r.PlanResources(context.Background(), rc, obs)
 		if n := countClusterServingRuntimes(plan.GetToApplyWithForce()); n != 0 {
@@ -453,13 +711,37 @@ func TestClusterProfilePlanResources_GatesAndTeardown(t *testing.T) {
 			t.Fatalf("must never delete the runtime, got %d deletes", n)
 		}
 	})
+
+	t.Run("retained gate-false projection is reasserted after switch to Reduced", func(t *testing.T) {
+		r, rc, _ := build(false)
+		r.ProjectionMode = aimv1alpha2.RuntimeProjectionModeReduced
+		rc.Object.Status.ProjectedRuntimeName = serving.RuntimeName(rc.Object.Name)
+		obs := r.ComposeState(
+			context.Background(),
+			rc,
+			ClusterProfileFetchResult{profile: rc.Object},
+		)
+		if obs.projectable {
+			t.Fatal("test precondition: retained cluster profile must no longer be projectable")
+		}
+		if obs.projectionErr != nil {
+			t.Fatalf("retained cluster projection validation failed: %v", obs.projectionErr)
+		}
+		plan := r.PlanResources(context.Background(), rc, obs)
+		if n := countClusterServingRuntimes(plan.GetToApplyWithForce()); n != 1 {
+			t.Fatalf("retained cluster runtime must be reasserted, got %d applies", n)
+		}
+		if n := len(plan.GetToDelete()); n != 0 {
+			t.Fatalf("must never delete the retained runtime, got %d deletes", n)
+		}
+	})
 }
 
-// TestProjectionDisabledWhenReduced pins that Reduced mode never projects a
-// per-profile runtime: a non-primary projectable profile (gpuSpec defaults to
-// primary=false) yields no runtime at all, since Reduced publishes only the
-// model-slug primary and this profile is not its model's primary.
-func TestProjectionDisabledWhenReduced(t *testing.T) {
+// TestReducedModeCreatesNoNewPerProfileRuntimeButMaintainsRetained pins the
+// additive mode-flip lifecycle: Reduced does not create a per-profile runtime,
+// but it keeps reasserting one previously published by Exhaustive/Both so the
+// eager marker never strands stale content that the lazy controller defers to.
+func TestReducedModeCreatesNoNewPerProfileRuntimeButMaintainsRetained(t *testing.T) {
 	spec := gpuSpec()
 	profile := &aimv1alpha2.AIMProfile{
 		ObjectMeta: metav1.ObjectMeta{Name: "p", Namespace: "ns"},
@@ -472,6 +754,27 @@ func TestProjectionDisabledWhenReduced(t *testing.T) {
 	plan := r.PlanResources(context.Background(), controllerutils.ReconcileContext[*aimv1alpha2.AIMProfile]{Object: profile}, obs)
 	if n := countServingRuntimes(plan.GetToApplyWithForce()); n != 0 {
 		t.Fatalf("Reduced mode must not project per-profile runtimes for a non-primary profile, got %d", n)
+	}
+
+	profile.Status.ProjectedRuntimeName = serving.RuntimeName(profile.Name)
+	obs = r.ComposeState(
+		context.Background(),
+		controllerutils.ReconcileContext[*aimv1alpha2.AIMProfile]{Object: profile},
+		ProfileFetchResult{profile: profile},
+	)
+	if obs.projectionErr != nil {
+		t.Fatalf("compose retained Reduced-mode projection: %v", obs.projectionErr)
+	}
+	plan = r.PlanResources(
+		context.Background(),
+		controllerutils.ReconcileContext[*aimv1alpha2.AIMProfile]{Object: profile},
+		obs,
+	)
+	if n := countServingRuntimes(plan.GetToApplyWithForce()); n != 1 {
+		t.Fatalf("Reduced mode must maintain the retained per-profile runtime, got %d applies", n)
+	}
+	if runtime := findServingRuntime(t, plan.GetToApplyWithForce()); runtime.Name != profile.Status.ProjectedRuntimeName {
+		t.Fatalf("maintained runtime name = %q, want retained %q", runtime.Name, profile.Status.ProjectedRuntimeName)
 	}
 }
 
@@ -514,10 +817,12 @@ func TestProfilePlanResources_ReducedModelSlugPrimary(t *testing.T) {
 	}
 	affinity := BuildNodeAffinity(aimv1alpha2.AcceleratorTypeGPU, "MI300X", "unpartitioned")
 	obs := ProfileObservation{
-		matchResult:       NodeMatchResult{MatchingNodes: 3, NodeAffinity: affinity},
-		resolvedResources: ResolveResources(spec.AcceleratorType, spec.AcceleratorCount, nil, spec.AcceleratorModel, nil),
-		deployable:        true,
-		projectable:       true,
+		ProfileFetchResult: ProfileFetchResult{modelSlugWinner: true},
+		matchResult:        NodeMatchResult{MatchingNodes: 3, NodeAffinity: affinity},
+		resolvedResources:  ResolveResources(spec.AcceleratorType, spec.AcceleratorCount, nil, spec.AcceleratorModel, nil),
+		deployable:         true,
+		projectable:        true,
+		yamlContract:       profileyaml.CanonicalContract(&spec),
 	}
 	obs.profile = profile
 
@@ -546,8 +851,8 @@ func TestProfilePlanResources_ReducedModelSlugPrimary(t *testing.T) {
 }
 
 // TestProfilePlanResources_ReducedSkipsNonPrimaryAndNonProjectable pins the
-// thin primary-selection rule: Reduced publishes nothing for a non-primary
-// profile, and nothing for a primary profile that is not projectable.
+// post-election gates: Reduced publishes nothing for a non-primary profile, and
+// nothing for an elected primary that is not projectable.
 func TestProfilePlanResources_ReducedSkipsNonPrimaryAndNonProjectable(t *testing.T) {
 	cases := map[string]struct {
 		primary     bool
@@ -565,7 +870,11 @@ func TestProfilePlanResources_ReducedSkipsNonPrimaryAndNonProjectable(t *testing
 				ObjectMeta: metav1.ObjectMeta{Name: "p", Namespace: "ns"},
 				Spec:       aimv1alpha2.AIMProfileSpec{AIMProfileSpecCommon: spec},
 			}
-			obs := ProfileObservation{deployable: true, projectable: tc.projectable}
+			obs := ProfileObservation{
+				ProfileFetchResult: ProfileFetchResult{modelSlugWinner: tc.primary},
+				deployable:         true,
+				projectable:        tc.projectable,
+			}
 			obs.profile = profile
 
 			r := &ProfileReconciler{ProjectionMode: aimv1alpha2.RuntimeProjectionModeReduced}
@@ -589,10 +898,11 @@ func TestClusterProfilePlanResources_ReducedModelSlugPrimary(t *testing.T) {
 	}
 	affinity := BuildNodeAffinity(aimv1alpha2.AcceleratorTypeGPU, "MI300X", "unpartitioned")
 	obs := ClusterProfileObservation{
-		matchResult:       NodeMatchResult{MatchingNodes: 3, NodeAffinity: affinity},
-		resolvedResources: ResolveResources(spec.AcceleratorType, spec.AcceleratorCount, nil, spec.AcceleratorModel, nil),
-		deployable:        true,
-		projectable:       true,
+		ClusterProfileFetchResult: ClusterProfileFetchResult{modelSlugWinner: true},
+		matchResult:               NodeMatchResult{MatchingNodes: 3, NodeAffinity: affinity},
+		resolvedResources:         ResolveResources(spec.AcceleratorType, spec.AcceleratorCount, nil, spec.AcceleratorModel, nil),
+		deployable:                true,
+		projectable:               true,
 	}
 	obs.profile = profile
 
@@ -614,6 +924,86 @@ func TestClusterProfilePlanResources_ReducedModelSlugPrimary(t *testing.T) {
 	}
 }
 
+func TestExhaustiveModeMaintainsRetainedNamespaceModelSlugRuntime(t *testing.T) {
+	spec := primaryGPUSpec()
+	spec.Image = "registry.example.com/updated-after-mode-flip:2.0.0"
+	profile := &aimv1alpha2.AIMProfile{
+		ObjectMeta: metav1.ObjectMeta{Name: "retained-model-slug", Namespace: "team-a"},
+		Spec:       aimv1alpha2.AIMProfileSpec{AIMProfileSpecCommon: spec},
+	}
+	profile.Status.ProjectedModelSlugRuntimeName = serving.ModelSlugRuntimeName(spec.AimId)
+
+	r := &ProfileReconciler{ProjectionMode: aimv1alpha2.RuntimeProjectionModeExhaustive}
+	reconcileCtx := controllerutils.ReconcileContext[*aimv1alpha2.AIMProfile]{Object: profile}
+	obs := r.ComposeState(
+		context.Background(),
+		reconcileCtx,
+		ProfileFetchResult{profile: profile},
+	)
+	if obs.projectable {
+		t.Fatal("test precondition: retained profile must be gate-false without matching GPU nodes")
+	}
+	if obs.projectionErr != nil {
+		t.Fatalf("compose retained model-slug projection: %v", obs.projectionErr)
+	}
+	if err := obs.yamlContract.Validate(); err != nil {
+		t.Fatalf("retained namespace model-slug projection must compose its YAML contract: %v", err)
+	}
+
+	plan := r.PlanResources(context.Background(), reconcileCtx, obs)
+	if got := countServingRuntimes(plan.GetToApplyWithForce()); got != 1 {
+		t.Fatalf("Exhaustive must maintain one retained model-slug runtime, got %d", got)
+	}
+	runtime := findServingRuntime(t, plan.GetToApplyWithForce())
+	if runtime.Name != profile.Status.ProjectedModelSlugRuntimeName {
+		t.Fatalf("maintained runtime name = %q, want retained %q", runtime.Name, profile.Status.ProjectedModelSlugRuntimeName)
+	}
+	if got := runtime.Spec.Containers[0].Image; got != spec.Image {
+		t.Fatalf("maintained runtime image = %q, want current profile image %q", got, spec.Image)
+	}
+	if shouldMaintainNamespaceModelSlugRuntime(
+		aimv1alpha2.RuntimeProjectionModeReduced, profile, true, false,
+	) {
+		t.Fatal("active model-slug mode must honor a lost election instead of retaining the old owner")
+	}
+}
+
+func TestExhaustiveModeMaintainsRetainedClusterModelSlugRuntime(t *testing.T) {
+	spec := primaryGPUSpec()
+	spec.Image = "registry.example.com/updated-cluster-after-mode-flip:2.0.0"
+	profile := &aimv1alpha2.AIMClusterProfile{
+		ObjectMeta: metav1.ObjectMeta{Name: "retained-cluster-model-slug"},
+		Spec:       aimv1alpha2.AIMClusterProfileSpec{AIMProfileSpecCommon: spec},
+	}
+	profile.Status.ProjectedModelSlugRuntimeName = serving.ModelSlugRuntimeName(spec.AimId)
+
+	r := &ClusterProfileReconciler{ProjectionMode: aimv1alpha2.RuntimeProjectionModeExhaustive}
+	reconcileCtx := controllerutils.ReconcileContext[*aimv1alpha2.AIMClusterProfile]{Object: profile}
+	obs := r.ComposeState(
+		context.Background(),
+		reconcileCtx,
+		ClusterProfileFetchResult{profile: profile},
+	)
+	if obs.projectable {
+		t.Fatal("test precondition: retained cluster profile must be gate-false without matching GPU nodes")
+	}
+	if obs.projectionErr != nil {
+		t.Fatalf("compose retained cluster model-slug projection: %v", obs.projectionErr)
+	}
+
+	plan := r.PlanResources(context.Background(), reconcileCtx, obs)
+	if got := countClusterServingRuntimes(plan.GetToApplyWithForce()); got != 1 {
+		t.Fatalf("Exhaustive must maintain one retained model-slug ClusterServingRuntime, got %d", got)
+	}
+	runtime := findClusterServingRuntime(t, plan.GetToApplyWithForce())
+	if runtime.Name != profile.Status.ProjectedModelSlugRuntimeName {
+		t.Fatalf("maintained runtime name = %q, want retained %q", runtime.Name, profile.Status.ProjectedModelSlugRuntimeName)
+	}
+	if got := runtime.Spec.Containers[0].Image; got != spec.Image {
+		t.Fatalf("maintained runtime image = %q, want current profile image %q", got, spec.Image)
+	}
+}
+
 // TestProfilePlanResources_BothModeNoAmbiguity pins that Both mode publishes the
 // per-profile runtime AND the model-slug primary together, with NEITHER
 // advertising autoSelect so native KServe auto-selection is never made ambiguous
@@ -626,10 +1016,12 @@ func TestProfilePlanResources_BothModeNoAmbiguity(t *testing.T) {
 	}
 	affinity := BuildNodeAffinity(aimv1alpha2.AcceleratorTypeGPU, "MI300X", "unpartitioned")
 	obs := ProfileObservation{
-		matchResult:       NodeMatchResult{MatchingNodes: 3, NodeAffinity: affinity},
-		resolvedResources: ResolveResources(spec.AcceleratorType, spec.AcceleratorCount, nil, spec.AcceleratorModel, nil),
-		deployable:        true,
-		projectable:       true,
+		ProfileFetchResult: ProfileFetchResult{modelSlugWinner: true},
+		matchResult:        NodeMatchResult{MatchingNodes: 3, NodeAffinity: affinity},
+		resolvedResources:  ResolveResources(spec.AcceleratorType, spec.AcceleratorCount, nil, spec.AcceleratorModel, nil),
+		deployable:         true,
+		projectable:        true,
+		yamlContract:       profileyaml.CanonicalContract(&spec),
 	}
 	obs.profile = profile
 
@@ -942,10 +1334,11 @@ func TestProfileDecorateStatus_ReducedRecordsModelSlugName(t *testing.T) {
 		Spec:       aimv1alpha2.AIMProfileSpec{AIMProfileSpecCommon: spec},
 	}
 	obs := ProfileObservation{
-		matchResult:       NodeMatchResult{MatchingNodes: 3},
-		resolvedResources: ResolveResources(spec.AcceleratorType, spec.AcceleratorCount, nil, spec.AcceleratorModel, nil),
-		deployable:        true,
-		projectable:       true,
+		ProfileFetchResult: ProfileFetchResult{modelSlugWinner: true},
+		matchResult:        NodeMatchResult{MatchingNodes: 3},
+		resolvedResources:  ResolveResources(spec.AcceleratorType, spec.AcceleratorCount, nil, spec.AcceleratorModel, nil),
+		deployable:         true,
+		projectable:        true,
 	}
 	obs.profile = profile
 
@@ -972,10 +1365,11 @@ func TestProfileDecorateStatus_BothRecordsBothNames(t *testing.T) {
 		Spec:       aimv1alpha2.AIMProfileSpec{AIMProfileSpecCommon: spec},
 	}
 	obs := ProfileObservation{
-		matchResult:       NodeMatchResult{MatchingNodes: 3},
-		resolvedResources: ResolveResources(spec.AcceleratorType, spec.AcceleratorCount, nil, spec.AcceleratorModel, nil),
-		deployable:        true,
-		projectable:       true,
+		ProfileFetchResult: ProfileFetchResult{modelSlugWinner: true},
+		matchResult:        NodeMatchResult{MatchingNodes: 3},
+		resolvedResources:  ResolveResources(spec.AcceleratorType, spec.AcceleratorCount, nil, spec.AcceleratorModel, nil),
+		deployable:         true,
+		projectable:        true,
 	}
 	obs.profile = profile
 

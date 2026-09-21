@@ -49,8 +49,8 @@ func assembleProfileYAML(spec *aimv1alpha2.AIMProfileSpecCommon) ([]byte, string
 	return serving.AssembleProfileYAML(spec)
 }
 
-func profileFilename(accModel, precision string, accCount int32, metric string) string {
-	return serving.ProfileFilename(accModel, precision, accCount, metric)
+func profileFilename(spec *aimv1alpha2.AIMProfileSpecCommon) (string, error) {
+	return serving.ProfileFilename(spec)
 }
 
 // BuildProfileVolume creates a Volume that projects the profile ConfigMap.
@@ -64,7 +64,7 @@ func BuildProfileVolumeMount(aimId string) corev1.VolumeMount {
 }
 
 // legacyProfileConfigMapName reconstructs the deterministic name of the
-// service-owned profile ConfigMap that pre-ADR-0008 AIMService reconciles
+// service-owned profile ConfigMap that legacy inline-predictor AIMService reconciles
 // created (<service>-profile-<hash>) through the now-removed profileConfigMapName
 // helper. The runtime-reference rewrite stopped planning that ConfigMap, so a
 // service already running when the operator is upgraded leaves it orphaned. The

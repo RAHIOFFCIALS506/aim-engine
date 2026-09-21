@@ -60,11 +60,22 @@ The canonical label set stamped on every operator-produced `AIMProfile` / `AIMCl
 | Label | Values | Set by | Used by |
 |---|---|---|---|
 | `aim.eai.amd.com/profile-role` | `base`, `deployable` | Model controller, AIMProfileSet controller | AIMProfileSet `selector.role`, AIMService `selector.role` (reserved) |
-| `aim.eai.amd.com/profile-origin` | `discovered`, `derived`, `user-authored` | Model / AIMProfileSet controllers; backfilled by AIMProfile controller for user-authored | AIMProfileSet `selector.origin` |
+| `aim.eai.amd.com/profile-origin` | `discovered`, `derived`, `generated`, `user-authored` | Model / AIMProfileSet controllers; backfilled by AIMProfile controller for user-authored | AIMProfileSet `selector.origin` |
 | `aim.eai.amd.com/source-model` | Name of producing AIM(Cluster)Model | Model / AIMProfileSet controllers (with controller ownerRef) | AIMProfileSet `selector.modelRef.name`, AIMService `spec.model.name` shortcut |
 | `aim.eai.amd.com/source-model-scope` | `namespace`, `cluster` | Model / AIMProfileSet controllers | AIMProfileSet `selector.modelRef.scope` |
-| `aim.eai.amd.com/profile-source` | `copy` | AIMProfileSet derivation | Provenance only |
+
+### v1alpha2 profile annotations
+
+These carry provenance or controller compatibility state that nothing selects on, so they are **annotations**, not labels — a label selector will never match them.
+
+| Annotation | Values | Set by | Used by |
+|---|---|---|---|
+| `aim.eai.amd.com/profile-source` | `image`, `copy`, `generated` | AIMModel discovery/generation or AIMProfileSet derivation | Origin classification (`status.origin`) |
 | `aim.eai.amd.com/profile-copyable` | `"true"` | Image discovery (default); manual opt-in for hand-authored profiles | AIMProfileSet candidate eligibility |
+| `aim.eai.amd.com/profile-generation-fallback` | RuntimeConfig fallback name | AIMModel generation | Retaining a generated profile when its hardware disappears |
+| `aim.eai.amd.com/profile-yaml-contract` | JSON object with `codec`, `metadataFields`, and optional `extensions` | Image discovery; inherited by AIMProfileSet derivation and AIMService overlays | Rendering the source-compatible profile YAML mounted into the runtime |
+
+`profile-yaml-contract` is controller-owned diagnostic state. Typical values identify the `aim-profile/v1` codec and list the metadata fields present in the source. The optional `extensions` object retains source-owned fields that AIM Engine does not model, for example `metadata.capabilities`. Profiles without source YAML provenance use the strict canonical accelerator v1 format. Discovered and derived profiles require the annotation; projection waits for their producer to backfill it instead of guessing. Unknown fields in the contract envelope, unknown codec identifiers, malformed contracts, and contracts larger than 64 KiB are rejected explicitly during derivation or runtime projection.
 
 :::{admonition} Hand-authored profiles
 :class: important
@@ -92,20 +103,22 @@ The `source-model` and `source-model-scope` labels are derived from controller o
 | `aim.eai.amd.com/gpu.model` | `MI300X`, `MI325X`, … | GPU model |
 | `aim.eai.amd.com/gpu.count` | `"1"`, `"4"` | GPU count |
 
-### Projected runtime metadata
+<a id="projected-runtime-metadata"></a>
+
+### Projected KServe `ServingRuntime` / `ClusterServingRuntime` metadata
 
 Stamped on every projected KServe `ServingRuntime` / `ClusterServingRuntime` (and its colocated profile `ConfigMap`) so a native / bring-your-own-KServe consumer can trace and inspect the runtime without reversing its hashed object name. See [Bring Your Own KServe](../guides/bring-your-own-kserve.md).
 
-Per-profile runtimes are named `aim-<truncated-profile>-<hash>` (hashed, not reversible); the Reduced/Both model-slug primary is named `aim-<model-slug>` (readable, `autoSelect` on). The `aim-` prefix is **reserved** for AIM Engine — do not hand-author objects under it.
+Per-profile KServe `ServingRuntime` / `ClusterServingRuntime` objects are named `aim-<truncated-profile>-<hash>` (hashed, not reversible); the Reduced/Both model-slug primary is named `aim-<model-slug>` (readable, `autoSelect` off). The `aim-` prefix is **reserved** for AIM Engine — do not hand-author objects under it.
 
 | Label | Value | Purpose |
 |---|---|---|
 | `aim.eai.amd.com/profile` | Sanitized backing profile name | Correlator back to the profile (selectable) |
-| `aim.eai.amd.com/model` | Sanitized model slug | Filter runtimes by the model they serve |
+| `aim.eai.amd.com/model` | Sanitized model slug | Filter `ServingRuntime` / `ClusterServingRuntime` objects by the model they serve |
 | `aim.eai.amd.com/precision` | `fp8`, `fp16`, … | Filter by numeric precision |
 | `aim.eai.amd.com/accelerator-class` | `MI300X`, … | Filter by accelerator class |
-| `aim.eai.amd.com/runtime-projection` | `eager`, `lazy` | How it was materialized — `eager` (by the profile) or `lazy` (shadow via InferenceService watch). Provenance, not health |
-| `aim.eai.amd.com/runtime-projection-state` | `projected` | Projection **health** surfaced on the runtime object. `projected` is the only value stamped; the degraded transition is reported on the profile's [`RuntimeProjected`](conditions.md#runtimeprojected) condition, not this label |
+| `aim.eai.amd.com/runtime-projection` | `eager`, `lazy` | How it was materialized — `eager` (by the profile) or `lazy` (namespaced `ServingRuntime` shadow via the `ServingRuntime`-keyed controller). Provenance, not health |
+| `aim.eai.amd.com/runtime-projection-state` | `projected` | Projection provenance surfaced on the `ServingRuntime` / `ClusterServingRuntime` object. `projected` is the only value stamped; the degraded transition is reported on the profile's [`RuntimeProjected`](conditions.md#runtimeprojected) condition, not this label |
 
 | Annotation | Value | Purpose |
 |---|---|---|
@@ -115,8 +128,9 @@ Per-profile runtimes are named `aim-<truncated-profile>-<hash>` (hashed, not rev
 | `aim.eai.amd.com/projected.precision` | Backing profile precision | — |
 | `aim.eai.amd.com/projected.metric` | Backing profile metric | — |
 | `aim.eai.amd.com/runtime-projection-message` | Human-readable note | Companion to `runtime-projection-state`; points to the profile's `RuntimeProjected` condition |
+| `aim.eai.amd.com/runtime-projection-content-hash` | SHA-256 digest | Stamped identically on a complete namespaced `ServingRuntime` / `ConfigMap` pair from workload-affecting content; AIMService waits for both hashes to match the current profile/cache projection before reconciling its `InferenceService` |
 
-A projected runtime also carries an owner reference to its backing `AIMProfile` / `AIMClusterProfile`, which is what garbage-collects it when the profile is deleted.
+A projected `ServingRuntime` / `ClusterServingRuntime` also carries an owner reference to its backing `AIMProfile` / `AIMClusterProfile`, which is what garbage-collects it when the profile is deleted.
 
 ### Cache labels
 
@@ -212,7 +226,7 @@ kubectl get inferenceservice -l aim.eai.amd.com/service.name=qwen-chat -n <names
 kubectl get aimartifact -l aim.eai.amd.com/profile-cache.name=<cache-name> -n <namespace>
 ```
 
-### Find projected runtimes for a model (with their projection state)
+### Find projected KServe `ClusterServingRuntime` objects for a model
 
 ```bash
 kubectl get clusterservingruntime \

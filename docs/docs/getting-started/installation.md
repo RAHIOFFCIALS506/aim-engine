@@ -6,28 +6,34 @@ This guide covers installing AIM Engine on a Kubernetes cluster.
 
 | Component | Minimum Version | Notes |
 |-----------|----------------|-------|
-| Kubernetes | 1.32+ | Cluster with AMD GPU nodes |
-| [AMD GPU Operator](https://github.com/ROCm/gpu-operator) | — | Advertises `amd.com/gpu` and the GPU node labels used for template selection |
+| Kubernetes | 1.32+ | Cluster with supported AMD or NVIDIA GPU nodes; CPU-only profiles are also supported |
+| [AMD GPU Operator](https://github.com/ROCm/gpu-operator) | — | AMD GPU stack; advertises `amd.com/gpu`, labels AMD nodes, and installs NFD |
+| [NVIDIA GPU Operator](https://github.com/NVIDIA/gpu-operator) | — | NVIDIA GPU stack; advertises `nvidia.com/gpu`, installs NFD, and provides the NVIDIA runtime |
 | KServe | v0.16.1 | See [KServe Configuration](../admin/kserve-configuration.md) |
-| Gateway API | v1.3.0 | Required for HTTP routing |
-| kgateway | v2.0+ | Gateway API data plane that AIM Engine targets for routing and the scale-from-zero activation signal |
+| Gateway API | v1.5.1+ | Required only when HTTP routing is enabled |
+| Envoy Gateway | v1.8.2 | Optional Gateway API data plane. Required only when that platform integration is selected. |
 | cert-manager | v1.16+ | Required by KServe and optional metrics TLS |
-| KEDA | 2.18+ | Autoscaling; required because scale-from-zero is a default-on feature |
+| KEDA | 2.18+ | Required when using AIMService autoscaling |
 | keda-otel-add-on | latest | gRPC scaler that bridges OpenTelemetry metrics to KEDA. Installed alongside KEDA |
-| OpenTelemetry Operator | 0.101+ | Reconciles the `OpenTelemetryCollector` CR for the bundled scale-from-zero collector (see note below) |
+| OpenTelemetry Operator | 0.101+ | Required when Helm manages a bundled scale-from-zero collector (see note below) |
 
-The scale-from-zero collector (`kgateway-metrics-collector`) is **not** a
-separate prerequisite to apply — it ships with the AIM Engine Helm chart and
-`dist/install.yaml` and is enabled by default
-(`scaleFromZero.gatewayMetricsCollector.enable=true`), deployed into the release
-namespace. You only apply it yourself when opting out; see
-[the collector README](https://github.com/amd-enterprise-ai/aim-engine/tree/main/config/prereqs/scale-from-zero).
+Gateway activation is disabled by default (`scaleFromZero.gatewayProvider=none`).
+Selecting `envoyGateway` or `kgateway` makes the chart include the matching
+collector by default. Envoy Gateway also requires one shared metrics policy per
+Gateway and a source-side delta OTLP sink on its platform-owned `EnvoyProxy`.
+See
+[Optional Envoy Gateway scale-from-zero](../admin/envoy-gateway-scale-from-zero.md).
 
 Optional components:
 
 | Component | Version | Purpose |
 |-----------|---------|---------|
 | Longhorn or similar CSI | — | ReadWriteMany storage for model caching |
+
+Install the GPU operator that matches the cluster hardware, or provide an
+equivalent device-plugin, NFD, and runtime setup. AIM Engine's
+[AcceleratorDetector](../concepts/accelerator-detection.md) uses NFD to publish
+normalized model, vendor, and partition labels for profile resolution.
 
 ## Install with Helm
 
@@ -45,7 +51,7 @@ helm install aim-engine-crds oci://docker.io/amdenterpriseai/aim-engine-crds-cha
 Or from a local file:
 
 ```bash
-kubectl apply -f crds.yaml
+kubectl apply --server-side -f crds.yaml
 kubectl wait --for=condition=Established crd --all --timeout=60s
 ```
 
@@ -58,24 +64,43 @@ helm install aim-engine oci://docker.io/amdenterpriseai/aim-engine-chart \
   --create-namespace
 ```
 
-The chart deploys the scale-from-zero `kgateway-metrics-collector` into the
-release namespace by default (`scaleFromZero.gatewayMetricsCollector.enable=true`);
-it needs the OpenTelemetry Operator CRDs already present. To run it standalone
-instead — for a different namespace, a non-default gateway label, or because you
-manage cluster infra separately — set that value to `false` and apply the
-manifest yourself:
+This base installation is gateway-neutral. Gateway activation remains disabled
+because `scaleFromZero.gatewayProvider` defaults to `none`, and the chart
+renders no gateway metrics collector.
+
+### 3. Enable a scale-from-zero gateway integration (optional)
+
+To use Envoy Gateway, the platform administrator installs and configures Envoy
+Gateway and one shared `EnvoyExtensionPolicy` per Gateway. AIM Engine does not
+own those resources. Then enable the matching controller contract and
+Helm-managed collector:
 
 ```bash
-kubectl apply -f https://raw.githubusercontent.com/amd-enterprise-ai/aim-engine/main/config/prereqs/scale-from-zero/kgateway-metrics-collector.yaml
-kubectl -n keda rollout status deploy/kgateway-metrics-collector --timeout=120s
+helm upgrade aim-engine oci://docker.io/amdenterpriseai/aim-engine-chart \
+  --version <version> \
+  --namespace aim-system \
+  --set scaleFromZero.gatewayProvider=envoyGateway
 ```
 
-See [`config/prereqs/scale-from-zero/README.md`](https://github.com/amd-enterprise-ai/aim-engine/tree/main/config/prereqs/scale-from-zero)
-for the customization points.
+Follow [Optional Envoy Gateway scale-from-zero](../admin/envoy-gateway-scale-from-zero.md)
+for the complete platform setup, policy installation, and verification.
+
+For kgateway, use the [kgateway setup](../admin/kgateway-setup.md). Custom
+gateways use `scaleFromZero.gatewayProvider=custom` together with
+`scaleFromZero.gatewayMetricsCollector.management=external`; they must provide
+an activation metric query through a RuntimeConfig.
+
+Existing kgateway installations should follow
+[Migrate from kgateway to Envoy Gateway](../admin/migrating-kgateway-to-envoy-gateway.md)
+instead of switching the provider and Gateway reference without a warm-replica
+safety window.
+
+See
+[Custom gateway activation metrics](../guides/scaling-and-autoscaling.md#custom-gateway-activation-metrics).
 
 See [Helm Chart Values](../reference/helm-values.md) for all configurable values (replicas, resources, metrics, CRD management, etc.).
 
-### 3. Enable model discovery (optional)
+### 4. Enable model discovery (optional)
 
 The Helm chart does not create an `AIMClusterModelSource`. To populate cluster models from a registry, apply an `AIMClusterModelSource` manifest yourself (for example from the samples under `config/samples/` in this repository). See [Model Catalog](../guides/model-catalog.md) for details.
 
@@ -92,11 +117,10 @@ make crds
 make helm
 
 # Install CRDs
-kubectl apply -f dist/crds.yaml
+kubectl apply --server-side -f dist/crds.yaml
 kubectl wait --for=condition=Established crd --all --timeout=60s
 
-# Install the operator (bundles the scale-from-zero collector by default;
-# requires the OpenTelemetry Operator CRDs to be present)
+# Install the operator with gateway activation disabled by default.
 helm install aim-engine ./dist/chart \
   --namespace aim-system \
   --create-namespace
@@ -107,18 +131,23 @@ This project uses [mise](https://mise.jdx.dev) to manage tool versions (Go, cont
 :::
 ## Common Configuration
 
-### Enable Cluster Runtime Defaults
+### Customize Cluster Runtime Defaults
 
-Set up cluster-wide routing and storage defaults:
+The chart creates `AIMClusterRuntimeConfig/default` by default, including a
+generic NVIDIA vLLM fallback for model-ID onboarding. Add cluster-wide routing
+and storage defaults by overriding its spec:
 
 ```bash
 helm upgrade aim-engine oci://docker.io/amdenterpriseai/aim-engine-chart \
   --namespace aim-system \
-  --set clusterRuntimeConfig.enable=true \
   --set clusterRuntimeConfig.spec.routing.enabled=true \
-  --set clusterRuntimeConfig.spec.routing.gatewayRef.name=aim-gateway \
-  --set clusterRuntimeConfig.spec.routing.gatewayRef.namespace=kgateway-system
+  --set clusterRuntimeConfig.spec.routing.gatewayRef.name=<gateway-name> \
+  --set clusterRuntimeConfig.spec.routing.gatewayRef.namespace=<gateway-namespace>
 ```
+
+If the cluster already has a platform-managed `AIMClusterRuntimeConfig/default`,
+install or upgrade with `--set clusterRuntimeConfig.enable=false` to avoid a
+Helm ownership conflict.
 
 See [Helm Chart Values](../reference/helm-values.md) for all available options.
 

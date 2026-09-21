@@ -3,7 +3,14 @@
 This guide maps v1alpha1 concepts to their v1alpha2 equivalents and provides conversion recipes for the common deployment patterns.
 
 :::{note}
-Read the [Legacy Overview](index.md) first for context on coexistence rules and the deprecation timeline.
+Read the [Legacy Overview](index.md) first for coexistence rules and the
+migration/removal boundary.
+:::
+:::{warning}
+This page maps fields and target shapes; it is not a migration execution or
+cleanup runbook. Install and verify the bridge first. The bounded
+administrator-run Plan/Apply behavior and manual outcomes are governed by
+[ADR-0002](https://github.com/amd-enterprise-ai/aim-engine/blob/main/ADR-0002-bounded-plan-apply-template-migration.md).
 :::
 ## Resource mapping
 
@@ -293,32 +300,29 @@ Cluster-scoped profiles cannot enable caching directly (cluster-scoped caches no
 
 ## Migration order
 
-The recommended sequence:
-
-1. **Cluster admins first** — onboard cluster-scoped models via `AIMClusterModel` with `spec.image`. Verify deployable profiles materialise.
-2. **Namespace admins** — migrate namespace-scoped `AIMServiceTemplate` to `AIMProfile` (or rebuild from a namespace `AIMModel`).
-3. **Services last** — switch `AIMService.spec.template` to `spec.profile` (or `spec.model.name`).
-4. **Verify** with `kubectl get aimservice <name> -o jsonpath='{.status.resolvedProfile}'`.
-5. **Clean up** — delete v1alpha1 templates after confirming no service references remain.
+Install the bridge CRDs before the matching operator and verify predecessor
+serving before planning any changes. Use ADR-0002 for operation ordering,
+dry-run, partial-failure recovery, and manual outcomes. These field mappings do
+not authorize template/cache deletion, storage rewriting, or automatic
+handling of custom and ambiguous resources.
 
 ## Validation traps
 
-The v1alpha2 CRD rejects a handful of fields that were valid on v1alpha1:
+The v1alpha2 CRD rejects legacy-only fields and invalid combinations of the
+three onboarding spec shapes:
 
 | Rejected on v1alpha2 | Resource | Why |
 |---|---|---|
-| `spec.aimId` | `AIMModel` | Resolved automatically (image discovery) or supplied by `derivedFrom.overrides.aimId`. |
 | `spec.modelSources` | `AIMModel` | Lives on `AIMProfile` instead. |
 | `spec.custom` | `AIMModel` | Replaced by base-image + `derivedFrom`. |
 | `spec.customTemplates` | `AIMModel` | Replaced by `AIMProfileSet` / `derivedFrom`. |
-| `spec.discovery` | `AIMModel` | Discovery configuration now lives at the controller level. |
-| `spec.defaultServiceTemplate` | `AIMModel` | Profiles select themselves via `primary: true`. |
-| `spec.runtimeConfigName` | `AIMModel` | Runtime config is referenced on the service. |
-| `spec.env` | `AIMModel` | Lives on the profile as `containerEnv` / `engineEnv`. |
-| `spec.imageMetadata` | `AIMModel` | Internal; not user-facing. |
 | `spec.profileCopy` | `AIMModel` | Replaced by `derivedFrom`. |
-| Both `spec.image` and `spec.profiles` | `AIMModel` | Exactly one required. |
-| Neither | `AIMModel` | Exactly one required. |
+| Flat `spec.derivedFrom` | `AIMModel` | Use `spec.profiles.derivedFrom`. |
+| Any combination of two or more of `spec.image`, `spec.modelId`, and `spec.profiles` | `AIMModel` | Exactly one onboarding flow is required. |
+| None of `spec.image`, `spec.modelId`, or `spec.profiles` | `AIMModel` | Exactly one onboarding flow is required. |
+| `spec.source` or `spec.accelerator` without `spec.modelId` | `AIMModel` | These fields configure generated model-ID onboarding only. |
+| `spec.aimId`, `spec.source`, or `spec.runtimeConfigName` with `spec.profiles` | `AIMModel` | Derivation identity and runtime come from the selected source profiles and overrides. |
+| Image-discovery/runtime fields such as `spec.discovery`, `spec.env`, `spec.imagePullSecrets`, `spec.serviceAccountName`, or `spec.resources` with `spec.modelId` | `AIMModel` | Configure the generated profile runtime on the referenced RuntimeConfig fallback. |
 | `spec.template` | `AIMService` | Use `spec.profile`. |
 | `spec.overrides` | `AIMService` | Use `spec.profileOverrides`. |
 | `spec.profileOverrides` without `spec.profile.name` | `AIMService` | Overlay requires a named seed. |
@@ -338,7 +342,7 @@ Once a workload is migrated:
 ## Related documentation
 
 - [Legacy Overview](index.md)
-- [AIM Models](../concepts/models.md) — Three model flows in detail
+- [AIM Models](../concepts/models.md) — Four model flows in detail
 - [Services](../concepts/services.md) — v1alpha2 resolution shapes
 - [Profiles](../concepts/profiles.md) — Self-contained runtime configurations
 - [Fine-Tuned Models](../guides/fine-tuned-models.md) — Migration target for fine-tunes

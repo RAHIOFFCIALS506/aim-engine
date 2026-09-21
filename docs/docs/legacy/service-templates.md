@@ -57,7 +57,7 @@ spec:
 | `modelName` | `AIMModel` / `AIMClusterModel` name. | Yes |
 | `runtimeConfigName` | Runtime configuration for storage defaults / discovery settings. Defaults to `default`. | No |
 | `metric` | `latency` or `throughput`. | Yes |
-| `precision` | `auto`, `fp4`, `fp8`, `fp16`, `fp32`, `bf16`, `int4`, `int8`. | Yes |
+| `precision` | `auto`, `fp4`, `fp8`, `fp16`, `fp32`, `fp64`, `bf16`, `int4`, `int8`. | Yes |
 | `hardware.gpu.requests` | GPUs per replica. | Yes |
 | `hardware.gpu.model` | GPU model (e.g. `MI300X`). | Yes |
 | `hardware.cpu` | CPU requirements (alternative to `hardware.gpu`). | Yes |
@@ -112,7 +112,8 @@ When an `AIMService` references a model without naming a specific template (`spe
 3. Excludes templates whose GPU isn't present in the cluster.
 4. Selects the single remaining candidate or surfaces an ambiguity / not-found condition.
 
-For the v1alpha2 equivalent (ranking deployable profiles by `primary > type > version`), see [Services → Resolution shapes](../concepts/services.md#resolution-shapes).
+For the v1alpha2 equivalent, including its deterministic multi-axis profile
+ranking, see [Services → Resolution shapes](../concepts/services.md#resolution-shapes).
 
 ## v1alpha2 replacements at a glance
 

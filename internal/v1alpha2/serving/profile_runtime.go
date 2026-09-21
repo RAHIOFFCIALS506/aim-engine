@@ -34,10 +34,12 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/validation"
 	"sigs.k8s.io/yaml"
 
 	aimv1alpha2 "github.com/amd-enterprise-ai/aim-engine/api/v1alpha2"
 	"github.com/amd-enterprise-ai/aim-engine/internal/constants"
+	"github.com/amd-enterprise-ai/aim-engine/internal/v1alpha2/profileyaml"
 )
 
 const (
@@ -61,20 +63,9 @@ type ProfileYAML struct {
 	EnvVars    map[string]string `json:"env_vars"`
 }
 
-// ProfileMetadata matches the AIM runtime's ProfileMetadata schema.
-//
-// We emit BOTH naming conventions so the assembled YAML is valid against
-// every aim-runtime version we ship today:
-//
-//   - Legacy `gpu` / `gpu_count` are still REQUIRED by the runtime baked into
-//     amdenterpriseai/aim-base:0.11 (and earlier). The runtime's Pydantic
-//     ProfileMetadata schema validates `metadata.gpu` and `metadata.gpu_count`
-//     as required fields; omitting them causes the predictor pod to crash
-//     before opening port 8000.
-//   - New `accelerator_model` / `accelerator_type` / `accelerator_count` are
-//     the v1alpha2 vocabulary. Runtimes that don't know them ignore the
-//     extras (Pydantic extras are not forbidden); runtimes that do can
-//     consume them directly.
+// ProfileMetadata is the superset decode shape used by tests and callers that
+// inspect assembled YAML. Rendering is contract-driven: only the field
+// families present in the source profile YAML are emitted.
 type ProfileMetadata struct {
 	Engine              string `json:"engine"`
 	GPU                 string `json:"gpu"`
@@ -86,6 +77,7 @@ type ProfileMetadata struct {
 	Metric              string `json:"metric"`
 	Precision           string `json:"precision"`
 	Type                string `json:"type"`
+	Variant             string `json:"variant,omitempty"`
 	// Features carries optional capability tokens (e.g. "adapters") into runtime
 	// ProfileMetadata; the runtime computes supports_adapters from it. Omitted
 	// when empty.
@@ -99,8 +91,22 @@ type ProfileMetadata struct {
 // AIMProfile and points at it, so this function does not re-merge user overrides
 // on top.
 func AssembleProfileYAML(spec *aimv1alpha2.AIMProfileSpecCommon) ([]byte, string, error) {
+	return AssembleProfileYAMLForContract(spec, profileyaml.CanonicalContract(spec))
+}
+
+// AssembleProfileYAMLForContract builds a complete profile YAML using the field
+// contract inferred from the profile YAML shipped by the runtime image. This
+// keeps projected profiles valid across legacy, transitional, and strict AIM
+// runtime schemas without inspecting the image tag.
+func AssembleProfileYAMLForContract(
+	spec *aimv1alpha2.AIMProfileSpecCommon,
+	contract profileyaml.Contract,
+) ([]byte, string, error) {
 	if spec == nil {
 		return nil, "", fmt.Errorf("profile spec is nil")
+	}
+	if err := contract.Validate(); err != nil {
+		return nil, "", fmt.Errorf("invalid profile YAML contract: %w", err)
 	}
 
 	engineArgs := make(map[string]any)
@@ -120,44 +126,114 @@ func AssembleProfileYAML(spec *aimv1alpha2.AIMProfileSpecCommon) ([]byte, string
 	accModel := spec.AcceleratorModel
 	accType := string(spec.AcceleratorType)
 	accCount := spec.AcceleratorCount
-
-	profile := ProfileYAML{
-		AimID:   spec.AimId,
-		ModelID: spec.ModelId,
-		Metadata: ProfileMetadata{
-			Engine:              spec.Engine,
-			GPU:                 accModel,
-			GPUCount:            accCount,
-			AcceleratorModel:    accModel,
-			AcceleratorType:     accType,
-			AcceleratorCount:    accCount,
-			ManualSelectionOnly: false,
-			Metric:              string(spec.Metric),
-			Precision:           string(spec.Precision),
-			Type:                string(spec.Type),
-			Features:            append([]string(nil), spec.Features...),
-		},
-		EngineArgs: engineArgs,
-		EnvVars:    envVars,
+	if contract.Codec() != profileyaml.CodecV1 {
+		return nil, "", fmt.Errorf("unsupported profile YAML codec %q", contract.Codec())
 	}
+
+	extensions := contract.Extensions()
+
+	metadata := extensions.Metadata
+	metadata["engine"] = spec.Engine
+	metadata["metric"] = string(spec.Metric)
+	metadata["precision"] = string(spec.Precision)
+	metadata["type"] = string(spec.Type)
+
+	if contract.HasMetadataField("gpu") {
+		metadata["gpu"] = accModel
+	}
+	if contract.HasMetadataField("gpu_count") {
+		metadata["gpu_count"] = accCount
+	}
+	if contract.HasMetadataField("accelerator_model") {
+		metadata["accelerator_model"] = accModel
+	}
+	if contract.HasMetadataField("accelerator_type") {
+		metadata["accelerator_type"] = accType
+	}
+	if contract.HasMetadataField("accelerator_count") {
+		metadata["accelerator_count"] = accCount
+	}
+	if contract.HasMetadataField("manual_selection_only") {
+		// The resolver ignores this deprecated field, but legacy/transitional
+		// runtime schemas still require its serialized value when the source
+		// YAML carried it.
+		metadata["manual_selection_only"] = spec.ManualSelectionOnly //nolint:staticcheck
+	}
+	if contract.HasMetadataField("variant") {
+		metadata["variant"] = spec.Variant
+	}
+	if contract.HasMetadataField("features") {
+		metadata["features"] = append([]string{}, spec.Features...)
+	}
+	if contract.HasMetadataField("primary") {
+		metadata["primary"] = spec.Primary
+	}
+	if contract.HasMetadataField("auto_selection_policy") {
+		metadata["auto_selection_policy"] = string(spec.AutoSelectionPolicy)
+	}
+
+	profile := extensions.TopLevel
+	profile["aim_id"] = spec.AimId
+	profile["model_id"] = spec.ModelId
+	profile["metadata"] = metadata
+	profile["engine_args"] = engineArgs
+	profile["env_vars"] = envVars
 
 	yamlBytes, err := yaml.Marshal(profile)
 	if err != nil {
 		return nil, "", fmt.Errorf("failed to marshal profile YAML: %w", err)
 	}
 
-	filename := ProfileFilename(accModel, string(spec.Precision), accCount, string(spec.Metric))
+	filename, err := ProfileFilename(spec)
+	if err != nil {
+		return nil, "", err
+	}
 	return yamlBytes, filename, nil
 }
 
-// ProfileFilename returns the deterministic on-disk name of the assembled
-// profile YAML the runtime resolves AIM_PROFILE_ID against.
-func ProfileFilename(accModel, precision string, accCount int32, metric string) string {
-	accSegment := strings.ToLower(accModel)
+// ProfileFilename returns the on-disk name of the assembled profile YAML the
+// runtime resolves AIM_PROFILE_ID against. Discovered profiles retain their
+// original filename stem through spec.profileId. Manually authored profiles
+// without a profileId use an engine-aware deterministic fallback.
+func ProfileFilename(spec *aimv1alpha2.AIMProfileSpecCommon) (string, error) {
+	if spec == nil {
+		return "", fmt.Errorf("profile spec is nil")
+	}
+
+	if profileID := strings.TrimSuffix(spec.ProfileId, ".yaml"); profileID != "" {
+		filename := profileID + ".yaml"
+		if problems := validation.IsConfigMapKey(filename); len(problems) > 0 {
+			return "", fmt.Errorf("profileId %q cannot be used as a profile filename: %s", spec.ProfileId, strings.Join(problems, "; "))
+		}
+		return filename, nil
+	}
+
+	engine := strings.ToLower(spec.Engine)
+	if engine == "" {
+		// Preserve the historical filename for hand-authored profiles that
+		// predate spec.engine being populated.
+		engine = "vllm"
+	}
+	accSegment := strings.ToLower(spec.AcceleratorModel)
 	if accSegment == "" {
 		accSegment = "none"
 	}
-	return fmt.Sprintf("vllm-%s-%s-tp%d-%s.yaml", accSegment, precision, accCount, metric)
+	stem := fmt.Sprintf(
+		"%s-%s-%s-tp%d-%s",
+		engine,
+		accSegment,
+		spec.Precision,
+		spec.AcceleratorCount,
+		spec.Metric,
+	)
+	if spec.Variant != "" {
+		stem += "-" + spec.Variant
+	}
+	filename := stem + ".yaml"
+	if problems := validation.IsConfigMapKey(filename); len(problems) > 0 {
+		return "", fmt.Errorf("generated profile filename %q is invalid: %s", filename, strings.Join(problems, "; "))
+	}
+	return filename, nil
 }
 
 // BuildProfileConfigMap creates a ConfigMap containing the pre-assembled profile
@@ -205,9 +281,9 @@ func BuildProfileVolumeMount(aimId string) corev1.VolumeMount {
 }
 
 // BuildFrameworkEnvVars returns the operator-managed environment variables that
-// must be present on the predictor container for the AIM runtime to locate the
-// projected profile and, when model caching is active, to redirect model
-// loading to the PVC-backed local path.
+// must be present on the predictor container for the AIM runtime to select the
+// profile's engine, locate the projected profile and, when model caching is
+// active, redirect model loading to the PVC-backed local path.
 //
 // These vars are framework-owned: neither profile.ContainerEnv nor a consumer's
 // containerEnv overrides can override them. Consumers layer them on top of the
@@ -237,6 +313,9 @@ func BuildFrameworkEnvVars(profileSpec *aimv1alpha2.AIMProfileSpecCommon, profil
 	// (see BuildClusterServingRuntime).
 	vars := []corev1.EnvVar{
 		{Name: constants.EnvAIMProfileID, Value: aimProfileID},
+	}
+	if profileSpec.Engine != "" {
+		vars = append(vars, corev1.EnvVar{Name: constants.EnvAIMEngine, Value: profileSpec.Engine})
 	}
 
 	// When the profile declares modelSources, the AIMProfileCache has populated

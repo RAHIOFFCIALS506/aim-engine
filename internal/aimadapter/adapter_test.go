@@ -25,6 +25,7 @@ package aimadapter
 import (
 	"context"
 	"fmt"
+	"strings"
 	"testing"
 
 	servingv1beta1 "github.com/kserve/kserve/pkg/apis/serving/v1beta1"
@@ -33,6 +34,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/utils/ptr"
 	fakeclient "sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	aimv1alpha1 "github.com/amd-enterprise-ai/aim-engine/api/v1alpha1"
@@ -53,6 +55,22 @@ func succeededJob(name string) *batchv1.Job {
 		Status: batchv1.JobStatus{
 			Conditions: []batchv1.JobCondition{
 				{Type: batchv1.JobComplete, Status: corev1.ConditionTrue},
+			},
+		},
+	}
+}
+
+func failedJob(name, reason, message string) *batchv1.Job {
+	return &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default"},
+		Status: batchv1.JobStatus{
+			Conditions: []batchv1.JobCondition{
+				{
+					Type:    batchv1.JobFailed,
+					Status:  corev1.ConditionTrue,
+					Reason:  reason,
+					Message: message,
+				},
 			},
 		},
 	}
@@ -187,6 +205,281 @@ func TestComposeHappyPath(t *testing.T) {
 	if len(st.Adapters) != 1 || st.Adapters[0].State != aimv1alpha1.AdapterStatePending {
 		t.Errorf("expected single pending adapter (no job yet), got %+v", st.Adapters)
 	}
+	if st.MaxRank != constants.DefaultAIMAdapterRank {
+		t.Errorf("MaxRank = %d, want omitted-rank default %d", st.MaxRank, constants.DefaultAIMAdapterRank)
+	}
+}
+
+func TestComposeStaticInfersMaximumDeclaredRank(t *testing.T) {
+	svc := serviceWithAdapters("lora-a", "lora-b")
+	a := adapterArtifact("lora-a", "base")
+	b := adapterArtifact("lora-b", "base")
+	rank16 := int32(16)
+	rank64 := int32(64)
+	a.Spec.Rank = &rank16
+	b.Spec.Rank = &rank64
+
+	st := ComposeWithRuntimeConfig(
+		svc,
+		depsWith(modelParent(testAdapterPVC), map[string]*aimv1alpha1.AIMArtifact{
+			"lora-a": a,
+			"lora-b": b,
+		}),
+		&aimv1alpha1.AIMRuntimeConfigCommon{
+			AIMServiceRuntimeConfig: aimv1alpha1.AIMServiceRuntimeConfig{
+				AdapterRuntime: &aimv1alpha1.AIMAdapterRuntimeConfig{MaxRank: ptr.To[int32](8)},
+			},
+		},
+		nil,
+	)
+
+	if st.ConfigErr != nil {
+		t.Fatalf("static rank inference returned config error: %v", st.ConfigErr)
+	}
+	if st.MaxRank != 64 {
+		t.Errorf("MaxRank = %d, want largest declared rank 64", st.MaxRank)
+	}
+}
+
+func TestComposeStaticPreservesLastResolvedRankDuringArtifactGap(t *testing.T) {
+	svc := serviceWithAdapters("lora-a")
+	svc.Status.AdapterMaxRank = 64
+	deps := depsWith(modelParent(testAdapterPVC), nil)
+
+	st := Compose(svc, deps)
+	if st.ConfigErr != nil {
+		t.Fatalf("transient missing artifact returned config error: %v", st.ConfigErr)
+	}
+	if st.MaxRank != 64 {
+		t.Errorf("MaxRank = %d, want previously resolved 64", st.MaxRank)
+	}
+
+	status := svc.Status
+	DecorateStatus(&status, st)
+	if status.AdapterMaxRank != svc.Status.AdapterMaxRank {
+		t.Errorf("status.AdapterMaxRank = %d, want previously resolved %d", status.AdapterMaxRank, svc.Status.AdapterMaxRank)
+	}
+}
+
+func TestComposeStaticRoundsRankToSupportedCeiling(t *testing.T) {
+	for _, tc := range []struct {
+		rank int32
+		want int32
+	}{
+		{rank: 1, want: 1},
+		{rank: 7, want: 8},
+		{rank: 17, want: 32},
+		{rank: 300, want: 320},
+	} {
+		t.Run(fmt.Sprintf("rank-%d", tc.rank), func(t *testing.T) {
+			svc := serviceWithAdapters("lora-a")
+			artifact := adapterArtifact("lora-a", "base")
+			artifact.Spec.Rank = ptr.To(tc.rank)
+
+			st := Compose(svc, depsWith(modelParent(testAdapterPVC), map[string]*aimv1alpha1.AIMArtifact{
+				"lora-a": artifact,
+			}))
+
+			if st.ConfigErr != nil {
+				t.Fatalf("unexpected config error: %v", st.ConfigErr)
+			}
+			if st.MaxRank != tc.want {
+				t.Errorf("MaxRank = %d, want supported ceiling %d", st.MaxRank, tc.want)
+			}
+		})
+	}
+}
+
+func TestComposeStaticRejectsRankAboveRuntimeMaximum(t *testing.T) {
+	svc := serviceWithAdapters("lora-a")
+	artifact := adapterArtifact("lora-a", "base")
+	artifact.Spec.Rank = ptr.To[int32](513)
+
+	st := Compose(svc, depsWith(modelParent(testAdapterPVC), map[string]*aimv1alpha1.AIMArtifact{
+		"lora-a": artifact,
+	}))
+
+	if st.ConfigErr == nil {
+		t.Fatal("expected rank above 512 to be rejected")
+	}
+}
+
+// Static ceilings must track the declared artifacts in both directions. Seeding
+// the recomputation from status would make the value monotonic, so a 64 -> 16
+// correction would never reach the workload.
+func TestComposeStaticLowersRankWhenArtifactsShrink(t *testing.T) {
+	svc := serviceWithAdapters("lora-a")
+	svc.Status.AdapterMaxRank = 64
+	artifact := adapterArtifact("lora-a", "base")
+	artifact.Spec.Rank = ptr.To[int32](16)
+
+	st := Compose(svc, depsWith(modelParent(testAdapterPVC), map[string]*aimv1alpha1.AIMArtifact{
+		"lora-a": artifact,
+	}))
+
+	if st.ConfigErr != nil {
+		t.Fatalf("unexpected config error: %v", st.ConfigErr)
+	}
+	if st.MaxRank != 16 {
+		t.Errorf("MaxRank = %d, want recomputed 16 (must not ratchet at 64)", st.MaxRank)
+	}
+}
+
+// status.adapterMaxRank reports the last valid resolved ceiling, so a rejected
+// configuration must not overwrite it.
+func TestDecorateStatusKeepsLastValidRankWhenConfigInvalid(t *testing.T) {
+	svc := serviceWithAdapters("lora-a")
+	svc.Spec.AdapterMode = aimv1alpha1.AdapterModeDynamic
+	svc.Spec.AdapterRuntime = &aimv1alpha1.AIMAdapterRuntimeConfig{MaxRank: ptr.To[int32](8)}
+	artifact := adapterArtifact("lora-a", "base")
+	artifact.Spec.Rank = ptr.To[int32](64)
+
+	st := Compose(svc, depsWith(modelParent(testAdapterPVC), map[string]*aimv1alpha1.AIMArtifact{
+		"lora-a": artifact,
+	}))
+	if st.ConfigErr == nil {
+		t.Fatal("expected the lowered ceiling to be rejected")
+	}
+
+	status := aimv1alpha1.AIMServiceStatus{AdapterMaxRank: 64}
+	DecorateStatus(&status, st)
+	if status.AdapterMaxRank != 64 {
+		t.Errorf("status.AdapterMaxRank = %d, want the last valid 64 (not the rejected 8)", status.AdapterMaxRank)
+	}
+}
+
+func TestComposeDynamicMaxRankResolutionAndValidation(t *testing.T) {
+	rank64 := int32(64)
+	artifact := adapterArtifact("lora-a", "base")
+	artifact.Spec.Rank = &rank64
+	deps := depsWith(modelParent(testAdapterPVC), map[string]*aimv1alpha1.AIMArtifact{
+		"lora-a": artifact,
+	})
+
+	t.Run("default rejects adapter above 32", func(t *testing.T) {
+		svc := serviceWithAdapters("lora-a")
+		svc.Spec.AdapterMode = aimv1alpha1.AdapterModeDynamic
+
+		st := ComposeWithRuntimeConfig(svc, deps, nil, nil)
+		if st.ConfigErr == nil {
+			t.Fatal("expected rank above the dynamic default to be rejected")
+		}
+		if st.MaxRank != constants.DefaultAIMAdapterMaxRank {
+			t.Errorf("MaxRank = %d, want default %d", st.MaxRank, constants.DefaultAIMAdapterMaxRank)
+		}
+	})
+
+	t.Run("runtime config raises ceiling", func(t *testing.T) {
+		svc := serviceWithAdapters("lora-a")
+		svc.Spec.AdapterMode = aimv1alpha1.AdapterModeDynamic
+		runtimeConfig := &aimv1alpha1.AIMRuntimeConfigCommon{
+			AIMServiceRuntimeConfig: aimv1alpha1.AIMServiceRuntimeConfig{
+				AdapterRuntime: &aimv1alpha1.AIMAdapterRuntimeConfig{MaxRank: ptr.To[int32](64)},
+			},
+		}
+
+		st := ComposeWithRuntimeConfig(svc, deps, runtimeConfig, nil)
+		if st.ConfigErr != nil {
+			t.Fatalf("runtime-configured rank should be accepted: %v", st.ConfigErr)
+		}
+		if st.MaxRank != 64 {
+			t.Errorf("MaxRank = %d, want runtime-configured 64", st.MaxRank)
+		}
+	})
+
+	t.Run("service setting overrides runtime config", func(t *testing.T) {
+		svc := serviceWithAdapters("lora-a")
+		svc.Spec.AdapterMode = aimv1alpha1.AdapterModeDynamic
+		svc.Spec.AdapterRuntime = &aimv1alpha1.AIMAdapterRuntimeConfig{MaxRank: ptr.To[int32](64)}
+		runtimeConfig := &aimv1alpha1.AIMRuntimeConfigCommon{
+			AIMServiceRuntimeConfig: aimv1alpha1.AIMServiceRuntimeConfig{
+				AdapterRuntime: &aimv1alpha1.AIMAdapterRuntimeConfig{MaxRank: ptr.To[int32](32)},
+			},
+		}
+
+		st := ComposeWithRuntimeConfig(svc, deps, runtimeConfig, nil)
+		if st.ConfigErr != nil {
+			t.Fatalf("service-configured rank should win: %v", st.ConfigErr)
+		}
+		if st.MaxRank != 64 {
+			t.Errorf("MaxRank = %d, want service-configured 64", st.MaxRank)
+		}
+	})
+}
+
+func TestComposeDynamicDefersRankResolutionWhenRuntimeConfigFetchFails(t *testing.T) {
+	artifact := adapterArtifact("lora-a", "base")
+	artifact.Spec.Rank = ptr.To[int32](64)
+	deps := depsWith(modelParent(testAdapterPVC), map[string]*aimv1alpha1.AIMArtifact{
+		"lora-a": artifact,
+	})
+	fetchErr := fmt.Errorf("runtime config fetch failed")
+
+	t.Run("preserves last resolved ceiling", func(t *testing.T) {
+		svc := serviceWithAdapters("lora-a")
+		svc.Spec.AdapterMode = aimv1alpha1.AdapterModeDynamic
+		svc.Status.AdapterMaxRank = 64
+
+		st := ComposeWithRuntimeConfig(svc, deps, nil, fetchErr)
+		if st.ConfigErr != nil {
+			t.Fatalf("RuntimeConfig fetch failure must be reported by its component health, got adapter config error: %v", st.ConfigErr)
+		}
+		if st.MaxRank != 64 {
+			t.Errorf("MaxRank = %d, want last resolved 64", st.MaxRank)
+		}
+
+		status := svc.Status
+		DecorateStatus(&status, st)
+		if status.AdapterMaxRank != 64 {
+			t.Errorf("status.AdapterMaxRank = %d, want preserved 64", status.AdapterMaxRank)
+		}
+	})
+
+	t.Run("does not invent default or reject adapter before first resolution", func(t *testing.T) {
+		svc := serviceWithAdapters("lora-a")
+		svc.Spec.AdapterMode = aimv1alpha1.AdapterModeDynamic
+
+		st := ComposeWithRuntimeConfig(svc, deps, nil, fetchErr)
+		if st.ConfigErr != nil {
+			t.Fatalf("unresolved RuntimeConfig must not produce a false rank validation error: %v", st.ConfigErr)
+		}
+		if st.MaxRank != 0 {
+			t.Errorf("MaxRank = %d, want unresolved zero until RuntimeConfig fetch succeeds", st.MaxRank)
+		}
+
+		status := svc.Status
+		DecorateStatus(&status, st)
+		if status.AdapterMaxRank != 0 {
+			t.Errorf("status.AdapterMaxRank = %d, want status left unset", status.AdapterMaxRank)
+		}
+	})
+}
+
+func TestComposeDynamicDefersDecreaseUntilAllRanksResolve(t *testing.T) {
+	svc := serviceWithAdapters("lora-a")
+	svc.Spec.AdapterMode = aimv1alpha1.AdapterModeDynamic
+	svc.Spec.AdapterRuntime = &aimv1alpha1.AIMAdapterRuntimeConfig{MaxRank: ptr.To[int32](32)}
+	svc.Status.AdapterMaxRank = 64
+
+	st := Compose(svc, depsWith(modelParent(testAdapterPVC), nil))
+	if st.ConfigErr != nil {
+		t.Fatalf("transient missing artifact returned config error: %v", st.ConfigErr)
+	}
+	if st.MaxRank != 64 {
+		t.Errorf("MaxRank = %d during lookup gap, want applied 64", st.MaxRank)
+	}
+
+	artifact := adapterArtifact("lora-a", "base")
+	artifact.Spec.Rank = ptr.To[int32](16)
+	st = Compose(svc, depsWith(modelParent(testAdapterPVC), map[string]*aimv1alpha1.AIMArtifact{
+		"lora-a": artifact,
+	}))
+	if st.ConfigErr != nil {
+		t.Fatalf("resolved compatible adapter returned config error: %v", st.ConfigErr)
+	}
+	if st.MaxRank != 32 {
+		t.Errorf("MaxRank = %d after rank resolution, want configured 32", st.MaxRank)
+	}
 }
 
 func TestComposeParentMismatch(t *testing.T) {
@@ -316,6 +609,56 @@ func TestNotMountableWithoutSubtree(t *testing.T) {
 	}
 }
 
+func TestComposeFailedStagingJob(t *testing.T) {
+	svc := serviceWithAdapters("lora-a")
+	deps := withSyncedSubtree(
+		depsWith(modelParent(testAdapterPVC), map[string]*aimv1alpha1.AIMArtifact{
+			"lora-a": adapterArtifact("lora-a", "base"),
+		}),
+		svc,
+	)
+	deps.StagingJobs["lora-a"] = controllerutils.FetchResult[*batchv1.Job]{
+		Value: failedJob(
+			StagingJobName(svc, "lora-a", testAdapterPVC, testAdapterPVCUID),
+			"BackoffLimitExceeded",
+			"Job has reached the specified backoff limit",
+		),
+	}
+
+	st := Compose(svc, deps)
+	if len(st.Adapters) != 1 {
+		t.Fatalf("expected one adapter observation, got %+v", st.Adapters)
+	}
+	adapter := st.Adapters[0]
+	if adapter.State != aimv1alpha1.AdapterStateFailed {
+		t.Errorf("adapter state = %q, want Failed", adapter.State)
+	}
+	const wantError = "BackoffLimitExceeded: Job has reached the specified backoff limit"
+	if adapter.LastError != wantError {
+		t.Errorf("adapter lastError = %q, want %q", adapter.LastError, wantError)
+	}
+	if st.AllStaged || st.Ready {
+		t.Errorf("failed static adapter must not be staged or Ready, got %+v", st)
+	}
+
+	status := &aimv1alpha1.AIMServiceStatus{}
+	DecorateStatus(status, st)
+	if len(status.Adapters) != 1 ||
+		status.Adapters[0].State != aimv1alpha1.AdapterStateFailed ||
+		status.Adapters[0].LastError != wantError {
+		t.Errorf("failed adapter status not propagated: %+v", status.Adapters)
+	}
+
+	var plan controllerutils.PlanResult
+	Plan(&plan, svc, deps, st, nil)
+	for _, obj := range plan.GetToApply() {
+		if job, ok := obj.(*batchv1.Job); ok &&
+			job.Name == StagingJobName(svc, "lora-a", testAdapterPVC, testAdapterPVCUID) {
+			t.Error("failed staging Job must remain terminal until retry policy is explicitly defined")
+		}
+	}
+}
+
 // Once the subtree-sync Job succeeds the service is mountable (MountReady) even
 // before downloads finish. Whether that mountable state gates the ISVC (Ready)
 // then depends on the adapter mode: dynamic loads asynchronously (Ready ==
@@ -400,6 +743,9 @@ func TestComposeRejectsProfileWithoutAdapterFeature(t *testing.T) {
 	st := Compose(svc, deps)
 	if st.ConfigErr == nil {
 		t.Fatal("expected ConfigErr when the profile does not advertise adapter support")
+	}
+	if !strings.Contains(st.ConfigErr.Error(), "profileOverrides.features") {
+		t.Errorf("error must explain the explicit override escape hatch, got %q", st.ConfigErr)
 	}
 	if st.Ready {
 		t.Errorf("must not be Ready when config is invalid, got %+v", st)
@@ -811,6 +1157,10 @@ func TestBuildStagingJobUsesTypedAdapterS3Connection(t *testing.T) {
 				{Name: "AWS_PROFILE", Value: "admin-profile"},
 			},
 		},
+		AdditionalCABundleRef: &aimv1alpha1.AdditionalCABundleReference{
+			Name: "company-ca",
+			Key:  "ca.crt",
+		},
 		Artifact: &aimv1alpha1.AIMArtifactConfig{
 			S3: &aimv1alpha1.S3ConnectionConfig{
 				Endpoint: "https://s3.internal.example",
@@ -831,7 +1181,7 @@ func TestBuildStagingJobUsesTypedAdapterS3Connection(t *testing.T) {
 		},
 	}
 
-	job := BuildStagingJob(svc, artifact, testAdapterPVC, testAdapterPVCUID, ad, config)
+	job := BuildStagingJob(svc, artifact, testAdapterPVC, testAdapterPVCUID, ad, config, true)
 	container := job.Spec.Template.Spec.Containers[0]
 	env := envMap(container.Env)
 
@@ -849,7 +1199,7 @@ func TestBuildStagingJobUsesTypedAdapterS3Connection(t *testing.T) {
 		env["AWS_ACCESS_KEY_ID_FILE"] == "" {
 		t.Error("typed credentials must replace artifact credential values with mounted files")
 	}
-	if env["AWS_CA_BUNDLE"] != "/etc/aim/s3/ca.crt" {
+	if env["AWS_CA_BUNDLE"] != "/etc/aim/trust/ca-bundle.crt" {
 		t.Errorf("AWS_CA_BUNDLE = %q, want mounted CA path", env["AWS_CA_BUNDLE"])
 	}
 	if env["HTTPS_PROXY"] != "http://admin-proxy:8080" {
@@ -864,8 +1214,15 @@ func TestBuildStagingJobUsesTypedAdapterS3Connection(t *testing.T) {
 	if _, ok := env["PYTHONPATH"]; ok {
 		t.Error("artifact PYTHONPATH survived typed S3 filtering")
 	}
-	if len(job.Spec.Template.Spec.Volumes) != 3 {
-		t.Fatalf("volumes = %d, want adapter disk, credentials, and CA", len(job.Spec.Template.Spec.Volumes))
+	if len(job.Spec.Template.Spec.Volumes) != 5 {
+		t.Fatalf("volumes = %d, want adapter disk, credentials, two CA inputs, and combined CA output", len(job.Spec.Template.Spec.Volumes))
+	}
+	if len(job.Spec.Template.Spec.InitContainers) != 1 ||
+		len(job.Spec.Template.Spec.InitContainers[0].Args) != 3 {
+		t.Fatalf("combined trust init = %#v", job.Spec.Template.Spec.InitContainers)
+	}
+	if got := job.Spec.Template.Spec.InitContainers[0].Env; len(got) != 0 {
+		t.Errorf("trust init env = %#v, want no rollout metadata", got)
 	}
 }
 
@@ -919,7 +1276,7 @@ func TestRuntimeConfigForAdapterStagingUsesAdapterS3TrustBoundary(t *testing.T) 
 func TestAddVolumeMountReadOnlySubPath(t *testing.T) {
 	svc := serviceWithAdapters("lora-a")
 	isvc := isvcWithContainer()
-	AddVolumeMount(isvc, svc, testAdapterPVC)
+	AddVolumeMount(isvc, svc, testAdapterPVC, 64)
 
 	if len(isvc.Spec.Predictor.Volumes) != 1 {
 		t.Fatalf("expected one adapter volume, got %d", len(isvc.Spec.Predictor.Volumes))
@@ -951,7 +1308,7 @@ func TestAddVolumeMountReadOnlySubPath(t *testing.T) {
 	if env[constants.EnvAIMAdapterMode] != string(aimv1alpha1.AdapterModeStatic) {
 		t.Errorf("AIM_ADAPTER_MODE = %q, want %q (default static)", env[constants.EnvAIMAdapterMode], aimv1alpha1.AdapterModeStatic)
 	}
-	if env[constants.EnvAIMAdapterMaxCount] != "8" || env[constants.EnvAIMAdapterMaxCPUCount] != "16" || env[constants.EnvAIMAdapterMaxRank] != "32" {
+	if env[constants.EnvAIMAdapterMaxCount] != "8" || env[constants.EnvAIMAdapterMaxCPUCount] != "16" || env[constants.EnvAIMAdapterMaxRank] != "64" {
 		t.Errorf("unexpected MAX_* caps: count=%q cpu=%q rank=%q", env[constants.EnvAIMAdapterMaxCount], env[constants.EnvAIMAdapterMaxCPUCount], env[constants.EnvAIMAdapterMaxRank])
 	}
 	if _, ok := env[constants.EnvAIMAdapterRefreshInterval]; ok {
@@ -963,7 +1320,7 @@ func TestAddVolumeMountDynamicSetsRefreshInterval(t *testing.T) {
 	svc := serviceWithAdapters("lora-a")
 	svc.Spec.AdapterMode = aimv1alpha1.AdapterModeDynamic
 	isvc := isvcWithContainer()
-	AddVolumeMount(isvc, svc, testAdapterPVC)
+	AddVolumeMount(isvc, svc, testAdapterPVC, constants.DefaultAIMAdapterMaxRank)
 
 	env := envMap(isvc.Spec.Predictor.Containers[0].Env)
 	if env[constants.EnvAIMAdapterMode] != string(aimv1alpha1.AdapterModeDynamic) {
@@ -971,6 +1328,15 @@ func TestAddVolumeMountDynamicSetsRefreshInterval(t *testing.T) {
 	}
 	if env[constants.EnvAIMAdapterRefreshInterval] != "30" {
 		t.Errorf("AIM_ADAPTER_REFRESH_INTERVAL = %q, want 30", env[constants.EnvAIMAdapterRefreshInterval])
+	}
+}
+
+func TestDecorateStatusReportsResolvedRank(t *testing.T) {
+	status := &aimv1alpha1.AIMServiceStatus{AdapterMaxRank: 32}
+
+	DecorateStatus(status, State{MaxRank: 64})
+	if status.AdapterMaxRank != 64 {
+		t.Errorf("status.AdapterMaxRank = %d, want resolved 64", status.AdapterMaxRank)
 	}
 }
 
@@ -1037,6 +1403,9 @@ func TestComposeAdapterModeEmptyProvisionsSubtree(t *testing.T) {
 	if st.SubtreeReady || st.Ready {
 		t.Error("subtree must not be ready before the first sync succeeds")
 	}
+	if st.MaxRank != constants.DefaultAIMAdapterMaxRank {
+		t.Errorf("dynamic empty service MaxRank = %d, want default %d", st.MaxRank, constants.DefaultAIMAdapterMaxRank)
+	}
 	var plan controllerutils.PlanResult
 	Plan(&plan, svc, deps, st, nil)
 	sawSync := false
@@ -1055,7 +1424,7 @@ func TestComposeAdapterModeEmptyProvisionsSubtree(t *testing.T) {
 		t.Errorf("subtree must be mountable after sync (SubtreeReady=%v Ready=%v)", st.SubtreeReady, st.Ready)
 	}
 	isvc := isvcWithContainer()
-	AddVolumeMount(isvc, svc, st.AdapterDiskPVC)
+	AddVolumeMount(isvc, svc, st.AdapterDiskPVC, st.MaxRank)
 	if len(isvc.Spec.Predictor.Containers[0].VolumeMounts) != 1 {
 		t.Error("adapter disk must be mounted even with zero adapters declared")
 	}

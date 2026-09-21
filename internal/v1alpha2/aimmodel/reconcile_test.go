@@ -38,6 +38,7 @@ import (
 	controllerutils "github.com/amd-enterprise-ai/aim-engine/internal/controller/utils"
 	"github.com/amd-enterprise-ai/aim-engine/internal/utils"
 	"github.com/amd-enterprise-ai/aim-engine/internal/v1alpha2/aimprofile"
+	"github.com/amd-enterprise-ai/aim-engine/internal/v1alpha2/profileyaml"
 )
 
 var errListNodesFailed = errors.New("list nodes failed")
@@ -160,9 +161,26 @@ func TestBuildDesiredOfficialProfiles_MarksProfilesAsImageDerived(t *testing.T) 
 	model := &aimv1alpha2.AIMModel{
 		ObjectMeta: metav1.ObjectMeta{Name: "qwen", Namespace: "team-a", UID: "model-uid"},
 	}
+	sourceContract, err := profileyaml.Inspect([]byte(`metadata:
+  engine: vllm
+  gpu: MI300X
+  gpu_count: 1
+  manual_selection_only: false
+  metric: latency
+  precision: fp16
+  type: optimized
+  capabilities:
+    reasoning: true
+engine_args: {}
+env_vars: {}
+`))
+	if err != nil {
+		t.Fatalf("Inspect source profile YAML: %v", err)
+	}
 	catalog := aimprofile.DiscoveryCatalog{
 		Profiles: []aimprofile.DiscoveryCatalogItem{{
-			BaseImage: "quay.io/amd/aim-base:0.10.0",
+			BaseImage:    "quay.io/amd/aim-base:0.10.0",
+			YAMLContract: sourceContract,
 			Spec: aimv1alpha2.AIMProfileSpecCommon{
 				AimId:     "qwen/Qwen3-32B",
 				ModelId:   "qwen/Qwen3-32B",
@@ -202,6 +220,22 @@ func TestBuildDesiredOfficialProfiles_MarksProfilesAsImageDerived(t *testing.T) 
 	if !aimprofile.IsProfileCopyable(profile.Annotations) {
 		t.Fatal("image-derived profile should be marked copyable")
 	}
+	discoveredContract, found, err := profileyaml.FromAnnotations(profile.Annotations)
+	if err != nil {
+		t.Fatalf("parse discovered profile YAML contract: %v", err)
+	}
+	if !found {
+		t.Fatal("discovered profile YAML contract annotation is missing")
+	}
+	for _, field := range []string{"gpu", "gpu_count", "manual_selection_only"} {
+		if !discoveredContract.HasMetadataField(field) {
+			t.Errorf("discovered profile YAML contract missing %q: %s", field, discoveredContract.Encode())
+		}
+	}
+	extensions := discoveredContract.Extensions()
+	if _, ok := extensions.Metadata["capabilities"]; !ok {
+		t.Errorf("discovered profile dropped capabilities: %#v", extensions.Metadata)
+	}
 }
 
 func TestBuildDesiredOfficialProfiles_PrimaryFallbackFromRecommendedDeployments(t *testing.T) {
@@ -230,12 +264,14 @@ func TestBuildDesiredOfficialProfiles_PrimaryFallbackFromRecommendedDeployments(
 				// tuple and the YAML didn't stamp `primary` itself, so the fallback
 				// should flip Primary to true.
 				PrimaryExplicit: false,
+				YAMLContract:    profileyaml.DefaultContract(),
 				Spec:            specCommon("vllm-mi300x-fp16-tp1-latency", "MI300X", 1, "fp16", "latency"),
 			},
 			{
 				// Same image, no matching recommended deployment for fp8 — fallback
 				// leaves Primary at the catalog default (false).
 				PrimaryExplicit: false,
+				YAMLContract:    profileyaml.DefaultContract(),
 				Spec:            specCommon("vllm-mi300x-fp8-tp1-latency", "MI300X", 1, "fp8", "latency"),
 			},
 			{
@@ -243,12 +279,14 @@ func TestBuildDesiredOfficialProfiles_PrimaryFallbackFromRecommendedDeployments(
 				// though this spec matches a recommended deployment, the fallback
 				// MUST NOT override an explicit value from the image author.
 				PrimaryExplicit: true,
+				YAMLContract:    profileyaml.DefaultContract(),
 				Spec:            specCommon("vllm-mi300x-fp16-tp1-throughput", "MI300X", 1, "fp16", "throughput"),
 			},
 			{
 				// Recommended deployment uses profileId — exact match on ProfileId
 				// wins regardless of the other fields.
 				PrimaryExplicit: false,
+				YAMLContract:    profileyaml.DefaultContract(),
 				Spec:            specCommon("vllm-mi300x-named-special", "MI300X", 1, "fp8", "latency"),
 			},
 		},
@@ -405,8 +443,9 @@ func TestComposeState_NodeListFailurePreventsPruningManagedProfiles(t *testing.T
 	catalog := aimprofile.DiscoveryCatalog{
 		AimID: "qwen/qwen3-32b",
 		Profiles: []aimprofile.DiscoveryCatalogItem{{
-			Name:    "tp2",
-			Version: "0.10.0",
+			Name:         "tp2",
+			Version:      "0.10.0",
+			YAMLContract: profileyaml.DefaultContract(),
 			Spec: aimv1alpha2.AIMProfileSpecCommon{
 				AimId:     "qwen/qwen3-32b",
 				ModelId:   "qwen/qwen3-32b-fp8",
@@ -442,6 +481,171 @@ func TestComposeState_NodeListFailurePreventsPruningManagedProfiles(t *testing.T
 	}
 }
 
+func TestComposeState_ProfileInventoryFailuresBlockNativeMutation(t *testing.T) {
+	readErr := errors.New("profile inventory read failed")
+	tests := []struct {
+		name  string
+		model *aimv1alpha2.AIMModel
+		fetch func(*aimv1alpha2.AIMModel) ModelFetchResult
+	}{
+		{
+			name: "managed profile list",
+			model: &aimv1alpha2.AIMModel{
+				ObjectMeta: metav1.ObjectMeta{Name: "generated", Namespace: "team-a", UID: "model-uid"},
+				Spec:       aimv1alpha1.AIMModelSpec{ModelID: "Qwen/Qwen3.5-0.8B"},
+			},
+			fetch: func(model *aimv1alpha2.AIMModel) ModelFetchResult {
+				return ModelFetchResult{
+					model: model,
+					nodes: controllerutils.FetchResult[[]corev1.Node]{
+						Value: []corev1.Node{testNVIDIANode()},
+					},
+					existingProfiles: controllerutils.FetchResult[[]managedProfile]{
+						Value: []managedProfile{{
+							Object: &aimv1alpha2.AIMProfile{
+								ObjectMeta: metav1.ObjectMeta{Name: "existing", Namespace: model.Namespace},
+							},
+						}},
+						Error: readErr,
+					},
+					runtimeConfig: controllerutils.FetchResult[*aimv1alpha1.AIMRuntimeConfigCommon]{
+						Value: generatedProfileRuntimeConfig(),
+					},
+				}
+			},
+		},
+		{
+			name: "child profile set",
+			model: &aimv1alpha2.AIMModel{
+				ObjectMeta: metav1.ObjectMeta{Name: "derived", Namespace: "team-a", UID: "model-uid"},
+				Spec: aimv1alpha1.AIMModelSpec{
+					DerivedFrom: &aimv1alpha1.AIMProfileSetSpec{
+						Selector: aimv1alpha1.ProfileSelector{AimId: "qwen/qwen3"},
+					},
+				},
+			},
+			fetch: func(model *aimv1alpha2.AIMModel) ModelFetchResult {
+				return ModelFetchResult{
+					model: model,
+					existingProfiles: controllerutils.FetchResult[[]managedProfile]{
+						Value: []managedProfile{{
+							Object: &aimv1alpha2.AIMProfile{
+								ObjectMeta: metav1.ObjectMeta{Name: "existing", Namespace: model.Namespace},
+							},
+						}},
+					},
+					childProfileSet: controllerutils.FetchResult[*aimv1alpha2.AIMProfileSet]{
+						Error: readErr,
+					},
+				}
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			reconciler := &ModelReconciler{}
+			fetch := tt.fetch(tt.model)
+			obs := reconciler.ComposeState(
+				context.Background(),
+				controllerutils.ReconcileContext[*aimv1alpha2.AIMModel]{Object: tt.model},
+				fetch,
+			)
+			plan := reconciler.PlanResources(
+				context.Background(),
+				controllerutils.ReconcileContext[*aimv1alpha2.AIMModel]{Object: tt.model},
+				obs,
+			)
+
+			if obs.BuildErr == nil || obs.pruneSafe {
+				t.Fatalf("observation did not preserve read failure: %#v", obs)
+			}
+			if len(plan.GetToApply()) != 0 ||
+				len(plan.GetToApplyWithoutOwnerRef()) != 0 ||
+				len(plan.GetToApplyWithForce()) != 0 ||
+				len(plan.GetToDelete()) != 0 {
+				t.Fatalf("read failure allowed native mutation: %#v", plan)
+			}
+			foundBlockingError := false
+			for _, health := range obs.componentHealth {
+				if len(health.Errors) > 0 && !health.NonBlocking {
+					foundBlockingError = true
+				}
+			}
+			if !foundBlockingError {
+				t.Fatalf("read failure was not surfaced as blocking health: %#v", obs.componentHealth)
+			}
+		})
+	}
+}
+
+func TestComposeState_DerivationPrunesOnlyAfterCurrentReplacementIsReady(t *testing.T) {
+	model := &aimv1alpha2.AIMModel{
+		ObjectMeta: metav1.ObjectMeta{Name: "derived", Namespace: "team-a", UID: "model-uid"},
+		Spec: aimv1alpha1.AIMModelSpec{
+			DerivedFrom: &aimv1alpha1.AIMProfileSetSpec{
+				Selector: aimv1alpha1.ProfileSelector{AimId: "qwen/qwen3"},
+			},
+		},
+	}
+	child := &aimv1alpha2.AIMProfileSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "derived-profiles",
+			Namespace:  model.Namespace,
+			Generation: 2,
+		},
+		Status: aimv1alpha1.AIMProfileSetStatus{
+			ObservedGeneration: 1,
+			Status:             constants.AIMStatusReady,
+			ManagedProfiles: aimv1alpha1.ManagedProfileCounts{
+				Total: 1,
+				Ready: 1,
+			},
+		},
+	}
+	fetch := ModelFetchResult{
+		model: model,
+		existingProfiles: controllerutils.FetchResult[[]managedProfile]{
+			Value: []managedProfile{{
+				Object: &aimv1alpha2.AIMProfile{
+					ObjectMeta: metav1.ObjectMeta{Name: "predecessor", Namespace: model.Namespace},
+				},
+			}},
+		},
+		childProfileSet: controllerutils.FetchResult[*aimv1alpha2.AIMProfileSet]{Value: child},
+	}
+	reconciler := &ModelReconciler{}
+
+	stale := reconciler.ComposeState(
+		context.Background(),
+		controllerutils.ReconcileContext[*aimv1alpha2.AIMModel]{Object: model},
+		fetch,
+	)
+	stalePlan := reconciler.PlanResources(
+		context.Background(),
+		controllerutils.ReconcileContext[*aimv1alpha2.AIMModel]{Object: model},
+		stale,
+	)
+	if stale.pruneSafe || len(stalePlan.GetToDelete()) != 0 {
+		t.Fatalf("stale replacement permitted pruning: observation %#v plan %#v", stale, stalePlan)
+	}
+
+	child.Status.ObservedGeneration = child.Generation
+	current := reconciler.ComposeState(
+		context.Background(),
+		controllerutils.ReconcileContext[*aimv1alpha2.AIMModel]{Object: model},
+		fetch,
+	)
+	currentPlan := reconciler.PlanResources(
+		context.Background(),
+		controllerutils.ReconcileContext[*aimv1alpha2.AIMModel]{Object: model},
+		current,
+	)
+	if !current.pruneSafe || len(currentPlan.GetToDelete()) != 1 {
+		t.Fatalf("current Ready replacement did not permit bounded prune: observation %#v plan %#v", current, currentPlan)
+	}
+}
+
 // TestPlanResources_DiscoveredProfilesCarryOwnerRefBranch pins the contract
 // that namespace AIMModel image-discovery profiles flow through the
 // ownerRef-bearing apply branch (PlanResult.toApply, returned by GetToApply),
@@ -462,8 +666,9 @@ func TestPlanResources_DiscoveredProfilesCarryOwnerRefBranch(t *testing.T) {
 	catalog := aimprofile.DiscoveryCatalog{
 		AimID: "qwen/qwen3-32b",
 		Profiles: []aimprofile.DiscoveryCatalogItem{{
-			Name:    "tp2",
-			Version: "0.10.0",
+			Name:         "tp2",
+			Version:      "0.10.0",
+			YAMLContract: profileyaml.DefaultContract(),
 			Spec: aimv1alpha2.AIMProfileSpecCommon{
 				AimId:        "qwen/qwen3-32b",
 				ModelId:      "qwen/qwen3-32b-fp8",
@@ -527,6 +732,29 @@ func TestBuildModelComponentHealth_PartialReadinessIsDegraded(t *testing.T) {
 	}
 }
 
+func TestBuildModelComponentHealth_NoCompatibleRuntimeIncludesRejection(t *testing.T) {
+	t.Parallel()
+
+	const diagnostic = `No configured runtime fallback matches available cluster hardware: fallback "nvidia-vllm": node "mainbox": resource nvidia.com/gpu requested 1, allocatable 0`
+	health := buildModelComponentHealth(ModelObservation{
+		ModelFetchResult: ModelFetchResult{
+			model: &aimv1alpha2.AIMModel{
+				Spec: aimv1alpha1.AIMModelSpec{ModelID: "Qwen/Qwen3.5-0.8B"},
+			},
+		},
+		ProfileGenerationFailureMessage: diagnostic,
+	})
+	if len(health) != 1 {
+		t.Fatalf("len(health) = %d, want 1", len(health))
+	}
+	if health[0].Reason != "NoCompatibleRuntime" {
+		t.Fatalf("reason = %q, want NoCompatibleRuntime", health[0].Reason)
+	}
+	if health[0].Message != diagnostic {
+		t.Fatalf("message = %q, want %q", health[0].Message, diagnostic)
+	}
+}
+
 func TestBuildModelComponentHealth_ProfileCopyZeroProfilesIsNotAvailable(t *testing.T) {
 	t.Parallel()
 
@@ -542,12 +770,77 @@ func TestBuildModelComponentHealth_ProfileCopyZeroProfilesIsNotAvailable(t *test
 		},
 		ManagedProfiles:      aimv1alpha1.ManagedProfileCounts{Total: 0, Ready: 0},
 		ExistingDesiredCount: 1,
+		ProfileSetCurrent:    true,
+		ProfileSetStatus:     constants.AIMStatusReady,
 	})
 	if len(health) != 1 {
 		t.Fatalf("len(health) = %d, want 1", len(health))
 	}
 	if health[0].State != constants.AIMStatusNotAvailable {
 		t.Fatalf("state = %q, want %q", health[0].State, constants.AIMStatusNotAvailable)
+	}
+}
+
+func TestComposeState_ProfileCopyUsesOnlyCurrentTerminalChildStatus(t *testing.T) {
+	model := &aimv1alpha2.AIMModel{
+		ObjectMeta: metav1.ObjectMeta{Name: "derived", Namespace: "team-a", UID: "model-uid"},
+		Spec: aimv1alpha1.AIMModelSpec{
+			ProfileCopy: &aimv1alpha1.AIMProfileSetSpec{
+				Selector: aimv1alpha1.ProfileSelector{AimId: "amd/example"},
+			},
+		},
+	}
+	child := &aimv1alpha2.AIMProfileSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "derived-profiles",
+			Namespace:  model.Namespace,
+			Generation: 2,
+		},
+		Status: aimv1alpha1.AIMProfileSetStatus{
+			ObservedGeneration: 2,
+			ManagedProfiles:    aimv1alpha1.ManagedProfileCounts{},
+		},
+	}
+	reconciler := &ModelReconciler{}
+	compose := func() ModelObservation {
+		return reconciler.ComposeState(
+			context.Background(),
+			controllerutils.ReconcileContext[*aimv1alpha2.AIMModel]{Object: model},
+			ModelFetchResult{
+				model:            model,
+				existingProfiles: controllerutils.FetchResult[[]managedProfile]{Value: nil},
+				childProfileSet:  controllerutils.FetchResult[*aimv1alpha2.AIMProfileSet]{Value: child},
+			},
+		)
+	}
+
+	for _, childStatus := range []constants.AIMStatus{
+		constants.AIMStatusNotAvailable,
+		constants.AIMStatusDegraded,
+		constants.AIMStatusFailed,
+	} {
+		t.Run(string(childStatus), func(t *testing.T) {
+			child.Status.Status = childStatus
+			child.Status.ObservedGeneration = child.Generation
+			current := compose()
+			if !current.ProfileSetCurrent || current.ProfileSetStatus != childStatus {
+				t.Fatalf("current child status was not preserved: %#v", current)
+			}
+			if len(current.componentHealth) != 1 ||
+				current.componentHealth[0].State != childStatus {
+				t.Fatalf("current %s child health = %#v, want %s", childStatus, current.componentHealth, childStatus)
+			}
+
+			child.Status.ObservedGeneration = child.Generation - 1
+			stale := compose()
+			if stale.ProfileSetCurrent {
+				t.Fatal("stale child status was treated as current")
+			}
+			if len(stale.componentHealth) != 1 ||
+				stale.componentHealth[0].State != constants.AIMStatusProgressing {
+				t.Fatalf("stale %s child health = %#v, want Progressing", childStatus, stale.componentHealth)
+			}
+		})
 	}
 }
 
@@ -629,7 +922,8 @@ func TestBuildDesiredOfficialProfiles_StampsRoleAndOriginLabels(t *testing.T) {
 	}
 	catalog := aimprofile.DiscoveryCatalog{
 		Profiles: []aimprofile.DiscoveryCatalogItem{{
-			BaseImage: "quay.io/amd/aim-base:0.10.0",
+			BaseImage:    "quay.io/amd/aim-base:0.10.0",
+			YAMLContract: profileyaml.DefaultContract(),
 			Spec: aimv1alpha2.AIMProfileSpecCommon{
 				AimId:     "qwen/Qwen3-32B",
 				ModelId:   "qwen/Qwen3-32B",
@@ -682,7 +976,8 @@ func TestBuildDesiredOfficialProfiles_BaseEntriesStampedAsBase(t *testing.T) {
 	}
 	catalog := aimprofile.DiscoveryCatalog{
 		Profiles: []aimprofile.DiscoveryCatalogItem{{
-			BaseImage: "ghcr.io/silogen/aim-base-vllm:0.1.0",
+			BaseImage:    "ghcr.io/silogen/aim-base-vllm:0.1.0",
+			YAMLContract: profileyaml.DefaultContract(),
 			Spec: aimv1alpha2.AIMProfileSpecCommon{
 				ProfileId: "vllm-cpu-bf16-tp1-latency",
 				Engine:    "vllm",

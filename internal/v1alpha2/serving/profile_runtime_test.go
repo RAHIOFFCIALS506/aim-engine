@@ -27,11 +27,15 @@ import (
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
+	"sigs.k8s.io/yaml"
 
 	aimv1alpha1 "github.com/amd-enterprise-ai/aim-engine/api/v1alpha1"
 	aimv1alpha2 "github.com/amd-enterprise-ai/aim-engine/api/v1alpha2"
 	"github.com/amd-enterprise-ai/aim-engine/internal/constants"
+	"github.com/amd-enterprise-ai/aim-engine/internal/v1alpha2/profileyaml"
 )
+
+const testVariant = "usp4"
 
 func sampleSpec() *aimv1alpha2.AIMProfileSpecCommon {
 	return &aimv1alpha2.AIMProfileSpecCommon{
@@ -48,30 +52,336 @@ func sampleSpec() *aimv1alpha2.AIMProfileSpecCommon {
 	}
 }
 
+func sourceContract(t *testing.T, optionalMetadata string) profileyaml.Contract {
+	t.Helper()
+	contract, err := profileyaml.Inspect([]byte(`metadata:
+  engine: vllm
+  metric: latency
+  precision: fp8
+  type: optimized
+` + optionalMetadata))
+	if err != nil {
+		t.Fatalf("Inspect source contract: %v", err)
+	}
+	return contract
+}
+
 func TestProfileFilename(t *testing.T) {
 	cases := []struct {
-		name      string
-		accModel  string
-		precision string
-		accCount  int32
-		metric    string
-		want      string
+		name string
+		spec *aimv1alpha2.AIMProfileSpecCommon
+		want string
 	}{
-		{"gpu profile", "MI300X", "fp8", 1, "latency", "vllm-mi300x-fp8-tp1-latency.yaml"},
-		{"empty accelerator falls back to none", "", "fp16", 0, "latency", "vllm-none-fp16-tp0-latency.yaml"},
+		{
+			name: "discovered profile id is authoritative",
+			spec: &aimv1alpha2.AIMProfileSpecCommon{
+				ProfileId: "vllm_omni-mi300x-fp16-tp4-latency-usp4",
+				Engine:    "vllm_omni",
+				Variant:   testVariant,
+			},
+			want: "vllm_omni-mi300x-fp16-tp4-latency-usp4.yaml",
+		},
+		{
+			name: "engine-aware fallback includes variant",
+			spec: &aimv1alpha2.AIMProfileSpecCommon{
+				Engine:           "vllm_omni",
+				Variant:          testVariant,
+				AcceleratorModel: "MI300X",
+				Precision:        aimv1alpha1.AIMPrecision("fp16"),
+				AcceleratorCount: 4,
+				Metric:           aimv1alpha1.AIMMetric("latency"),
+			},
+			want: "vllm_omni-mi300x-fp16-tp4-latency-usp4.yaml",
+		},
+		{
+			name: "empty engine preserves legacy vllm fallback",
+			spec: &aimv1alpha2.AIMProfileSpecCommon{
+				Precision: aimv1alpha1.AIMPrecision("fp16"),
+				Metric:    aimv1alpha1.AIMMetric("latency"),
+			},
+			want: "vllm-none-fp16-tp0-latency.yaml",
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := ProfileFilename(tc.accModel, tc.precision, tc.accCount, tc.metric); got != tc.want {
+			got, err := ProfileFilename(tc.spec)
+			if err != nil {
+				t.Fatalf("ProfileFilename error: %v", err)
+			}
+			if got != tc.want {
 				t.Fatalf("ProfileFilename = %q, want %q", got, tc.want)
 			}
 		})
 	}
 }
 
+func TestProfileFilename_InvalidDiscoveredID(t *testing.T) {
+	_, err := ProfileFilename(&aimv1alpha2.AIMProfileSpecCommon{ProfileId: "nested/profile"})
+	if err == nil {
+		t.Fatal("expected invalid ConfigMap key error")
+	}
+}
+
 func TestAssembleProfileYAML_NilSpec(t *testing.T) {
 	if _, _, err := AssembleProfileYAML(nil); err == nil {
 		t.Fatalf("expected error for nil spec")
+	}
+}
+
+func TestAssembleProfileYAML_PreservesWanIdentity(t *testing.T) {
+	spec := sampleSpec()
+	spec.ProfileId = "vllm_omni-mi300x-fp16-tp4-latency-usp4"
+	spec.Engine = "vllm_omni"
+	spec.Variant = testVariant
+	spec.Precision = aimv1alpha1.AIMPrecision("fp16")
+	spec.AcceleratorCount = 4
+
+	yamlBytes, filename, err := AssembleProfileYAML(spec)
+	if err != nil {
+		t.Fatalf("AssembleProfileYAML error: %v", err)
+	}
+	if filename != spec.ProfileId+".yaml" {
+		t.Fatalf("filename = %q, want %q", filename, spec.ProfileId+".yaml")
+	}
+
+	var parsed ProfileYAML
+	if err := yaml.Unmarshal(yamlBytes, &parsed); err != nil {
+		t.Fatalf("unmarshal profile yaml: %v", err)
+	}
+	if parsed.Metadata.Variant != testVariant {
+		t.Errorf("metadata.variant = %q, want usp4", parsed.Metadata.Variant)
+	}
+}
+
+func TestAssembleProfileYAMLForContract_EmitsSourceFieldSet(t *testing.T) {
+	spec := sampleSpec()
+	spec.ManualSelectionOnly = true //nolint:staticcheck // Compatibility serialization is under test.
+
+	cases := []struct {
+		name     string
+		contract profileyaml.Contract
+		present  []string
+		absent   []string
+	}{
+		{
+			name:     "legacy GPU schema",
+			contract: sourceContract(t, "  gpu: MI300X\n  gpu_count: 1\n  manual_selection_only: true\n"),
+			present:  []string{"gpu", "gpu_count", "manual_selection_only"},
+			absent:   []string{"accelerator_model", "accelerator_type", "accelerator_count"},
+		},
+		{
+			name:     "transitional accelerator schema",
+			contract: sourceContract(t, "  accelerator_model: MI300X\n  accelerator_type: gpu\n  accelerator_count: 1\n  manual_selection_only: true\n"),
+			present:  []string{"accelerator_model", "accelerator_type", "accelerator_count", "manual_selection_only"},
+			absent:   []string{"gpu", "gpu_count"},
+		},
+		{
+			name:     "strict accelerator schema",
+			contract: profileyaml.DefaultContract(),
+			present:  []string{"accelerator_model", "accelerator_type", "accelerator_count"},
+			absent:   []string{"gpu", "gpu_count", "manual_selection_only"},
+		},
+		{
+			name:     "accelerator-free source schema",
+			contract: sourceContract(t, "  manual_selection_only: true\n"),
+			present:  []string{"manual_selection_only"},
+			absent: []string{
+				"gpu", "gpu_count",
+				"accelerator_model", "accelerator_type", "accelerator_count",
+			},
+		},
+		{
+			name:     "mixed source schema",
+			contract: sourceContract(t, "  gpu: MI300X\n  gpu_count: 1\n  accelerator_model: MI300X\n  accelerator_type: gpu\n  accelerator_count: 1\n  manual_selection_only: true\n"),
+			present: []string{
+				"gpu", "gpu_count",
+				"accelerator_model", "accelerator_type", "accelerator_count",
+				"manual_selection_only",
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			yamlBytes, _, err := AssembleProfileYAMLForContract(spec, tc.contract)
+			if err != nil {
+				t.Fatalf("AssembleProfileYAMLForContract error: %v", err)
+			}
+
+			var decoded struct {
+				Metadata map[string]any `json:"metadata"`
+			}
+			if err := yaml.Unmarshal(yamlBytes, &decoded); err != nil {
+				t.Fatalf("unmarshal profile YAML: %v", err)
+			}
+			for _, key := range tc.present {
+				if _, ok := decoded.Metadata[key]; !ok {
+					t.Errorf("metadata missing %q:\n%s", key, yamlBytes)
+				}
+			}
+			for _, key := range tc.absent {
+				if _, ok := decoded.Metadata[key]; ok {
+					t.Errorf("metadata unexpectedly contains %q:\n%s", key, yamlBytes)
+				}
+			}
+			if tc.contract.HasMetadataField("manual_selection_only") {
+				if got, ok := decoded.Metadata["manual_selection_only"].(bool); !ok || !got {
+					t.Errorf("manual_selection_only = %#v, want true", decoded.Metadata["manual_selection_only"])
+				}
+			}
+		})
+	}
+}
+
+func TestAssembleProfileYAMLForContract_DoesNotIntroduceAbsentOptionalFields(t *testing.T) {
+	spec := sampleSpec()
+	spec.Variant = testVariant
+	spec.Features = []string{"adapters"}
+	contract := sourceContract(t, "  accelerator_model: MI300X\n  accelerator_type: gpu\n  accelerator_count: 1\n")
+
+	yamlBytes, _, err := AssembleProfileYAMLForContract(spec, contract)
+	if err != nil {
+		t.Fatalf("AssembleProfileYAMLForContract: %v", err)
+	}
+	var decoded struct {
+		Metadata map[string]any `json:"metadata"`
+	}
+	if err := yaml.Unmarshal(yamlBytes, &decoded); err != nil {
+		t.Fatalf("unmarshal profile YAML: %v", err)
+	}
+	for _, field := range []string{"variant", "features"} {
+		if _, ok := decoded.Metadata[field]; ok {
+			t.Errorf("projected YAML introduced absent source field %q:\n%s", field, yamlBytes)
+		}
+	}
+}
+
+func TestAssembleProfileYAMLForContract_PreservesEmptyFeaturesSequence(t *testing.T) {
+	spec := sampleSpec()
+	spec.Features = nil
+	contract := sourceContract(t, "  features: []\n")
+
+	yamlBytes, _, err := AssembleProfileYAMLForContract(spec, contract)
+	if err != nil {
+		t.Fatalf("AssembleProfileYAMLForContract: %v", err)
+	}
+
+	var decoded struct {
+		Metadata map[string]any `json:"metadata"`
+	}
+	if err := yaml.Unmarshal(yamlBytes, &decoded); err != nil {
+		t.Fatalf("unmarshal profile YAML: %v", err)
+	}
+	features, ok := decoded.Metadata["features"].([]any)
+	if !ok {
+		t.Fatalf("metadata.features = %#v (%T), want empty sequence", decoded.Metadata["features"], decoded.Metadata["features"])
+	}
+	if len(features) != 0 {
+		t.Fatalf("metadata.features = %#v, want empty sequence", features)
+	}
+	if strings.Contains(string(yamlBytes), "features: null") {
+		t.Fatalf("projected YAML rendered empty features as null:\n%s", yamlBytes)
+	}
+}
+
+func TestAssembleProfileYAMLForContract_KeepsOpaqueValueUntilReinspection(t *testing.T) {
+	contract, err := profileyaml.Parse(`{
+		"codec": "aim-profile/v1",
+		"metadataFields": ["engine", "metric", "precision", "type"],
+		"extensions": {
+			"metadata": {
+				"variant": "opaque-source-value"
+			}
+		}
+	}`)
+	if err != nil {
+		t.Fatalf("Parse contract: %v", err)
+	}
+	spec := sampleSpec()
+	spec.Variant = "typed-value-not-yet-migrated"
+
+	yamlBytes, _, err := AssembleProfileYAMLForContract(spec, contract)
+	if err != nil {
+		t.Fatalf("AssembleProfileYAMLForContract: %v", err)
+	}
+	var decoded struct {
+		Metadata map[string]any `json:"metadata"`
+	}
+	if err := yaml.Unmarshal(yamlBytes, &decoded); err != nil {
+		t.Fatalf("unmarshal profile YAML: %v", err)
+	}
+	if got := decoded.Metadata["variant"]; got != "opaque-source-value" {
+		t.Fatalf("metadata.variant = %#v, want preserved opaque source value", got)
+	}
+}
+
+func TestAssembleProfileYAMLForContract_PreservesUnmodeledSourceExtensions(t *testing.T) {
+	source := []byte(`profile_schema_version: 1
+aim_id: openai/gpt-oss-20b
+model_id: openai/gpt-oss-20b
+metadata:
+  engine: vllm
+  accelerator_type: gpu
+  accelerator_model: MI300X
+  accelerator_count: 1
+  precision: fp4
+  metric: latency
+  type: optimized
+  primary: true
+  capabilities:
+    tool_calling: true
+    structured_outputs: true
+    reasoning: true
+  future_runtime_hint:
+    mode: fast
+engine_args: {}
+env_vars: {}
+future_top_level:
+  enabled: true
+`)
+	contract, err := profileyaml.Inspect(source)
+	if err != nil {
+		t.Fatalf("Inspect: %v", err)
+	}
+
+	spec := sampleSpec()
+	spec.AcceleratorModel = "MI325X"
+	spec.Primary = false
+
+	yamlBytes, _, err := AssembleProfileYAMLForContract(spec, contract)
+	if err != nil {
+		t.Fatalf("AssembleProfileYAMLForContract: %v", err)
+	}
+
+	var decoded map[string]any
+	if err := yaml.Unmarshal(yamlBytes, &decoded); err != nil {
+		t.Fatalf("unmarshal projected profile YAML: %v", err)
+	}
+	metadata, ok := decoded["metadata"].(map[string]any)
+	if !ok {
+		t.Fatalf("metadata = %T, want object", decoded["metadata"])
+	}
+	if metadata["accelerator_model"] != "MI325X" {
+		t.Errorf("accelerator_model = %#v, want normalized override", metadata["accelerator_model"])
+	}
+	if metadata["primary"] != false {
+		t.Errorf("primary = %#v, want normalized false", metadata["primary"])
+	}
+	capabilities, ok := metadata["capabilities"].(map[string]any)
+	if !ok || capabilities["reasoning"] != true || capabilities["tool_calling"] != true {
+		t.Errorf("capabilities not preserved: %#v", metadata["capabilities"])
+	}
+	if _, ok := metadata["future_runtime_hint"]; !ok {
+		t.Errorf("future_runtime_hint not preserved: %#v", metadata)
+	}
+	if decoded["profile_schema_version"] != float64(1) {
+		t.Errorf("profile_schema_version = %#v, want 1", decoded["profile_schema_version"])
+	}
+	if _, ok := decoded["future_top_level"]; !ok {
+		t.Errorf("future_top_level not preserved: %#v", decoded)
+	}
+	if _, ok := metadata["gpu"]; ok {
+		t.Errorf("strict source unexpectedly gained legacy gpu field: %#v", metadata)
 	}
 }
 
@@ -101,9 +411,9 @@ func TestBuildProfileVolumeMount_ReadOnlyUnderBase(t *testing.T) {
 	}
 }
 
-// TestBuildFrameworkEnvVars_NoModelSources asserts the standalone case: only
-// AIM_PROFILE_ID and AIM_ID (set to the profile's aimId) are emitted, so a
-// per-AIM image can serve without a cache redirect.
+// TestBuildFrameworkEnvVars_NoModelSources asserts the standalone case:
+// AIM_ENGINE, AIM_PROFILE_ID and AIM_ID (set to the profile's aimId) are
+// emitted, so a per-AIM image can serve without a cache redirect.
 func TestBuildFrameworkEnvVars_NoModelSources(t *testing.T) {
 	env := envMap(BuildFrameworkEnvVars(sampleSpec(), "vllm-mi300x-fp8-tp1-latency.yaml"))
 
@@ -112,6 +422,9 @@ func TestBuildFrameworkEnvVars_NoModelSources(t *testing.T) {
 	}
 	if env[constants.EnvAIMID] != "qwen/qwen3-32b" {
 		t.Errorf("AIM_ID = %q, want the profile aimId when not redirecting", env[constants.EnvAIMID])
+	}
+	if env[constants.EnvAIMEngine] != sampleSpec().Engine {
+		t.Errorf("AIM_ENGINE = %q, want %q", env[constants.EnvAIMEngine], sampleSpec().Engine)
 	}
 	if _, ok := env[constants.EnvAIMModelID]; ok {
 		t.Errorf("AIM_MODEL_ID must be unset without modelSources")
@@ -135,6 +448,19 @@ func TestBuildFrameworkEnvVars_WithModelSources(t *testing.T) {
 	}
 	if env[constants.EnvAIMCachePath] != constants.AIMCacheBasePath {
 		t.Errorf("AIM_CACHE_PATH = %q, want %q", env[constants.EnvAIMCachePath], constants.AIMCacheBasePath)
+	}
+	if env[constants.EnvAIMEngine] != spec.Engine {
+		t.Errorf("AIM_ENGINE = %q, want %q", env[constants.EnvAIMEngine], spec.Engine)
+	}
+}
+
+func TestBuildFrameworkEnvVars_EmptyEngineIsOmitted(t *testing.T) {
+	spec := sampleSpec()
+	spec.Engine = ""
+
+	env := envMap(BuildFrameworkEnvVars(spec, "vllm-mi300x-fp8-tp1-latency.yaml"))
+	if _, ok := env[constants.EnvAIMEngine]; ok {
+		t.Errorf("AIM_ENGINE must be unset when the profile does not declare an engine")
 	}
 }
 

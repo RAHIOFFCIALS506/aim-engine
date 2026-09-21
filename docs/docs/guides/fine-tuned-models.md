@@ -147,12 +147,14 @@ kind: AIMService
 metadata:
   name: llama-finetune-service
   namespace: ml-team
+  annotations:
+    aim.eai.amd.com/reconciler-pipeline: profile
 spec:
   model:
     name: llama-3-8b-finetune-acme
 ```
 
-`spec.model.name` resolves to the deployable profiles produced by the fine-tune AIMModel and ranks them by `primary > type > version`. Add `spec.profile.selector` to narrow further (for example, force `precision: fp8`).
+`spec.model.name` resolves to the deployable profiles produced by the fine-tune AIMModel and applies the shared deterministic profile ranking. The annotation selects the profile pipeline during the v1alpha1 → v1alpha2 migration window. Add `spec.profile.selector` to narrow further (for example, force `precision: fp8`), and see [Deploying Services](deploying-services.md#ranking) for the complete ranking order.
 
 ## Common patterns
 
@@ -239,6 +241,6 @@ With `versionPolicy: pinned`, the derivation is locked to a specific upstream ve
 
 - [Custom Models](custom-models.md) — Derive from base-image base profiles when no official model matches your architecture
 - [Deploying Services](deploying-services.md) — Resolution shapes and overlay patterns for `AIMService`
-- [AIM Models](../concepts/models.md) — Full lifecycle of all three model flows
+- [AIM Models](../concepts/models.md) — Full lifecycle of all four model flows
 - [AIM Profile Sets](../concepts/profilesets.md) — The derivation machinery underneath `spec.profiles`
 - [Profiles](../concepts/profiles.md) — Provenance labels, status fields, override semantics

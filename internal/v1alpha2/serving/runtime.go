@@ -23,8 +23,10 @@
 package serving
 
 import (
+	"crypto/sha256"
+	"encoding/json"
 	"fmt"
-	"path/filepath"
+	"maps"
 	"sort"
 	"strings"
 
@@ -38,6 +40,7 @@ import (
 	aimv1alpha2 "github.com/amd-enterprise-ai/aim-engine/api/v1alpha2"
 	"github.com/amd-enterprise-ai/aim-engine/internal/constants"
 	"github.com/amd-enterprise-ai/aim-engine/internal/utils"
+	"github.com/amd-enterprise-ai/aim-engine/internal/v1alpha2/profileyaml"
 )
 
 const (
@@ -49,7 +52,7 @@ const (
 	// reserved-prefix policy ALONE — a hand-authored runtime uses any other name,
 	// so a force-apply can only ever clobber a runtime AIM Engine owns, regardless
 	// of whether the name is hashed. See CONTEXT.md "Reserved `aim-` prefix" /
-	// "Authoritative apply" and ADR 0008.
+	// "Authoritative apply".
 	//
 	// Per-profile runtimes add one further margin ON TOP OF the prefix policy:
 	// RuntimeName appends a deterministic hash of the profile name, so the exact
@@ -86,7 +89,7 @@ const (
 //   - suffixed with an unguessable SHA-256-derived hash of profileName.
 //
 // The reserved aim- prefix already makes AIM Engine authoritative over this name
-// (see RuntimeNamePrefix, CONTEXT.md "Authoritative apply", ADR 0008), so the
+// (see RuntimeNamePrefix and CONTEXT.md "Authoritative apply"), so the
 // unconditional force-apply is safe on the prefix policy alone. The hash suffix
 // is an ADDITIONAL margin specific to the per-profile scheme: a hand-authored
 // object cannot even land on the exact aim-<truncated-profile>-<hash> name by
@@ -133,7 +136,7 @@ func ModelSlug(aimId string) string {
 // reserved aim- prefix policy alone — AIM Engine owns everything under aim-
 // exclusively, so a force-apply can only clobber a runtime it owns regardless of
 // whether the name is hashed. See CONTEXT.md "Reserved `aim-` prefix" /
-// "Authoritative apply" and ADR 0008.
+// "Authoritative apply".
 func ModelSlugRuntimeName(aimId string) string {
 	slug := ModelSlug(aimId)
 	if maxSlug := utils.MaxKubernetesNameLength - len(RuntimeNamePrefix); len(slug) > maxSlug {
@@ -170,6 +173,12 @@ type NamespaceRuntimeInput struct {
 	// Spec is the resolved profile spec (consumer overlays already
 	// materialised). Required.
 	Spec *aimv1alpha2.AIMProfileSpecCommon
+
+	// YAMLContract is inferred from the source profile YAML and inherited by
+	// derived profiles. Generated and hand-authored profiles pass an explicit
+	// CanonicalContract. The zero value is invalid so missing propagation fails
+	// during validation instead of silently changing the runtime schema.
+	YAMLContract profileyaml.Contract
 
 	// Resources is the resolved predictor resource requirements (the profile
 	// status.resources the profile controller computed). Falls back to
@@ -214,7 +223,7 @@ func BuildNamespaceServingRuntime(input NamespaceRuntimeInput) (*kservev1alpha1.
 
 	spec := input.Spec
 
-	yamlBytes, filename, err := AssembleProfileYAML(spec)
+	yamlBytes, filename, err := AssembleProfileYAMLForContract(spec, input.YAMLContract)
 	if err != nil {
 		return nil, nil, fmt.Errorf("assemble profile YAML: %w", err)
 	}
@@ -226,19 +235,30 @@ func BuildNamespaceServingRuntime(input NamespaceRuntimeInput) (*kservev1alpha1.
 	labels := runtimeLabels(input.ProfileName, spec)
 	annotations := runtimeAnnotations(input.ProfileName, spec)
 
-	configMap := BuildProfileConfigMap(runtimeName, input.Namespace, labels, filename, yamlBytes)
-	configMap.Annotations = annotations
+	configMap := BuildProfileConfigMap(runtimeName, input.Namespace, maps.Clone(labels), filename, yamlBytes)
+	configMap.Annotations = maps.Clone(annotations)
 
-	// Framework AIM_* env wins over the profile's container env: the
-	// identity-of-the-profile vars belong to the framework, not the user.
-	envVars := upsertEnvVars(spec.ContainerEnv, BuildFrameworkEnvVars(spec, filename))
+	modelReference := resolveVLLMModelReference(spec, input.Cache)
+	envVars := buildRuntimeEnv(spec, filename, modelReference)
 
-	volumes := []corev1.Volume{sharedMemoryVolume(), BuildProfileVolume(runtimeName)}
+	volumes := []corev1.Volume{sharedMemoryVolume(spec.Engine), BuildProfileVolume(runtimeName)}
 	mounts := []corev1.VolumeMount{sharedMemoryMount(), BuildProfileVolumeMount(spec.AimId)}
 
 	cacheVolumes, cacheMounts := buildProfileCacheMounts(input.Cache)
 	volumes = append(volumes, cacheVolumes...)
 	mounts = append(mounts, cacheMounts...)
+
+	runtimeSpec, err := buildRuntimeSpec(
+		spec,
+		input.Resources,
+		envVars,
+		volumes,
+		mounts,
+		input.NodeAffinity,
+	)
+	if err != nil {
+		return nil, nil, fmt.Errorf("build runtime spec: %w", err)
+	}
 
 	runtime := &kservev1alpha1.ServingRuntime{
 		TypeMeta: metav1.TypeMeta{
@@ -251,10 +271,50 @@ func BuildNamespaceServingRuntime(input NamespaceRuntimeInput) (*kservev1alpha1.
 			Labels:      labels,
 			Annotations: annotations,
 		},
-		Spec: buildRuntimeSpec(spec, input.Resources, envVars, volumes, mounts, input.NodeAffinity),
+		Spec: runtimeSpec,
 	}
 
+	contentHash, err := RuntimeProjectionContentHash(runtime, configMap)
+	if err != nil {
+		return nil, nil, fmt.Errorf("hash runtime projection content: %w", err)
+	}
+	runtime.Annotations[constants.AnnotationRuntimeProjectionContentHash] = contentHash
+	configMap.Annotations[constants.AnnotationRuntimeProjectionContentHash] = contentHash
+
 	return runtime, configMap, nil
+}
+
+// runtimeProjectionContent contains exactly the fields that can change what a
+// pod receives from a namespaced ServingRuntime projection. Object metadata is
+// intentionally absent: names are checked independently, while labels,
+// annotations, owner references, resource versions, managed fields, and
+// timestamps do not change the projected pod or profile file.
+type runtimeProjectionContent struct {
+	RuntimeSpec         kservev1alpha1.ServingRuntimeSpec `json:"runtimeSpec"`
+	ConfigMapData       map[string]string                 `json:"configMapData,omitempty"`
+	ConfigMapBinaryData map[string][]byte                 `json:"configMapBinaryData,omitempty"`
+	ConfigMapImmutable  *bool                             `json:"configMapImmutable,omitempty"`
+}
+
+// RuntimeProjectionContentHash returns a deterministic SHA-256 hash of the
+// workload-affecting content shared by a namespaced ServingRuntime and its
+// colocated ConfigMap. It excludes ephemeral metadata and the hash annotation
+// itself, so repeated builds from equivalent profile/cache inputs are stable.
+func RuntimeProjectionContentHash(runtime *kservev1alpha1.ServingRuntime, configMap *corev1.ConfigMap) (string, error) {
+	if runtime == nil || configMap == nil {
+		return "", fmt.Errorf("ServingRuntime and ConfigMap must both be non-nil")
+	}
+	content := runtimeProjectionContent{
+		RuntimeSpec:         runtime.Spec,
+		ConfigMapData:       configMap.Data,
+		ConfigMapBinaryData: configMap.BinaryData,
+		ConfigMapImmutable:  configMap.Immutable,
+	}
+	data, err := json.Marshal(content)
+	if err != nil {
+		return "", fmt.Errorf("marshal projection content: %w", err)
+	}
+	return fmt.Sprintf("%x", sha256.Sum256(data)), nil
 }
 
 // ClusterRuntimeInput carries everything the shared builder needs to project a
@@ -332,11 +392,27 @@ func BuildClusterServingRuntime(input ClusterRuntimeInput) (*kservev1alpha1.Clus
 	labels := runtimeLabels(input.ProfileName, spec)
 	annotations := runtimeAnnotations(input.ProfileName, spec)
 
-	filename := ProfileFilename(spec.AcceleratorModel, string(spec.Precision), spec.AcceleratorCount, string(spec.Metric))
-	envVars := upsertEnvVars(spec.ContainerEnv, BuildFrameworkEnvVars(spec, filename))
+	filename, err := ProfileFilename(spec)
+	if err != nil {
+		return nil, fmt.Errorf("resolve profile filename: %w", err)
+	}
+	modelReference := resolveVLLMModelReference(spec, nil)
+	envVars := buildRuntimeEnv(spec, filename, modelReference)
 
-	volumes := []corev1.Volume{sharedMemoryVolume()}
+	volumes := []corev1.Volume{sharedMemoryVolume(spec.Engine)}
 	mounts := []corev1.VolumeMount{sharedMemoryMount()}
+
+	runtimeSpec, err := buildRuntimeSpec(
+		spec,
+		input.Resources,
+		envVars,
+		volumes,
+		mounts,
+		input.NodeAffinity,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("build runtime spec: %w", err)
+	}
 
 	return &kservev1alpha1.ClusterServingRuntime{
 		TypeMeta: metav1.TypeMeta{
@@ -348,15 +424,17 @@ func BuildClusterServingRuntime(input ClusterRuntimeInput) (*kservev1alpha1.Clus
 			Labels:      labels,
 			Annotations: annotations,
 		},
-		Spec: buildRuntimeSpec(spec, input.Resources, envVars, volumes, mounts, input.NodeAffinity),
+		Spec: runtimeSpec,
 	}, nil
 }
 
 // buildRuntimeSpec assembles the ServingRuntimeSpec shared by the namespace
 // ServingRuntime and the cluster ClusterServingRuntime: one predictor container
 // (image, env, resources, ports, mounts), the supplied volumes, the standard
-// supportedModelFormat and v2 protocol, and the resolved node affinity when
-// present. autoSelect is always OFF: every projected runtime — per-profile and
+// supportedModelFormat, and the resolved node affinity when present. Legacy
+// AIM runtimes retain their v2 protocol declaration; direct upstream vLLM
+// exposes its native OpenAI API and does not claim KServe protocol v2.
+// autoSelect is always OFF: every projected runtime — per-profile and
 // model-slug primary alike — shares the single RuntimeModelFormat, so enabling
 // autoSelect would make KServe's format-based auto-selection ambiguous across
 // unrelated models (and hijack any co-installed generic huggingface runtime).
@@ -368,7 +446,12 @@ func buildRuntimeSpec(
 	volumes []corev1.Volume,
 	mounts []corev1.VolumeMount,
 	nodeAffinity *corev1.NodeAffinity,
-) kservev1alpha1.ServingRuntimeSpec {
+) (kservev1alpha1.ServingRuntimeSpec, error) {
+	invocation, err := buildEngineInvocation(spec)
+	if err != nil {
+		return kservev1alpha1.ServingRuntimeSpec{}, err
+	}
+
 	container := corev1.Container{
 		Name:            constants.ContainerKServe,
 		Image:           spec.Image,
@@ -383,6 +466,8 @@ func buildRuntimeSpec(
 			},
 		},
 		VolumeMounts: mounts,
+		Command:      invocation.Command,
+		Args:         invocation.Args,
 	}
 
 	runtimeSpec := kservev1alpha1.ServingRuntimeSpec{
@@ -392,25 +477,31 @@ func buildRuntimeSpec(
 				AutoSelect: ptr.To(false),
 			},
 		},
-		ProtocolVersions: []kserveconstants.InferenceServiceProtocol{kserveconstants.ProtocolV2},
 		ServingRuntimePodSpec: kservev1alpha1.ServingRuntimePodSpec{
 			Containers:       []corev1.Container{container},
 			Volumes:          volumes,
 			ImagePullSecrets: utils.CopyPullSecrets(spec.ImagePullSecrets),
 		},
 	}
+	if !usesDirectVLLM(spec) {
+		runtimeSpec.ProtocolVersions = []kserveconstants.InferenceServiceProtocol{kserveconstants.ProtocolV2}
+	}
 
 	if nodeAffinity != nil {
 		runtimeSpec.Affinity = &corev1.Affinity{NodeAffinity: nodeAffinity}
 	}
 
-	return runtimeSpec
+	return runtimeSpec, nil
 }
 
 // sharedMemoryVolume returns the emptyDir-backed /dev/shm volume every predictor
 // needs for multi-worker engines.
-func sharedMemoryVolume() corev1.Volume {
-	dshmSizeLimit := resource.MustParse(constants.DefaultSharedMemorySize)
+func sharedMemoryVolume(engine string) corev1.Volume {
+	size := constants.DefaultSharedMemorySize
+	if strings.EqualFold(engine, "vllm_omni") {
+		size = constants.VLLMOmniSharedMemorySize
+	}
+	dshmSizeLimit := resource.MustParse(size)
 	return corev1.Volume{
 		Name: constants.VolumeSharedMemory,
 		VolumeSource: corev1.VolumeSource{
@@ -533,7 +624,7 @@ func buildProfileCacheMounts(cache *aimv1alpha2.AIMProfileCache) ([]corev1.Volum
 			continue
 		}
 
-		volumeName := strings.ReplaceAll(utils.MakeRFC1123Compliant(resolved.Name), ".", "-")
+		volumeName := artifactVolumeName(resolved)
 
 		volumes = append(volumes, corev1.Volume{
 			Name: volumeName,
@@ -544,18 +635,9 @@ func buildProfileCacheMounts(cache *aimv1alpha2.AIMProfileCache) ([]corev1.Volum
 			},
 		})
 
-		mountPath := resolved.MountPoint
-		if mountPath == "" {
-			safeModelName := strings.ReplaceAll(resolved.Model, "..", "")
-			if safeModelName == "" || safeModelName == "." {
-				safeModelName = volumeName
-			}
-			mountPath = filepath.Join(constants.AIMCacheBasePath, safeModelName)
-		}
-
 		mounts = append(mounts, corev1.VolumeMount{
 			Name:      volumeName,
-			MountPath: mountPath,
+			MountPath: resolvedArtifactMountPath(resolved, volumeName),
 		})
 	}
 

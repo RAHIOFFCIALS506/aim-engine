@@ -37,6 +37,7 @@ import (
 
 	aimv1alpha1 "github.com/amd-enterprise-ai/aim-engine/api/v1alpha1"
 	aimv1alpha2 "github.com/amd-enterprise-ai/aim-engine/api/v1alpha2"
+	"github.com/amd-enterprise-ai/aim-engine/internal/v1alpha2/profileyaml"
 )
 
 // Discovery cache on-disk layout (ConfigMap data keys):
@@ -82,10 +83,11 @@ type DiscoveryCatalog struct {
 
 // DiscoveryCatalogItem is one normalized discovered profile entry.
 type DiscoveryCatalogItem struct {
-	Name      string
-	Spec      aimv1alpha2.AIMProfileSpecCommon
-	Version   string
-	BaseImage string
+	Name         string
+	Spec         aimv1alpha2.AIMProfileSpecCommon
+	Version      string
+	BaseImage    string
+	YAMLContract profileyaml.Contract
 	// RelPath is the in-image relative path the profile was emitted from, e.g.
 	// "Qwen/Qwen3-0.6B/vllm-cpu-bf16-tp1-latency.yaml" or
 	// "general/vllm-cpu-bf16-tp1-latency.yaml". Retained on the item so the
@@ -124,17 +126,19 @@ type imageProfileFile struct {
 }
 
 type imageProfileMetadata struct {
-	Engine              string                      `json:"engine"`
-	Metric              aimv1alpha1.AIMMetric       `json:"metric"`
-	Precision           aimv1alpha1.AIMPrecision    `json:"precision"`
-	Type                aimv1alpha1.AIMProfileType  `json:"type"`
-	Primary             *bool                       `json:"primary,omitempty"`
-	ManualSelectionOnly bool                        `json:"manual_selection_only,omitempty"`
-	AcceleratorModel    string                      `json:"accelerator_model,omitempty"`
-	GPU                 string                      `json:"gpu,omitempty"`
-	AcceleratorType     aimv1alpha1.AcceleratorType `json:"accelerator_type,omitempty"`
-	AcceleratorCount    *int32                      `json:"accelerator_count,omitempty"`
-	GPUCount            *int32                      `json:"gpu_count,omitempty"`
+	Engine              string                                    `json:"engine"`
+	Variant             string                                    `json:"variant,omitempty"`
+	Metric              aimv1alpha1.AIMMetric                     `json:"metric"`
+	Precision           aimv1alpha1.AIMPrecision                  `json:"precision"`
+	Type                aimv1alpha1.AIMProfileType                `json:"type"`
+	AutoSelectionPolicy aimv1alpha1.AIMProfileAutoSelectionPolicy `json:"auto_selection_policy,omitempty"`
+	Primary             *bool                                     `json:"primary,omitempty"`
+	ManualSelectionOnly bool                                      `json:"manual_selection_only,omitempty"`
+	AcceleratorModel    string                                    `json:"accelerator_model,omitempty"`
+	GPU                 string                                    `json:"gpu,omitempty"`
+	AcceleratorType     aimv1alpha1.AcceleratorType               `json:"accelerator_type,omitempty"`
+	AcceleratorCount    *int32                                    `json:"accelerator_count,omitempty"`
+	GPUCount            *int32                                    `json:"gpu_count,omitempty"`
 	// Features mirrors the runtime's metadata.features (e.g. "adapters"); discovery
 	// materialises it onto AIMProfile.spec.features so gating matches the image.
 	Features []string `json:"features,omitempty"`
@@ -145,10 +149,11 @@ func (c DiscoveryCatalog) ToCandidates() []ProfileCopyCandidate {
 	out := make([]ProfileCopyCandidate, 0, len(c.Profiles))
 	for _, item := range c.Profiles {
 		out = append(out, ProfileCopyCandidate{
-			Name:      item.Name,
-			Spec:      *item.Spec.DeepCopy(),
-			Status:    aimv1alpha2.AIMProfileStatus{Version: item.Version},
-			BaseImage: firstNonEmpty(item.BaseImage, c.BaseImage),
+			Name:         item.Name,
+			Spec:         *item.Spec.DeepCopy(),
+			Status:       aimv1alpha2.AIMProfileStatus{Version: item.Version},
+			BaseImage:    firstNonEmpty(item.BaseImage, c.BaseImage),
+			YAMLContract: item.YAMLContract,
 		})
 	}
 	return out
@@ -347,6 +352,11 @@ func parseProfileYAMLIntoCatalogItem(raw []byte, relpath, defaultAimID, sourceIm
 		acceleratorType = aimv1alpha1.AcceleratorTypeGPU
 	}
 
+	yamlContract, err := profileyaml.Inspect(raw)
+	if err != nil {
+		return DiscoveryCatalogItem{}, fmt.Errorf("infer profile YAML contract: %w", err)
+	}
+
 	engineArgsJSON, err := marshalEngineArgs(parsed.EngineArgs)
 	if err != nil {
 		return DiscoveryCatalogItem{}, fmt.Errorf("marshal engine args: %w", err)
@@ -368,6 +378,7 @@ func parseProfileYAMLIntoCatalogItem(raw []byte, relpath, defaultAimID, sourceIm
 		Name:            firstNonEmpty(profileID, parsed.ModelID),
 		Version:         version,
 		BaseImage:       baseImage,
+		YAMLContract:    yamlContract,
 		RelPath:         relpath,
 		PrimaryExplicit: parsed.Metadata.Primary != nil,
 		Spec: aimv1alpha2.AIMProfileSpecCommon{
@@ -375,9 +386,11 @@ func parseProfileYAMLIntoCatalogItem(raw []byte, relpath, defaultAimID, sourceIm
 			ModelId:             parsed.ModelID,
 			ProfileId:           profileID,
 			Engine:              parsed.Metadata.Engine,
+			Variant:             parsed.Metadata.Variant,
 			Metric:              parsed.Metadata.Metric,
 			Precision:           parsed.Metadata.Precision,
 			Type:                parsed.Metadata.Type,
+			AutoSelectionPolicy: parsed.Metadata.AutoSelectionPolicy,
 			Primary:             primary,
 			ManualSelectionOnly: parsed.Metadata.ManualSelectionOnly,
 			AcceleratorModel:    acceleratorModel,

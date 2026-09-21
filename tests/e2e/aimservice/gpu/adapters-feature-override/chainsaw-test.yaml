@@ -1,0 +1,237 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/kyverno/chainsaw/main/.schemas/json/test-chainsaw-v1alpha1.json
+#
+# AIMService GPU E2E: explicit adapter feature override
+#
+# This reproduces the validated live setup with public Hugging Face artifacts:
+#   base model: Qwen/Qwen2.5-0.5B-Instruct (~1.0 GB)
+#   adapter:    closestfriend/brie-qwen2.5-0.5b (4.3 MB weights, rank 16)
+#   image:      amdenterpriseai/aim-base:0.13
+#
+# The seed AIMProfile intentionally does NOT advertise features: [adapters].
+# The service explicitly sets profileOverrides.features: [adapters], which must:
+#   1. fork a service-owned overlay carrying the asserted adapter feature;
+#   2. project the explicit dynamic-mode AIM_ADAPTER_MAX_RANK=16 ceiling;
+#   3. stage and mount the adapter subtree read-only at /adapters; and
+#   4. load the adapter dynamically; and
+#   5. keep vLLM's runtime load/unload APIs inaccessible through the Gateway.
+#
+# Requires:
+# - AMD MI300X GPU capacity.
+# - Longhorn (RWX) for the adapter disk.
+#
+# Run against the current vcluster:
+#   make test-chainsaw ENV=gpu \
+#     CHAINSAW_TEST_DIR=tests/e2e/aimservice/gpu/adapters-feature-override \
+#     CHAINSAW_ENV_SELECTOR=
+#
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: adapters-feature-override
+  labels:
+    requires: gpu
+    hf-access: anonymous
+spec:
+  description: >-
+    Serve a public Qwen2.5-0.5B LoRA through the full v1alpha2 pipeline from a
+    seed profile without the adapters feature, using an explicit profile
+    override; verify overlay materialisation, rank projection, disk mounting,
+    /v1/models registration, and Gateway blocking of runtime LoRA mutations.
+  timeouts:
+    assert: 600s
+  steps:
+    - name: Create the runtime config with gateway routing
+      try:
+        - apply:
+            file: runtime-config.yaml
+
+    - name: Pre-create the Qwen2.5-0.5B artifact with an RWX adapter disk
+      try:
+        - apply:
+            file: base-artifact.yaml
+        - assert:
+            # First-time model download is about 1.0 GB.
+            timeout: 15m
+            resource:
+              apiVersion: aim.eai.amd.com/v1alpha1
+              kind: AIMArtifact
+              metadata:
+                name: qwen25-05b-base
+              status:
+                status: Ready
+                (adapterPersistentVolumeClaim != ""): true
+
+    - name: Create the public rank-16 LoRA artifact
+      try:
+        - apply:
+            file: adapter-artifact.yaml
+        - assert:
+            timeout: 120s
+            resource:
+              apiVersion: aim.eai.amd.com/v1alpha1
+              kind: AIMArtifact
+              metadata:
+                name: qwen25-05b-lora
+              status:
+                status: Ready
+
+    - name: Create the feature-silent Qwen2.5 profile
+      try:
+        - apply:
+            file: profile.yaml
+        - assert:
+            timeout: 120s
+            resource:
+              apiVersion: aim.eai.amd.com/v1alpha2
+              kind: AIMProfile
+              metadata:
+                name: qwen25-05b-no-adapters-feature
+              status:
+                status: Ready
+
+    - name: Create the adapter-serving AIMService
+      try:
+        - apply:
+            file: service.yaml
+
+    - name: Assert the adapter is staged and rank 16 reaches service status
+      try:
+        - assert:
+            timeout: 15m
+            resource:
+              apiVersion: aim.eai.amd.com/v1alpha1
+              kind: AIMService
+              metadata:
+                name: qwen25-05b-lora
+              status:
+                adapterMaxRank: 16
+                (adapters[?name == 'qwen25-05b-lora']):
+                  - state: Downloaded
+      catch:
+        - script:
+            env:
+              - name: NAMESPACE
+                value: ($namespace)
+            content: |
+              echo "===== AIMService status ====="
+              kubectl get aimservice -n "$NAMESPACE" qwen25-05b-lora -o yaml || true
+              echo "===== adapter staging Jobs ====="
+              kubectl get jobs -n "$NAMESPACE" -l aim.eai.amd.com/component=adapter-stage || true
+              kubectl logs -n "$NAMESPACE" -l aim.eai.amd.com/component=adapter-stage --tail=200 || true
+
+    - name: Assert the service resolves to a Ready service-owned overlay
+      try:
+        - assert:
+            timeout: 30m
+            resource:
+              apiVersion: aim.eai.amd.com/v1alpha2
+              kind: AIMService
+              metadata:
+                name: qwen25-05b-lora
+              status:
+                status: Running
+                resolvedProfile:
+                  scope: Namespace
+                  (name != 'qwen25-05b-no-adapters-feature'): true
+      catch:
+        - script:
+            env:
+              - name: NAMESPACE
+                value: ($namespace)
+            content: |
+              echo "===== AIMService ====="
+              kubectl get aimservice -n "$NAMESPACE" qwen25-05b-lora -o yaml || true
+              echo "===== profiles and caches ====="
+              kubectl get aimprofile,aimprofilecache -n "$NAMESPACE" -o yaml || true
+              echo "===== InferenceService ====="
+              kubectl get inferenceservice -n "$NAMESPACE" -o yaml || true
+              echo "===== predictor pods ====="
+              kubectl get pods -n "$NAMESPACE" -o wide || true
+              kubectl describe pods -n "$NAMESPACE" -l serving.kserve.io/inferenceservice || true
+              kubectl logs -n "$NAMESPACE" -l serving.kserve.io/inferenceservice --tail=200 --all-containers || true
+
+    - name: Assert the overlay carries the explicit adapter feature
+      description: |
+        The seed profile remains reusable and feature-silent. Its service-owned
+        overlay must contain the explicitly asserted adapters feature.
+      try:
+        - assert:
+            timeout: 120s
+            resource:
+              apiVersion: aim.eai.amd.com/v1alpha2
+              kind: AIMProfile
+              metadata:
+                annotations:
+                  aim.eai.amd.com/overlay-service: qwen25-05b-lora
+              spec:
+                (contains(features || `[]`, 'adapters')): true
+
+    - name: Assert the seed profile still does not advertise adapter support
+      try:
+        - assert:
+            timeout: 120s
+            resource:
+              apiVersion: aim.eai.amd.com/v1alpha2
+              kind: AIMProfile
+              metadata:
+                name: qwen25-05b-no-adapters-feature
+              spec:
+                (contains(features || `[]`, 'adapters')): false
+
+    - name: Assert the adapter disk and rank contract reach the inference model
+      try:
+        - assert:
+            timeout: 5m
+            resource:
+              apiVersion: serving.kserve.io/v1beta1
+              kind: InferenceService
+              metadata:
+                labels:
+                  aim.eai.amd.com/service: qwen25-05b-lora
+              spec:
+                predictor:
+                  model:
+                    (volumeMounts[?mountPath == '/adapters']):
+                      - readOnly: true
+                        (subPath != ''): true
+                    (env[?name == 'AIM_ADAPTER_SOURCE']):
+                      - value: /adapters
+                    (env[?name == 'AIM_ADAPTER_MODE']):
+                      - value: dynamic
+                    (env[?name == 'AIM_ADAPTER_MAX_RANK']):
+                      - value: "16"
+
+    - name: Verify the dynamically loaded adapter is listed
+      description: |
+        Registration in /v1/models proves the dynamic runtime watcher loaded
+        the staged adapter rather than merely finding bytes on disk.
+      try:
+        - script:
+            timeout: 15m
+            env:
+              - name: ADAPTER_NAME
+                value: qwen25-05b-lora
+              - name: HTTP_RETRY_DEADLINE
+                value: "900"
+              - name: HTTP_BASE_PATH
+                value: (join('', ['/integration/adapters-feature-override/', $namespace, '/qwen25-05b-lora/v1']))
+            content: bash ../_shared/validate-adapter-loaded.sh
+
+    - name: Verify the Gateway blocks dynamic LoRA mutation APIs
+      description: |
+        The load/unload handlers must respond inside the predictor but return
+        404 through the generated HTTPRoute. Ordinary /v1/models routing must
+        remain healthy and keep listing the loaded adapter.
+      try:
+        - script:
+            timeout: 2m
+            env:
+              - name: NAMESPACE
+                value: ($namespace)
+              - name: AIM_SERVICE
+                value: qwen25-05b-lora
+              - name: ADAPTER_NAME
+                value: qwen25-05b-lora
+              - name: HTTP_SERVICE_PATH
+                value: (join('', ['/integration/adapters-feature-override/', $namespace, '/qwen25-05b-lora']))
+            content: bash ../_shared/validate-adapter-mutation-routes-blocked.sh

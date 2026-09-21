@@ -30,12 +30,12 @@ A v1alpha2 `AIMService` reaches a deployable `AIMProfile` through one of five sh
 | Shape | Spec | Use case |
 |---|---|---|
 | [**By name**](#by-name) | `spec.profile.name` | You know exactly which profile to deploy |
-| [**By model**](#by-model) | `spec.model.name` | You know the model; let the controller pick the best deployable profile |
+| [**By model**](#by-model) | `spec.model.name` + migration annotation | You know the model; let the controller pick the best deployable profile |
 | [**Model + selector**](#model--selector) | `spec.model.name` + `spec.profile.selector` | Narrow a model's profile pool by precision / accelerator / engine |
 | [**Global selector**](#global-selector) | `spec.profile.selector` (no `spec.model`) | Reach profiles via labels — `aimId` or `modelRef` required |
 | [**By image**](#by-image) | `spec.model.image` + `aim.eai.amd.com/reconciler-pipeline: profile` annotation | One-shot deploy straight from a container image; the controller looks up or auto-creates an `AIMModel` for that image |
 
-In all shapes the controller ranks the surviving candidates by `primary > type > version` and resolves to a single profile. The resolved profile is recorded in `status.resolvedProfile` (name, scope, kind, uid).
+In all shapes except explicit profile name, the controller applies the shared deterministic [profile ranking](../guides/deploying-services.md#ranking) and resolves to a single profile. The resolved profile is recorded in `status.resolvedProfile` (name, scope, kind, uid).
 
 ### By name
 
@@ -65,6 +65,10 @@ spec:
 ```
 
 `spec.model.name` is shorthand for `spec.profile.selector.modelRef.name` plus the implicit `role=Deployable` filter. The candidate pool is every deployable profile owned by that AIMModel (or AIMClusterModel of the same name). Ranking selects the best.
+
+During the v1alpha1 → v1alpha2 migration window, a model-only shape must also
+set `aim.eai.amd.com/reconciler-pipeline: profile`. Adding any
+`spec.profile.*` selector selects the profile pipeline by spec shape.
 
 ### Model + selector
 
@@ -197,7 +201,10 @@ What happens:
 3. Downstream (cache, ConfigMap, KServe wiring) keys off the overlay — so the override participates in cache-key computation, not just runtime env wiring.
 4. The overlay is owner-referenced by the service and garbage-collected on service deletion.
 
-The override field set mirrors [`ProfileOverrides`](profilesets.md#overrides) used by AIMProfileSet derivation — the same internal primitive applies both.
+The override field set mirrors [`ProfileOverrides`](profilesets.md#overrides)
+used by AIMProfileSet derivation — the same internal primitive applies both.
+Feature overrides are additive and can explicitly assert capabilities such as
+`adapters` when a legacy or custom profile omits the corresponding metadata.
 
 `spec.profileOverrides` requires `spec.profile.name`; it can't be combined with a selector-based resolution shape.
 
@@ -225,10 +232,24 @@ See [Model Caching](caching.md) for the full hierarchy (AIMProfileCache → AIMA
 | `replicas` | Fixed replica count. Default `1`. |
 | `minReplicas` / `maxReplicas` | Enables KEDA-driven autoscaling between the bounds. |
 | `autoScaling` | Custom metric configuration (typically vLLM OTEL metrics). See [Scaling and Autoscaling](../guides/scaling-and-autoscaling.md). |
-| `resources` | Optional override for container resources. Merged on top of the resolved profile's `status.resources`. |
+| `resources` | Optional per-key override for container resources. Fully merged on top of the resolved profile's `status.resources`; the merged footprint is used for node matching and can make a service deployable even when the profile's larger defaults are unavailable. |
 | `imagePullSecrets` | Service-level secrets, merged with the profile's. |
 | `serviceAccountName` | Pod service account for the inference workload. |
 | `priorityClassName` | Pod priority class. |
+
+For example, a one-GPU service can override CPU and memory while inheriting the
+profile's accelerator request and limit:
+
+```yaml
+spec:
+  resources:
+    requests:
+      cpu: "8"
+      memory: 64Gi
+    limits:
+      cpu: "16"
+      memory: 128Gi
+```
 
 ## Routing
 
@@ -324,6 +345,8 @@ kind: AIMService
 metadata:
   name: qwen-chat
   namespace: ml-team
+  annotations:
+    aim.eai.amd.com/reconciler-pipeline: profile
 spec:
   model:
     name: qwen-qwen3-32b
@@ -419,7 +442,7 @@ If the wrong profile was selected, narrow `spec.profile.selector` (or switch to 
 
 - [Deploying Services](../guides/deploying-services.md) — Task-oriented walkthroughs
 - [Profiles](profiles.md) — What `AIMProfile` carries; provenance and status fields
-- [AIM Models](models.md) — Three model flows that produce profiles for services to resolve
+- [AIM Models](models.md) — Four model flows that produce profiles for services to resolve
 - [Model Caching](caching.md) — Cache modes and storage configuration
 - [Scaling and Autoscaling](../guides/scaling-and-autoscaling.md) — KEDA integration and metric backends
 - [Routing and Ingress](../guides/routing-and-ingress.md) — Gateway API patterns

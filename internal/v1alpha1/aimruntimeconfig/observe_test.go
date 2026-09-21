@@ -217,7 +217,8 @@ func TestMergeRuntimeConfigs(t *testing.T) {
 			name: "priority overrides base",
 			priority: &aimv1alpha1.AIMRuntimeConfigCommon{
 				AIMServiceRuntimeConfig: aimv1alpha1.AIMServiceRuntimeConfig{
-					Storage: &aimv1alpha1.AIMStorageConfig{PVCHeadroomPercent: ptr.To(int32(10))},
+					Storage:        &aimv1alpha1.AIMStorageConfig{PVCHeadroomPercent: ptr.To(int32(10))},
+					AdapterRuntime: &aimv1alpha1.AIMAdapterRuntimeConfig{MaxRank: ptr.To(int32(64))},
 				},
 			},
 			base: &aimv1alpha1.AIMRuntimeConfigCommon{
@@ -226,6 +227,7 @@ func TestMergeRuntimeConfigs(t *testing.T) {
 						PVCHeadroomPercent:      ptr.To(int32(20)),
 						DefaultStorageClassName: ptr.To("base-sc"),
 					},
+					AdapterRuntime: &aimv1alpha1.AIMAdapterRuntimeConfig{MaxRank: ptr.To(int32(32))},
 				},
 			},
 			validate: func(t *testing.T, result *aimv1alpha1.AIMRuntimeConfigCommon) {
@@ -237,6 +239,29 @@ func TestMergeRuntimeConfigs(t *testing.T) {
 				}
 				if result.Storage.DefaultStorageClassName == nil || *result.Storage.DefaultStorageClassName != "base-sc" {
 					t.Error("expected base value to be preserved for non-overridden field")
+				}
+				if result.AdapterRuntime == nil || result.AdapterRuntime.MaxRank == nil ||
+					*result.AdapterRuntime.MaxRank != 64 {
+					t.Errorf("expected priority adapter max rank 64, got %+v", result.AdapterRuntime)
+				}
+			},
+		},
+		{
+			name: "empty priority adapter runtime inherits base max rank",
+			priority: &aimv1alpha1.AIMRuntimeConfigCommon{
+				AIMServiceRuntimeConfig: aimv1alpha1.AIMServiceRuntimeConfig{
+					AdapterRuntime: &aimv1alpha1.AIMAdapterRuntimeConfig{},
+				},
+			},
+			base: &aimv1alpha1.AIMRuntimeConfigCommon{
+				AIMServiceRuntimeConfig: aimv1alpha1.AIMServiceRuntimeConfig{
+					AdapterRuntime: &aimv1alpha1.AIMAdapterRuntimeConfig{MaxRank: ptr.To(int32(32))},
+				},
+			},
+			validate: func(t *testing.T, result *aimv1alpha1.AIMRuntimeConfigCommon) {
+				if result == nil || result.AdapterRuntime == nil || result.AdapterRuntime.MaxRank == nil ||
+					*result.AdapterRuntime.MaxRank != 32 {
+					t.Errorf("expected inherited adapter max rank 32, got %+v", result)
 				}
 			},
 		},
@@ -440,6 +465,46 @@ func TestFetchRuntimeConfig_RoutingMerge(t *testing.T) {
 	}
 }
 
+func TestFetchRuntimeConfig_ActivationMetricQueryNamespaceOverridesCluster(t *testing.T) {
+	clusterConfig := &aimv1alpha1.AIMClusterRuntimeConfig{
+		ObjectMeta: metav1.ObjectMeta{Name: "default"},
+		Spec: aimv1alpha1.AIMClusterRuntimeConfigSpec{
+			AIMRuntimeConfigCommon: aimv1alpha1.AIMRuntimeConfigCommon{
+				AIMServiceRuntimeConfig: aimv1alpha1.AIMServiceRuntimeConfig{
+					ScaleFromZero: &aimv1alpha1.AIMScaleFromZeroConfig{
+						ActivationMetricQueryTemplate: "cluster_query",
+					},
+				},
+			},
+		},
+	}
+	namespaceConfig := &aimv1alpha1.AIMRuntimeConfig{
+		ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: "test-ns"},
+		Spec: aimv1alpha1.AIMRuntimeConfigSpec{
+			AIMRuntimeConfigCommon: aimv1alpha1.AIMRuntimeConfigCommon{
+				AIMServiceRuntimeConfig: aimv1alpha1.AIMServiceRuntimeConfig{
+					ScaleFromZero: &aimv1alpha1.AIMScaleFromZeroConfig{
+						ActivationMetricQueryTemplate: "namespace_query",
+					},
+				},
+			},
+		},
+	}
+
+	result := FetchMergedRuntimeConfig(
+		context.Background(),
+		newFakeClient(clusterConfig, namespaceConfig),
+		"default",
+		"test-ns",
+	)
+	if result.Value == nil || result.Value.ScaleFromZero == nil {
+		t.Fatal("expected merged scale-from-zero config")
+	}
+	if got := result.Value.ScaleFromZero.ActivationMetricQueryTemplate; got != "namespace_query" {
+		t.Errorf("activation metric query=%q, want namespace override", got)
+	}
+}
+
 func TestFetchRuntimeConfig_ModelConfig(t *testing.T) {
 	clusterConfig := &aimv1alpha1.AIMClusterRuntimeConfig{
 		ObjectMeta: metav1.ObjectMeta{Name: "default"},
@@ -461,6 +526,77 @@ func TestFetchRuntimeConfig_ModelConfig(t *testing.T) {
 
 	if result.Value.Model.AutoDiscovery == nil || *result.Value.Model.AutoDiscovery != false {
 		t.Error("expected AutoDiscovery=false from cluster config")
+	}
+}
+
+func TestMergeRuntimeConfigs_ProfileGenerationFallbacksByName(t *testing.T) {
+	t.Parallel()
+
+	base := &aimv1alpha1.AIMRuntimeConfigCommon{
+		Model: &aimv1alpha1.AIMModelConfig{
+			ProfileGeneration: &aimv1alpha1.AIMProfileGenerationConfig{
+				Fallbacks: []aimv1alpha1.AIMProfileGenerationFallback{
+					{
+						Name: "nvidia-vllm",
+						Runtime: aimv1alpha1.AIMProfileGenerationRuntime{
+							Image:  "cluster/vllm:1",
+							Engine: "vllm",
+						},
+					},
+					{
+						Name: "cluster-only",
+						Runtime: aimv1alpha1.AIMProfileGenerationRuntime{
+							Image:  "cluster/other:1",
+							Engine: "vllm",
+						},
+					},
+				},
+			},
+		},
+	}
+	priority := &aimv1alpha1.AIMRuntimeConfigCommon{
+		Model: &aimv1alpha1.AIMModelConfig{
+			ProfileGeneration: &aimv1alpha1.AIMProfileGenerationConfig{
+				Fallbacks: []aimv1alpha1.AIMProfileGenerationFallback{
+					{
+						Name: "nvidia-vllm",
+						Runtime: aimv1alpha1.AIMProfileGenerationRuntime{
+							Image:  "namespace/vllm:2",
+							Engine: "vllm",
+						},
+					},
+					{
+						Name: "namespace-only",
+						Runtime: aimv1alpha1.AIMProfileGenerationRuntime{
+							Image:  "namespace/other:2",
+							Engine: "vllm",
+						},
+					},
+				},
+			},
+		},
+	}
+
+	merged := mergeRuntimeConfigs(priority, base)
+	if merged == nil || merged.Model == nil || merged.Model.ProfileGeneration == nil {
+		t.Fatal("merged profile generation config is nil")
+	}
+	got := make(map[string]string)
+	for _, fallback := range merged.Model.ProfileGeneration.Fallbacks {
+		got[fallback.Name] = fallback.Runtime.Image
+	}
+	want := map[string]string{
+		"nvidia-vllm":    "namespace/vllm:2",
+		"cluster-only":   "cluster/other:1",
+		"namespace-only": "namespace/other:2",
+	}
+	if len(got) != len(want) {
+		t.Fatalf("merged fallbacks = %#v, want %#v", got, want)
+	}
+	for name, image := range want {
+		if got[name] != image {
+			t.Fatalf("fallback %q image = %q, want %q", name, got[name], image)
+		}
 	}
 }
 
@@ -516,5 +652,31 @@ func TestFetchRuntimeConfig_EmptyName(t *testing.T) {
 	}
 	if result.Value.Storage == nil || result.Value.Storage.PVCHeadroomPercent == nil || *result.Value.Storage.PVCHeadroomPercent != 10 {
 		t.Error("expected default config values")
+	}
+}
+
+func TestMergeRuntimeConfigs_AdditionalCABundleNamespacePrecedence(t *testing.T) {
+	cluster := &aimv1alpha1.AIMRuntimeConfigCommon{
+		AdditionalCABundleRef: &aimv1alpha1.AdditionalCABundleReference{
+			Name: "cluster-ca",
+			Key:  "ca.crt",
+		},
+	}
+	namespace := &aimv1alpha1.AIMRuntimeConfigCommon{
+		AdditionalCABundleRef: &aimv1alpha1.AdditionalCABundleReference{
+			Name: "namespace-ca",
+			Key:  "bundle.pem",
+		},
+	}
+
+	merged := mergeRuntimeConfigs(namespace, cluster)
+	if merged == nil || merged.AdditionalCABundleRef == nil {
+		t.Fatal("merged additional CA reference is nil")
+	}
+	if got := merged.AdditionalCABundleRef.Name; got != "namespace-ca" {
+		t.Errorf("name = %q, want namespace-ca", got)
+	}
+	if got := merged.AdditionalCABundleRef.Key; got != "bundle.pem" {
+		t.Errorf("key = %q, want bundle.pem", got)
 	}
 }

@@ -41,7 +41,9 @@ import (
 	controllerutils "github.com/amd-enterprise-ai/aim-engine/internal/controller/utils"
 	"github.com/amd-enterprise-ai/aim-engine/internal/utils"
 	legacyaimmodel "github.com/amd-enterprise-ai/aim-engine/internal/v1alpha1/aimmodel"
+	"github.com/amd-enterprise-ai/aim-engine/internal/v1alpha1/aimruntimeconfig"
 	"github.com/amd-enterprise-ai/aim-engine/internal/v1alpha2/aimprofile"
+	"github.com/amd-enterprise-ai/aim-engine/internal/v1alpha2/profileyaml"
 )
 
 type ClusterModelReconciler struct {
@@ -71,33 +73,38 @@ type ClusterModelFetchResult struct {
 	nodes                   controllerutils.FetchResult[[]corev1.Node]
 	existingClusterProfiles controllerutils.FetchResult[[]managedProfile]
 	childProfileSet         controllerutils.FetchResult[*aimv1alpha2.AIMClusterProfileSet]
+	runtimeConfig           controllerutils.FetchResult[*aimv1alpha1.AIMRuntimeConfigCommon]
 	legacyFetch             *legacyaimmodel.ClusterModelFetchResult
 }
 
 type ClusterModelObservation struct {
 	ClusterModelFetchResult
-	Kind                 aimv1alpha1.AIMModelKind
-	ResolvedAimID        string
-	ResolvedBaseImage    string
-	DiscoveryCacheRef    *aimv1alpha1.DiscoveryCacheReference
-	DiscoveredProfiles   aimv1alpha1.DiscoveredProfileCounts
-	ProfileSetRef        *aimv1alpha1.ProfileSetReference
-	ManagedProfiles      aimv1alpha1.ManagedProfileCounts
-	ExistingDesiredCount int32
-	DesiredProfiles      []desiredProfile
-	DesiredCache         *corev1.ConfigMap
-	DesiredJob           *batchv1.Job
-	CompletedJobToDelete *batchv1.Job
-	DesiredProfileSet    *aimv1alpha2.AIMClusterProfileSet
-	DiscoveryState       *aimv1alpha1.ModelDiscoveryState
-	DiscoveryReason      string
-	DiscoveryMessage     string
-	DiscoveryProgressing bool
-	RequeueAfter         time.Duration
-	pruneSafe            bool
-	BuildErr             error
-	componentHealth      []controllerutils.ComponentHealth
-	legacyObservation    *legacyaimmodel.ClusterModelObservation
+	Kind                            aimv1alpha1.AIMModelKind
+	ResolvedAimID                   string
+	ResolvedBaseImage               string
+	DiscoveryCacheRef               *aimv1alpha1.DiscoveryCacheReference
+	DiscoveredProfiles              aimv1alpha1.DiscoveredProfileCounts
+	ProfileSetRef                   *aimv1alpha1.ProfileSetReference
+	ManagedProfiles                 aimv1alpha1.ManagedProfileCounts
+	ExistingDesiredCount            int32
+	ProfileSetCurrent               bool
+	ProfileSetStatus                constants.AIMStatus
+	DesiredProfiles                 []desiredProfile
+	ProfileGeneration               *aimv1alpha1.AIMModelProfileGenerationStatus
+	ProfileGenerationFailureMessage string
+	DesiredCache                    *corev1.ConfigMap
+	DesiredJob                      *batchv1.Job
+	CompletedJobToDelete            *batchv1.Job
+	DesiredProfileSet               *aimv1alpha2.AIMClusterProfileSet
+	DiscoveryState                  *aimv1alpha1.ModelDiscoveryState
+	DiscoveryReason                 string
+	DiscoveryMessage                string
+	DiscoveryProgressing            bool
+	RequeueAfter                    time.Duration
+	pruneSafe                       bool
+	BuildErr                        error
+	componentHealth                 []controllerutils.ComponentHealth
+	legacyObservation               *legacyaimmodel.ClusterModelObservation
 }
 
 func (obs ClusterModelObservation) GetComponentHealth(_ context.Context, _ kubernetes.Interface) []controllerutils.ComponentHealth {
@@ -110,6 +117,9 @@ func (obs ClusterModelObservation) GetComponentHealth(_ context.Context, _ kuber
 func (r *ClusterModelReconciler) GetApplyOptions(obs ClusterModelObservation) controllerutils.ApplyOptions {
 	if obs.legacyObservation != nil {
 		return r.legacy().GetApplyOptions(*obs.legacyObservation)
+	}
+	if obs.model != nil && obs.model.Spec.ModelID != "" {
+		return aimruntimeconfig.GetApplyOptions(obs.runtimeConfig.Value)
 	}
 	return controllerutils.ApplyOptions{}
 }
@@ -136,6 +146,9 @@ func (r *ClusterModelReconciler) FetchRemoteState(
 		legacyFetch := r.legacy().FetchRemoteState(ctx, c, controllerutils.ReconcileContext[*aimv1alpha1.AIMClusterModel]{Object: result.legacyModel})
 		result.legacyFetch = &legacyFetch
 	}
+	if model.Spec.ModelID != "" {
+		result.runtimeConfig = aimruntimeconfig.FetchMergedRuntimeConfig(ctx, c, model.Spec.Name, "")
+	}
 	// See ModelReconciler.FetchRemoteState for why custom / fine-tuned models
 	// skip native discovery — their image is typically a base image without
 	// AIM_ID / model-specific profiles, and readiness is owned by the legacy
@@ -157,6 +170,8 @@ func (r *ClusterModelReconciler) FetchRemoteState(
 		fetch := FetchDiscoveryState(ctx, c, inputs)
 		result.discovery = DecideDiscovery(ctx, c, inputs, fetch)
 
+	}
+	if model.Spec.Image != "" || model.Spec.ModelID != "" {
 		var nodes corev1.NodeList
 		nodeErr := c.List(ctx, &nodes)
 		result.nodes = controllerutils.FetchResult[[]corev1.Node]{Value: nodes.Items, Error: nodeErr}
@@ -188,6 +203,13 @@ func (r *ClusterModelReconciler) ComposeState(
 	obs.Kind = classifyModelKind(&fetch.model.Spec)
 	derivation := derivationSpec(&fetch.model.Spec)
 	desiredProfilesKnown := derivation != nil
+	obs.BuildErr = profileInventoryReadError(
+		fetch.existingClusterProfiles.Error,
+		fetch.childProfileSet.Error,
+		derivation != nil,
+		"failed to list cluster profiles managed by this AIMClusterModel",
+		"failed to read the child AIMClusterProfileSet",
+	)
 	if derivation != nil {
 		// For role=base derivations the target aimId lives on
 		// overrides.aimId (CEL forbids selector.aimId then); for
@@ -246,6 +268,29 @@ func (r *ClusterModelReconciler) ComposeState(
 		}
 	}
 
+	if fetch.model.Spec.ModelID != "" {
+		obs.ResolvedAimID = effectiveAimID(&fetch.model.Spec)
+		switch {
+		case obs.BuildErr != nil:
+		case fetch.runtimeConfig.Error != nil:
+			obs.BuildErr = fetch.runtimeConfig.Error
+		case fetch.nodes.Error != nil:
+			obs.BuildErr = controllerutils.NewInfrastructureError("NodeListFailed", "failed to list cluster nodes", fetch.nodes.Error)
+		default:
+			var generated generatedProfiles
+			generated, obs.BuildErr = buildDesiredGeneratedClusterProfiles(
+				fetch.model,
+				fallbacksFromRuntimeConfig(fetch.runtimeConfig.Value),
+				fetch.nodes.Value,
+				fetch.existingClusterProfiles.Value,
+			)
+			obs.DesiredProfiles = generated.desired
+			obs.ProfileGeneration = generatedProfilesStatus(generated)
+			obs.ProfileGenerationFailureMessage = generated.noCompatibleRuntimeMessage()
+			desiredProfilesKnown = obs.BuildErr == nil
+		}
+	}
+
 	if derivation != nil {
 		childName, err := childProfileSetName(fetch.model.Name)
 		if err != nil {
@@ -254,18 +299,32 @@ func (r *ClusterModelReconciler) ComposeState(
 			obs.ProfileSetRef = &aimv1alpha1.ProfileSetReference{Name: childName}
 			obs.DesiredProfileSet = buildDesiredClusterProfileSet(fetch.model, obs.DiscoveryCacheRef, childName)
 		}
-		if fetch.childProfileSet.OK() {
-			obs.ManagedProfiles = fetch.childProfileSet.Value.Status.ManagedProfiles
-			obs.ExistingDesiredCount = 1
-		}
+		obs.ManagedProfiles,
+			obs.ExistingDesiredCount,
+			obs.ProfileSetCurrent,
+			obs.ProfileSetStatus = observedClusterProfileSet(fetch.childProfileSet)
 	} else if fetch.existingClusterProfiles.OK() {
 		obs.ManagedProfiles, obs.ExistingDesiredCount = summarizeManagedProfiles(obs.DesiredProfiles, fetch.existingClusterProfiles.Value)
 	}
-	obs.pruneSafe = desiredProfilesKnown && obs.BuildErr == nil && fetch.existingClusterProfiles.Error == nil
+	obs.pruneSafe = profilePruneSafe(
+		desiredProfilesKnown,
+		obs.BuildErr,
+		fetch.existingClusterProfiles.Error,
+		derivation != nil,
+		obs.ProfileSetCurrent,
+		obs.ProfileSetStatus,
+		obs.ManagedProfiles,
+	)
 	obs.componentHealth = buildClusterModelComponentHealth(obs)
 	if obs.legacyObservation != nil {
 		obs.componentHealth = append(obs.componentHealth, obs.legacyObservation.GetComponentHealth()...)
 	}
+	applyModelServingPathPolicy(
+		&fetch.model.Spec,
+		obs.legacyObservation != nil,
+		componentClusterServiceTemplates,
+		obs.componentHealth,
+	)
 	return obs
 }
 
@@ -344,27 +403,40 @@ func (r *ClusterModelReconciler) DecorateStatus(
 	status.DiscoveredProfiles = obs.DiscoveredProfiles
 	status.ProfileSetRef = obs.ProfileSetRef
 	status.ManagedProfiles = obs.ManagedProfiles
+	status.ProfileGeneration = obs.ProfileGeneration
 	if obs.DiscoveryState != nil {
 		status.Discovery = obs.DiscoveryState
 	}
+	controllerutils.SetTemplateMigrationRequired(cm, requiresTemplateMigration(&obs.model.Spec))
+	retireRemovedModelPathState(
+		status,
+		cm,
+		&obs.model.Spec,
+		obs.legacyObservation != nil,
+		componentClusterServiceTemplates,
+		obs.componentHealth,
+	)
 	EnsureBaseImageBridge(&obs.model.Spec, status)
 }
 
 func buildClusterModelComponentHealth(obs ClusterModelObservation) []controllerutils.ComponentHealth {
 	modelObs := ModelObservation{
-		Kind:                 obs.Kind,
-		ResolvedAimID:        obs.ResolvedAimID,
-		ResolvedBaseImage:    obs.ResolvedBaseImage,
-		DiscoveryCacheRef:    obs.DiscoveryCacheRef,
-		DiscoveredProfiles:   obs.DiscoveredProfiles,
-		ProfileSetRef:        obs.ProfileSetRef,
-		ManagedProfiles:      obs.ManagedProfiles,
-		ExistingDesiredCount: obs.ExistingDesiredCount,
-		BuildErr:             obs.BuildErr,
-		componentHealth:      obs.componentHealth,
-		DiscoveryReason:      obs.DiscoveryReason,
-		DiscoveryMessage:     obs.DiscoveryMessage,
-		DiscoveryProgressing: obs.DiscoveryProgressing,
+		Kind:                            obs.Kind,
+		ResolvedAimID:                   obs.ResolvedAimID,
+		ResolvedBaseImage:               obs.ResolvedBaseImage,
+		DiscoveryCacheRef:               obs.DiscoveryCacheRef,
+		DiscoveredProfiles:              obs.DiscoveredProfiles,
+		ProfileSetRef:                   obs.ProfileSetRef,
+		ManagedProfiles:                 obs.ManagedProfiles,
+		ExistingDesiredCount:            obs.ExistingDesiredCount,
+		ProfileSetCurrent:               obs.ProfileSetCurrent,
+		ProfileSetStatus:                obs.ProfileSetStatus,
+		ProfileGenerationFailureMessage: obs.ProfileGenerationFailureMessage,
+		BuildErr:                        obs.BuildErr,
+		componentHealth:                 obs.componentHealth,
+		DiscoveryReason:                 obs.DiscoveryReason,
+		DiscoveryMessage:                obs.DiscoveryMessage,
+		DiscoveryProgressing:            obs.DiscoveryProgressing,
 	}
 	modelObs.model = &aimv1alpha2.AIMModel{Spec: obs.model.Spec}
 	modelObs.nodes = obs.nodes
@@ -397,6 +469,7 @@ func buildDesiredOfficialClusterModelProfiles(
 			annotationModelName: model.Name,
 			annotationBaseImage: entry.BaseImage,
 		}, aimprofile.ProfileSourceImage), true)
+		clusterProfile.Annotations = profileyaml.Mark(clusterProfile.Annotations, entry.YAMLContract)
 		// See buildDesiredOfficialProfiles for why the role label is
 		// derived from the spec rather than hardcoded — a base-image
 		// AIMClusterModel emits entries that classify as `base`.

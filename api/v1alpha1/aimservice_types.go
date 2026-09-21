@@ -138,7 +138,7 @@ type AIMServiceAdapterReference struct {
 // subtree. The controller tracks staging and removal directly; the engine-reported
 // states (Loaded/LoadRejected) are reserved until the inference container exposes a
 // per-adapter load-status surface.
-// +kubebuilder:validation:Enum=Pending;Downloading;Downloaded;Deleting;Loaded;LoadRejected
+// +kubebuilder:validation:Enum=Pending;Downloading;Downloaded;Failed;Deleting;Loaded;LoadRejected
 type AIMAdapterState string
 
 const (
@@ -148,6 +148,9 @@ const (
 	AdapterStateDownloading AIMAdapterState = "Downloading"
 	// AdapterStateDownloaded means the bytes are staged in this service's subtree.
 	AdapterStateDownloaded AIMAdapterState = "Downloaded"
+	// AdapterStateFailed means the adapter's staging Job terminated unsuccessfully.
+	// LastError carries the Job failure reason and message.
+	AdapterStateFailed AIMAdapterState = "Failed"
 	// AdapterStateDeleting means the adapter was removed from spec.adapters and its
 	// bytes are being reclaimed from the service subtree by the subtree-sync Job.
 	// The entry is dropped from status once the prune completes.
@@ -377,11 +380,23 @@ type AIMServiceProfileOverrides struct {
 	// +optional
 	ModelSources []AIMModelSource `json:"modelSources,omitempty"`
 
+	// Features adds optional runtime capabilities to the service-owned overlay
+	// profile. Values are unioned with the referenced profile's features. Use
+	// ["adapters"] to explicitly assert that the selected image honours the LoRA
+	// adapter runtime contract when discovery metadata does not advertise it.
+	// +optional
+	// +listType=set
+	Features []string `json:"features,omitempty"`
+
 	// AcceleratorModel replaces the referenced profile's acceleratorModel
 	// (e.g. "MI300X" -> "MI325X"). Validation against actual cluster
 	// availability is left to the AIMServiceTemplate / runtime layers.
 	// +optional
 	AcceleratorModel string `json:"acceleratorModel,omitempty"`
+
+	// AcceleratorVendor replaces the referenced profile's acceleratorVendor.
+	// +optional
+	AcceleratorVendor AcceleratorVendor `json:"acceleratorVendor,omitempty"`
 
 	// AcceleratorCount replaces the referenced profile's acceleratorCount.
 	// +optional
@@ -436,6 +451,7 @@ type AIMServiceProfileOverrides struct {
 // With v1alpha2, a Profile can be used instead of a Template. Template and Profile
 // are mutually exclusive — at least one resolution path must be specified.
 // +kubebuilder:validation:XValidation:rule="!has(self.minReplicas) || !has(self.maxReplicas) || self.minReplicas <= self.maxReplicas",message="minReplicas must be less than or equal to maxReplicas"
+// +kubebuilder:validation:XValidation:rule="!has(self.adapterRuntime) || !has(self.adapterRuntime.maxRank) || self.adapterMode == 'dynamic'",message="spec.adapterRuntime.maxRank is only valid when spec.adapterMode is dynamic"
 type AIMServiceSpec struct {
 	// Model specifies which model to deploy using one of the available reference methods.
 	// Use `name` to reference an existing AIMModel/AIMClusterModel by name, or use `image`
@@ -568,6 +584,13 @@ type AIMServiceStatus struct {
 	// ObservedGeneration is the most recent generation observed by the controller.
 	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
 
+	// ReconcilerPipeline records which pipeline owns pipeline-specific status.
+	// The controller persists this before dispatch so transitions can retire old
+	// resolved references and conditions before the new pipeline fetches state.
+	// +optional
+	// +kubebuilder:validation:Enum=template;profile
+	ReconcilerPipeline string `json:"reconcilerPipeline,omitempty"`
+
 	// Conditions represent the latest observations of template state.
 	// +listType=map
 	// +listMapKey=type
@@ -614,6 +637,16 @@ type AIMServiceStatus struct {
 	// +listType=map
 	// +listMapKey=name
 	Adapters []AIMServiceAdapterStatus `json:"adapters,omitempty"`
+
+	// AdapterMaxRank is the resolved AIM_ADAPTER_MAX_RANK startup ceiling.
+	// It is only updated when the resolved configuration is valid; a rejected
+	// change leaves the last valid value in place. Static services recompute it
+	// from their declared adapter artifacts, preserving the last resolved value
+	// across transient lookup failures. Dynamic services report the
+	// configured/default startup ceiling, but preserve the previous higher
+	// ceiling while any declared adapter rank is unresolved before a decrease.
+	// +optional
+	AdapterMaxRank int32 `json:"adapterMaxRank,omitempty"`
 
 	// AdapterSubtreeSyncKey records the adapter-disk PVC generation and declared
 	// adapter set most recently reconciled onto the service's adapter subtree by
@@ -697,6 +730,10 @@ func (s *AIMServiceStatus) SetConditions(conditions []metav1.Condition) {
 	s.Conditions = conditions
 }
 
+func (s *AIMServiceStatus) SetObservedGeneration(generation int64) {
+	s.ObservedGeneration = generation
+}
+
 func (s *AIMServiceStatus) SetStatus(status string) {
 	// Map framework statuses to AIMService-specific statuses.
 	// AIMService uses: Pending, Starting, Running, Failed, Degraded
@@ -718,6 +755,20 @@ func (s *AIMServiceStatus) GetAIMStatus() constants.AIMStatus {
 // AIMServiceStatusEnum defines coarse-grained states for a service.
 // +kubebuilder:validation:Enum=Pending;Starting;Running;Failed;Degraded
 type AIMServiceStatusEnum string
+
+// Condition types for AIMService that are not component-health rollups.
+const (
+	// AIMServiceConditionActivationMetricAvailable reports whether the HPA
+	// has the expected activation-plus-user-metric shape and reports KEDA's
+	// exact s0 zero-to-one activation metric in currentMetrics. It applies only
+	// when scale-to-zero routing and the provider-neutral activation query are
+	// valid. It is informational only: the type deliberately omits the
+	// component "Ready" suffix so it never participates in the Ready rollup and
+	// never alters scaling behaviour. AIM Engine reports the signal; acting on
+	// it (fixing the collector or gateway policy, alerting) is the cluster
+	// administrator's call.
+	AIMServiceConditionActivationMetricAvailable = "ActivationMetricAvailable"
+)
 
 // Condition reasons for AIMService
 const (
@@ -755,16 +806,34 @@ const (
 	AIMServiceReasonScaledToZero = "ScaledToZero"
 	// AIMServiceReasonRoutingRequired indicates an invalid scale-to-zero
 	// configuration: minReplicas=0 with routing disabled. The 0->1 activation
-	// trigger queries gateway-side Envoy metrics that only exist once an
-	// HTTPRoute is wired up, so without routing the service idles to zero and
-	// can never wake. Drives ConfigValid=False.
+	// trigger queries gateway-side metrics associated with the service's
+	// HTTPRoute, so without routing the service idles to zero and can never
+	// wake. Drives ConfigValid=False.
 	AIMServiceReasonRoutingRequired = "RoutingRequiredForScaleToZero"
+	// AIMServiceReasonActivationMetricQueryInvalid indicates that the
+	// scale-from-zero activation query cannot be resolved from the selected
+	// provider, RuntimeConfig, and service override. Drives ConfigValid=False.
+	AIMServiceReasonActivationMetricQueryInvalid = "ActivationMetricQueryInvalid"
 	// AIMServiceReasonAutoscalingRequiresMetrics indicates autoscaling was
 	// configured (minReplicas/maxReplicas/autoScaling) but no scaling trigger
 	// resolves: the controller stamps autoscalerClass=external yet KEDA only
 	// manages replicas when a ScaledObject with at least one trigger exists, so
 	// the declared bounds are never enforced. Drives ConfigValid=False.
 	AIMServiceReasonAutoscalingRequiresMetrics = "AutoscalingRequiresMetrics"
+
+	// Scale-from-zero activation signal (ActivationMetricAvailable).
+	// AIMServiceReasonActivationMetricAvailable indicates the HPA reports the
+	// exact s0 zero-to-one activation metric, so its query is readable.
+	AIMServiceReasonActivationMetricAvailable = "MetricAvailable"
+	// AIMServiceReasonAwaitingActivationMetric indicates the HPA has not
+	// reported the exact s0 zero-to-one activation metric yet, but is still
+	// within the grace period that covers HPA creation and transient collector
+	// restarts.
+	AIMServiceReasonAwaitingActivationMetric = "AwaitingActivationMetric"
+	// AIMServiceReasonActivationMetricUnavailable indicates the HPA has not
+	// reported the exact s0 zero-to-one activation metric for longer than the
+	// grace period, so the service may not wake after scaling to zero.
+	AIMServiceReasonActivationMetricUnavailable = "ActivationMetricUnavailable"
 
 	// Routing
 	AIMServiceReasonPathTemplateInvalid = "PathTemplateInvalid"

@@ -23,6 +23,7 @@
 package aimprofile
 
 import (
+	"reflect"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
@@ -30,6 +31,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	aimv1alpha1 "github.com/amd-enterprise-ai/aim-engine/api/v1alpha1"
+	aimv1alpha2 "github.com/amd-enterprise-ai/aim-engine/api/v1alpha2"
 )
 
 func makeNode(name string, labels map[string]string, allocatable corev1.ResourceList) corev1.Node {
@@ -466,6 +468,9 @@ func TestExtractVersionFromImage(t *testing.T) {
 		{"registry.io/aim-qwen:0.11-rc21", "0.11-rc21"},
 		{"registry.io/aim-qwen:0.11.0+build123", "0.11.0+build123"},
 		{"registry.io/aim-qwen:v0.11.2", "v0.11.2"},
+		{"registry.io/aim-qwen:2026.8.0-preview", "2026.8.0-preview"},
+		{"registry.io/aim-qwen:2026.8.0-rc1", "2026.8.0-rc1"},
+		{"registry.io/aim-qwen:2026.8.0", "2026.8.0"},
 	}
 
 	for _, tt := range tests {
@@ -600,7 +605,7 @@ func TestResolveResources(t *testing.T) {
 			wantGPU:         "1",
 			wantCPU:         "8",
 			wantMemory:      "64Gi",
-			wantMemoryLimit: "48Gi",
+			wantMemoryLimit: "64Gi",
 		},
 		{
 			name:       "explicit GPU memory limit preserves override",
@@ -748,6 +753,265 @@ func TestResolveResources(t *testing.T) {
 				} else if qty.String() != tt.wantMemoryLimit {
 					t.Errorf("memory limit = %q, want %q", qty.String(), tt.wantMemoryLimit)
 				}
+			}
+		})
+	}
+}
+
+func TestResolveProfileResources_NVIDIAVendor(t *testing.T) {
+	spec := aimv1alpha2.AIMProfileSpecCommon{
+		AcceleratorVendor: aimv1alpha1.AcceleratorVendorNVIDIA,
+		AcceleratorType:   aimv1alpha1.AcceleratorTypeGPU,
+		AcceleratorCount:  2,
+	}
+
+	resolved := ResolveProfileResources(spec)
+	if resolved == nil {
+		t.Fatal("ResolveProfileResources returned nil")
+	}
+	for _, resources := range []corev1.ResourceList{resolved.Requests, resolved.Limits} {
+		if got := resources[corev1.ResourceName("nvidia.com/gpu")]; got.Cmp(resource.MustParse("2")) != 0 {
+			t.Fatalf("nvidia.com/gpu = %s, want 2", got.String())
+		}
+		if _, exists := resources[corev1.ResourceName("amd.com/gpu")]; exists {
+			t.Fatalf("unexpected amd.com/gpu in %#v", resources)
+		}
+	}
+}
+
+func TestMatchProfileNodes_NVIDIAVendorWithoutModel(t *testing.T) {
+	spec := aimv1alpha2.AIMProfileSpecCommon{
+		AcceleratorVendor: aimv1alpha1.AcceleratorVendorNVIDIA,
+		AcceleratorType:   aimv1alpha1.AcceleratorTypeGPU,
+		AcceleratorCount:  1,
+	}
+	resources := ResolveProfileResources(spec)
+	nodes := []corev1.Node{
+		{
+			ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{
+				AcceleratorVendorLabelPrefix + "GPU.NVIDIA":               "1",
+				PartitioningSchemeLabelPrefix + PartitioningSchemeDefault: "1",
+			}},
+			Status: corev1.NodeStatus{Allocatable: corev1.ResourceList{
+				corev1.ResourceName("nvidia.com/gpu"): resource.MustParse("1"),
+			}},
+		},
+		{
+			ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{
+				AcceleratorVendorLabelPrefix + "GPU.AMD":                  "1",
+				PartitioningSchemeLabelPrefix + PartitioningSchemeDefault: "1",
+			}},
+			Status: corev1.NodeStatus{Allocatable: corev1.ResourceList{
+				corev1.ResourceName("amd.com/gpu"): resource.MustParse("1"),
+			}},
+		},
+	}
+
+	result := MatchProfileNodes(nodes, spec, resources)
+	if result.MatchingNodes != 1 {
+		t.Fatalf("MatchingNodes = %d, want 1", result.MatchingNodes)
+	}
+	expressions := result.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms[0].MatchExpressions
+	if len(expressions) != 2 {
+		t.Fatalf("affinity expressions = %#v, want vendor + partition", expressions)
+	}
+	if expressions[0].Key != AcceleratorVendorLabelPrefix+"GPU.NVIDIA" {
+		t.Fatalf("vendor affinity key = %q", expressions[0].Key)
+	}
+}
+
+func TestMatchProfileNodes_ReportsResourceAndLabelMismatches(t *testing.T) {
+	spec := aimv1alpha2.AIMProfileSpecCommon{
+		AcceleratorVendor: aimv1alpha1.AcceleratorVendorNVIDIA,
+		AcceleratorType:   aimv1alpha1.AcceleratorTypeGPU,
+		AcceleratorCount:  1,
+		Resources: &corev1.ResourceRequirements{Requests: corev1.ResourceList{
+			corev1.ResourceCPU:    resource.MustParse("4"),
+			corev1.ResourceMemory: resource.MustParse("32Gi"),
+		}},
+	}
+	resources := ResolveProfileResources(spec)
+	node := corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "mainbox",
+			Labels: map[string]string{
+				AcceleratorVendorLabelPrefix + "GPU.NVIDIA":               "2",
+				PartitioningSchemeLabelPrefix + PartitioningSchemeDefault: "2",
+			},
+		},
+		Status: corev1.NodeStatus{Allocatable: corev1.ResourceList{
+			corev1.ResourceName("nvidia.com/gpu"): resource.MustParse("0"),
+			corev1.ResourceCPU:                    resource.MustParse("16"),
+			corev1.ResourceMemory:                 resource.MustParse("64Gi"),
+		}},
+	}
+
+	result := MatchProfileNodes([]corev1.Node{node}, spec, resources)
+	if result.MatchingNodes != 0 {
+		t.Fatalf("MatchingNodes = %d, want 0", result.MatchingNodes)
+	}
+	if len(result.NodeMismatches) != 1 {
+		t.Fatalf("NodeMismatches = %#v, want one entry", result.NodeMismatches)
+	}
+	mismatch := result.NodeMismatches[0]
+	if mismatch.NodeName != "mainbox" {
+		t.Fatalf("NodeName = %q, want mainbox", mismatch.NodeName)
+	}
+	want := []string{"resource nvidia.com/gpu requested 1, allocatable 0"}
+	if !reflect.DeepEqual(mismatch.Reasons, want) {
+		t.Fatalf("Reasons = %#v, want %#v", mismatch.Reasons, want)
+	}
+
+	delete(node.Labels, AcceleratorVendorLabelPrefix+"GPU.NVIDIA")
+	delete(node.Labels, PartitioningSchemeLabelPrefix+PartitioningSchemeDefault)
+	result = MatchProfileNodes([]corev1.Node{node}, spec, resources)
+	want = []string{
+		`required node label "feature.node.kubernetes.io/aim-accelerator.vendor.GPU.NVIDIA" is missing`,
+		`required node label "feature.node.kubernetes.io/aim-accelerator.partitioning-scheme.default" is missing`,
+		"resource nvidia.com/gpu requested 1, allocatable 0",
+	}
+	if !reflect.DeepEqual(result.NodeMismatches[0].Reasons, want) {
+		t.Fatalf("Reasons = %#v, want %#v", result.NodeMismatches[0].Reasons, want)
+	}
+}
+
+func TestResolveResources_generatedValuesRespectExplicitOppositeSide(t *testing.T) {
+	tests := []struct {
+		name      string
+		accelType aimv1alpha1.AcceleratorType
+		count     int32
+		resources *corev1.ResourceRequirements
+		resource  corev1.ResourceName
+		wantReq   string
+		wantLimit string
+	}{
+		{
+			name:      "explicit GPU request is mirrored into generated limit",
+			accelType: aimv1alpha1.AcceleratorTypeGPU,
+			count:     4,
+			resources: &corev1.ResourceRequirements{
+				Requests: corev1.ResourceList{corev1.ResourceName("amd.com/gpu"): resource.MustParse("2")},
+			},
+			resource:  corev1.ResourceName("amd.com/gpu"),
+			wantReq:   "2",
+			wantLimit: "2",
+		},
+		{
+			name:      "explicit CPU limit caps generated CPU request",
+			accelType: aimv1alpha1.AcceleratorTypeGPU,
+			count:     1,
+			resources: &corev1.ResourceRequirements{
+				Limits: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("2")},
+			},
+			resource:  corev1.ResourceCPU,
+			wantReq:   "2",
+			wantLimit: "2",
+		},
+		{
+			name:      "explicit memory request raises generated memory limit",
+			accelType: aimv1alpha1.AcceleratorTypeGPU,
+			count:     1,
+			resources: &corev1.ResourceRequirements{
+				Requests: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("64Gi")},
+			},
+			resource:  corev1.ResourceMemory,
+			wantReq:   "64Gi",
+			wantLimit: "64Gi",
+		},
+		{
+			name:      "explicit memory limit caps generated memory request",
+			accelType: aimv1alpha1.AcceleratorTypeGPU,
+			count:     1,
+			resources: &corev1.ResourceRequirements{
+				Limits: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("16Gi")},
+			},
+			resource:  corev1.ResourceMemory,
+			wantReq:   "16Gi",
+			wantLimit: "16Gi",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := ResolveResources(tt.accelType, tt.count, tt.resources, "", nil)
+			if got == nil {
+				t.Fatal("ResolveResources returned nil")
+			}
+			if request := got.Requests[tt.resource]; request.String() != tt.wantReq {
+				t.Errorf("request = %s, want %s", request.String(), tt.wantReq)
+			}
+			if limit := got.Limits[tt.resource]; limit.String() != tt.wantLimit {
+				t.Errorf("limit = %s, want %s", limit.String(), tt.wantLimit)
+			}
+		})
+	}
+}
+
+func TestResolveResourcesForPartition_scalesGPUHostDefaults(t *testing.T) {
+	tests := []struct {
+		name       string
+		count      int32
+		mode       string
+		wantCPU    string
+		wantMemory string
+		wantLimit  string
+	}{
+		{
+			name:       "eight CPX slices equal one whole GPU of host defaults",
+			count:      8,
+			mode:       "CPX-NPS4",
+			wantCPU:    "4",
+			wantMemory: "32Gi",
+			wantLimit:  "48Gi",
+		},
+		{
+			name:       "one CPX slice receives one eighth of host defaults",
+			count:      1,
+			mode:       "CPX-NPS4",
+			wantCPU:    "500m",
+			wantMemory: "4Gi",
+			wantLimit:  "6Gi",
+		},
+		{
+			name:  "generic partitioned mode omits geometry-dependent host defaults",
+			count: 1,
+			mode:  "partitioned",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := ResolveResourcesForPartition(
+				aimv1alpha1.AcceleratorTypeGPU,
+				tt.count,
+				nil,
+				"MI300X",
+				nil,
+				tt.mode,
+			)
+			if got == nil {
+				t.Fatal("ResolveResourcesForPartition returned nil")
+			}
+			if tt.wantCPU == "" {
+				if qty, exists := got.Requests[corev1.ResourceCPU]; exists {
+					t.Errorf("unexpected CPU default: %s", qty.String())
+				}
+				if qty, exists := got.Requests[corev1.ResourceMemory]; exists {
+					t.Errorf("unexpected memory request default: %s", qty.String())
+				}
+				if qty, exists := got.Limits[corev1.ResourceMemory]; exists {
+					t.Errorf("unexpected memory limit default: %s", qty.String())
+				}
+				return
+			}
+			if cpu := got.Requests[corev1.ResourceCPU]; cpu.String() != tt.wantCPU {
+				t.Errorf("cpu = %s, want %s", cpu.String(), tt.wantCPU)
+			}
+			if memory := got.Requests[corev1.ResourceMemory]; memory.String() != tt.wantMemory {
+				t.Errorf("memory request = %s, want %s", memory.String(), tt.wantMemory)
+			}
+			if limit := got.Limits[corev1.ResourceMemory]; limit.String() != tt.wantLimit {
+				t.Errorf("memory limit = %s, want %s", limit.String(), tt.wantLimit)
 			}
 		})
 	}

@@ -1,6 +1,6 @@
 # Architecture
 
-AIM Engine is a Kubernetes operator that orchestrates the full lifecycle of AI inference workloads on AMD GPUs. It bridges the gap between model artifacts and production-ready inference endpoints by coordinating several Kubernetes-native components.
+AIM Engine is a Kubernetes operator that orchestrates the full lifecycle of AI inference workloads on supported AMD and NVIDIA GPUs. It bridges the gap between model artifacts and production-ready inference endpoints by coordinating several Kubernetes-native components.
 
 ## High-level architecture
 
@@ -8,11 +8,13 @@ AIM Engine has two cooperating flows that meet at the `AIMProfile`: **onboarding
 
 ### Onboarding: from models to profiles
 
-Official models (via discovery), profile sets (via derivation), and hand-authored profiles all converge on a deployable `AIMProfile`.
+Official models (via image discovery), generated models (via RuntimeConfig
+fallbacks), profile sets (via derivation), and hand-authored profiles all
+converge on a deployable `AIMProfile`.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="../assets/diagrams/model-onboarding-dark.svg">
-  <img alt="Model onboarding flow: AIMClusterModelSource discovers AIMModels; the Model controller runs image discovery and derivation; profile sets and hand-authored profiles also resolve to deployable AIMProfiles." src="../assets/diagrams/model-onboarding.svg">
+  <img alt="Model onboarding flow: AIMClusterModelSource discovers images or declares model IDs; the Model controller runs image discovery, generated-profile resolution through RuntimeConfig fallbacks, or profile derivation; profile sets and hand-authored profiles also resolve to deployable AIMProfiles." src="../assets/diagrams/model-onboarding.svg">
 </picture>
 
 ### Serving: from profile to endpoint
@@ -31,25 +33,27 @@ v1alpha2 is the current API. v1alpha1 resources remain supported during the depr
 | CRD | Scope | Role |
 |---|---|---|
 | `AIMService` | Namespace | Deploys an inference endpoint by resolving a profile and creating a KServe InferenceService. |
-| `AIMModel` / `AIMClusterModel` | Namespace / Cluster | Onboards a model — three flows (official, fine-tuned, custom). Produces profiles. |
+| `AIMModel` / `AIMClusterModel` | Namespace / Cluster | Onboards a model — four flows (official, generated, fine-tuned, custom). Produces profiles. |
 | `AIMProfile` / `AIMClusterProfile` | Namespace / Cluster | Self-contained runtime configuration (image, accelerator, engine args, model sources). The unit a service resolves to. |
 | `AIMProfileSet` / `AIMClusterProfileSet` | Namespace / Cluster | Derives profiles by selector + overrides. Usually synthesised by `AIMModel.spec.profiles`, also usable standalone. |
 | `AIMProfileCache` | Namespace | Pre-warms a profile's `modelSources` to a PVC for fast service start. |
 | `AIMArtifact` | Namespace | Manages a single model artifact download to a PVC. |
-| `AIMClusterModelSource` | Cluster | Auto-discovers AIM models from a container registry. |
+| `AIMClusterModelSource` | Cluster | Auto-discovers AIM images from a registry (`spec.filters`/`spec.images`) or materializes declared model IDs (`spec.models`). Declared models are created as v1alpha2 `AIMClusterModel`, since `spec.modelId` is a v1alpha2-only field; discovered images are created as v1alpha1. Both are the same stored object — v1alpha2 is the storage version. |
 | `AIMRuntimeConfig` / `AIMClusterRuntimeConfig` | Namespace / Cluster | Storage defaults, routing defaults, environment defaults. |
 
-## Three model flows
+## Four model flows
 
-Every `AIMModel` resolves to one of three flows, selected by which spec field is set. The full mechanics live in [AIM Models](../concepts/models.md):
+Every `AIMModel` resolves to one of four flows, selected by which spec field is set. The full mechanics live in [AIM Models](../concepts/models.md):
 
 | Flow | Spec | Source of profiles |
 |---|---|---|
 | **Official** | `spec.image` (AIM image) | Image discovery — profile YAMLs inside the container |
+| **Generated** | `spec.modelId` | Hardware-matched RuntimeConfig fallbacks |
 | **Fine-tuned** | `spec.profiles.derivedFrom` (selecting deployable profiles) | A previously-applied official AIMModel |
 | **Custom** | `spec.profiles.derivedFrom` (selecting base-image base profiles) | A previously-applied base-image AIMModel |
 
-CRD validation enforces "exactly one of `spec.image` or `spec.profiles`" — neither can be set, both cannot be set.
+CRD validation enforces exactly one of `spec.image`, `spec.modelId`, or
+`spec.profiles`.
 
 ## Service resolution
 
@@ -106,12 +110,12 @@ Each step is idempotent: the operator converges toward the desired state on ever
 | **KServe** | Underlying model serving runtime. AIM Engine creates and manages `InferenceService` resources. |
 | **Gateway API** | HTTP routing. When routing is enabled, AIM Engine creates `HTTPRoute` resources attached to a configured Gateway. |
 | **Persistent Volumes** | Back the caching system. `AIMProfileCache` downloads model artifacts once to shared (or dedicated) PVCs. |
-| **AMD GPUs + NFD** | Detected via node labels (`feature.node.kubernetes.io/aim-accelerator.<model>`) written by the AcceleratorDetector DaemonSet. The profile selector filters candidates by node label availability. |
+| **AMD/NVIDIA GPUs + NFD** | Detected through model and vendor labels (`feature.node.kubernetes.io/aim-accelerator.*`) written by the AcceleratorDetector DaemonSets. Profile resolution filters candidates by node-label availability and vendor-specific device capacity. |
 
 ## Where to read next
 
 - [Quickstart](quickstart.md) — Deploy a service in minutes
-- [AIM Models](../concepts/models.md) — Three model flows in detail
+- [AIM Models](../concepts/models.md) — Four model flows in detail
 - [Services](../concepts/services.md) — Resolution shapes, overlays, caching
 - [Profiles](../concepts/profiles.md) — Self-contained runtime configurations
 - [AIM Profile Sets](../concepts/profilesets.md) — Derivation engine

@@ -31,13 +31,18 @@ import (
 	"strings"
 
 	batchv1 "k8s.io/api/batch/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"github.com/amd-enterprise-ai/aim-engine/internal/constants"
 )
+
+const coreConfigMapKind = "ConfigMap"
 
 // ApplyDesiredState applies the desired set of objects via Server-Side Apply (SSA).
 // Objects are applied in deterministic order: by GVK, then namespace, then name.
@@ -50,7 +55,7 @@ func ApplyDesiredState(
 	desired []client.Object,
 	owner client.Object,
 ) error {
-	return applyDesiredState(ctx, k8sClient, fieldOwner, scheme, desired, owner, false)
+	return applyDesiredState(ctx, k8sClient, fieldOwner, scheme, desired, owner, false, false)
 }
 
 // ApplyDesiredStateWithForce behaves like ApplyDesiredState but applies each
@@ -66,7 +71,67 @@ func ApplyDesiredStateWithForce(
 	desired []client.Object,
 	owner client.Object,
 ) error {
-	return applyDesiredState(ctx, k8sClient, fieldOwner, scheme, desired, owner, true)
+	return applyDesiredState(ctx, k8sClient, fieldOwner, scheme, desired, owner, true, false)
+}
+
+// ApplyDesiredStateWithForceFailFast applies authoritative projection batches.
+// ConfigMaps are applied before other force-owned objects and the first failure
+// stops the batch. This prevents initial publication of a projected runtime
+// whose required ConfigMap was not created. Updates remain eventually
+// consistent because Kubernetes does not transact across objects.
+func ApplyDesiredStateWithForceFailFast(
+	ctx context.Context,
+	k8sClient client.Client,
+	fieldOwner string,
+	scheme *runtime.Scheme,
+	desired []client.Object,
+	owner client.Object,
+) error {
+	return applyDesiredState(ctx, k8sClient, fieldOwner, scheme, desired, owner, true, true)
+}
+
+// CreateDesiredState creates owned objects atomically and never updates an
+// existing object. It is reserved for deterministic names where AlreadyExists
+// is a collision signal that the next reconciliation must re-observe.
+func CreateDesiredState(
+	ctx context.Context,
+	k8sClient client.Client,
+	scheme *runtime.Scheme,
+	desired []client.Object,
+	owner client.Object,
+) error {
+	if len(desired) == 0 {
+		return nil
+	}
+	for _, obj := range desired {
+		if err := stampGVK(obj, scheme); err != nil {
+			return fmt.Errorf("failed to stamp GVK: %w", err)
+		}
+	}
+	if owner != nil {
+		if err := stampGVK(owner, scheme); err != nil {
+			return fmt.Errorf("failed to stamp GVK on owner: %w", err)
+		}
+		for _, obj := range desired {
+			if err := setOwnerReference(owner, obj, scheme); err != nil {
+				return fmt.Errorf("failed to set owner reference: %w", err)
+			}
+		}
+	}
+	for _, obj := range sortObjects(desired) {
+		gvk := obj.GetObjectKind().GroupVersionKind()
+		key := client.ObjectKeyFromObject(obj)
+		if err := k8sClient.Create(ctx, obj); err != nil {
+			return fmt.Errorf(
+				"failed to create %s %s/%s: %w",
+				gvk.Kind,
+				key.Namespace,
+				key.Name,
+				err,
+			)
+		}
+	}
+	return nil
 }
 
 func applyDesiredState(
@@ -77,6 +142,7 @@ func applyDesiredState(
 	desired []client.Object,
 	owner client.Object,
 	force bool,
+	orderedFailFast bool,
 ) error {
 	if len(desired) == 0 {
 		return nil
@@ -97,20 +163,37 @@ func applyDesiredState(
 		}
 
 		for _, obj := range desired {
+			if err := preserveExistingOwnerSemantics(ctx, k8sClient, owner, obj); err != nil {
+				key := client.ObjectKeyFromObject(obj)
+				return fmt.Errorf(
+					"failed to preserve existing owner semantics for %s/%s: %w",
+					key.Namespace,
+					key.Name,
+					err,
+				)
+			}
 			if err := setOwnerReference(owner, obj, scheme); err != nil {
 				return fmt.Errorf("failed to set owner reference: %w", err)
 			}
 		}
 	}
 
-	// Sort deterministically
+	// Sort deterministically. Force-owned projection batches put their
+	// ConfigMaps first so a failed prerequisite prevents runtime publication.
 	sorted := sortObjects(desired)
+	if orderedFailFast {
+		sort.SliceStable(sorted, func(i, j int) bool {
+			iGVK := sorted[i].GetObjectKind().GroupVersionKind()
+			jGVK := sorted[j].GetObjectKind().GroupVersionKind()
+			iConfigMap := iGVK.Group == "" && iGVK.Kind == coreConfigMapKind
+			jConfigMap := jGVK.Group == "" && jGVK.Kind == coreConfigMapKind
+			return iConfigMap && !jConfigMap
+		})
+	}
 
-	// Apply each object via SSA. We accumulate errors across all objects
-	// rather than returning on the first failure: a single transient
-	// conflict on one resource should not hide a real misconfiguration
-	// on a sibling, and the framework's InfrastructureError unwrap
-	// surfaces every collected error to the categorizer.
+	// Apply each object via SSA. Standard batches accumulate errors so one
+	// transient conflict does not hide a sibling's misconfiguration. Ordered
+	// projection batches fail fast to preserve their prerequisite ordering.
 	// Use Server-Side Apply (SSA) to create/update desired objects.
 	// The FieldOwner parameter ensures this controller owns only the fields it manages.
 	// Without ForceOwnership, SSA cooperates with kubectl and other controllers:
@@ -132,7 +215,11 @@ func applyDesiredState(
 			client.Apply,
 			patchOpts...,
 		); err != nil {
-			applyErrs = append(applyErrs, fmt.Errorf("failed to apply %s %s/%s: %w", gvk.Kind, key.Namespace, key.Name, err))
+			applyErr := fmt.Errorf("failed to apply %s %s/%s: %w", gvk.Kind, key.Namespace, key.Name, err)
+			if orderedFailFast {
+				return applyErr
+			}
+			applyErrs = append(applyErrs, applyErr)
 		}
 	}
 	if len(applyErrs) == 1 {
@@ -140,6 +227,44 @@ func applyDesiredState(
 	}
 	if len(applyErrs) > 1 {
 		return fmt.Errorf("%d apply errors: %w", len(applyErrs), errors.Join(applyErrs...))
+	}
+
+	return nil
+}
+
+func preserveExistingOwnerSemantics(
+	ctx context.Context,
+	k8sClient client.Client,
+	owner client.Object,
+	desired client.Object,
+) error {
+	current := &unstructured.Unstructured{}
+	current.SetGroupVersionKind(desired.GetObjectKind().GroupVersionKind())
+	if err := k8sClient.Get(ctx, client.ObjectKeyFromObject(desired), current); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil
+		}
+		return err
+	}
+
+	for _, currentRef := range current.GetOwnerReferences() {
+		if currentRef.UID != owner.GetUID() {
+			continue
+		}
+
+		desiredRefs := desired.GetOwnerReferences()
+		for i := range desiredRefs {
+			if desiredRefs[i].UID != owner.GetUID() {
+				continue
+			}
+			desiredRefs[i].Controller = currentRef.Controller
+			desiredRefs[i].BlockOwnerDeletion = currentRef.BlockOwnerDeletion
+			desired.SetOwnerReferences(desiredRefs)
+			return nil
+		}
+
+		desired.SetOwnerReferences(append(desiredRefs, currentRef))
+		return nil
 	}
 
 	return nil
@@ -161,7 +286,7 @@ func stampGVK(obj client.Object, scheme *runtime.Scheme) error {
 // setOwnerReference sets an owner reference on the object.
 // The owner and object must both have GVK set before calling this function.
 func setOwnerReference(owner, obj client.Object, _ *runtime.Scheme) error {
-	ownerGVK := owner.GetObjectKind().GroupVersionKind()
+	ownerGVK := canonicalOwnerGVK(owner.GetObjectKind().GroupVersionKind())
 	if ownerGVK.Empty() {
 		return fmt.Errorf("owner GVK is not set")
 	}
@@ -173,12 +298,12 @@ func setOwnerReference(owner, obj client.Object, _ *runtime.Scheme) error {
 
 	// Create owner reference
 	ownerRef := metav1.OwnerReference{
-		APIVersion: ownerGVK.GroupVersion().String(),
-		Kind:       ownerGVK.Kind,
-		Name:       owner.GetName(),
-		UID:        owner.GetUID(),
-		Controller: ptr.To(true),
-		// BlockOwnerDeletion: ptr.To(true),  // TODO make configurable
+		APIVersion:         ownerGVK.GroupVersion().String(),
+		Kind:               ownerGVK.Kind,
+		Name:               owner.GetName(),
+		UID:                owner.GetUID(),
+		Controller:         ptr.To(true),
+		BlockOwnerDeletion: ptr.To(true),
 	}
 
 	// Get current owner references and append
@@ -188,7 +313,11 @@ func setOwnerReference(owner, obj client.Object, _ *runtime.Scheme) error {
 	found := false
 	for i := range ownerRefs {
 		if ownerRefs[i].UID == ownerRef.UID {
-			// Update existing reference
+			// Preserve ownership and deletion semantics while converging the
+			// GVK. Promoting a secondary owner here could conflict with the
+			// object's controller or change garbage-collection behavior.
+			ownerRef.Controller = ownerRefs[i].Controller
+			ownerRef.BlockOwnerDeletion = ownerRefs[i].BlockOwnerDeletion
 			ownerRefs[i] = ownerRef
 			found = true
 			break
@@ -201,6 +330,19 @@ func setOwnerReference(owner, obj client.Object, _ *runtime.Scheme) error {
 
 	obj.SetOwnerReferences(ownerRefs)
 	return nil
+}
+
+// canonicalOwnerGVK keeps bridge ownership on the production root even while
+// legacy reconciliation code still supplies a v1alpha1 view of the same object.
+func canonicalOwnerGVK(ownerGVK schema.GroupVersionKind) schema.GroupVersionKind {
+	if ownerGVK.Group != "aim.eai.amd.com" || ownerGVK.Version != "v1alpha1" {
+		return ownerGVK
+	}
+	switch ownerGVK.Kind {
+	case "AIMService", "AIMModel", "AIMClusterModel":
+		ownerGVK.Version = "v1alpha2"
+	}
+	return ownerGVK
 }
 
 // sortObjects returns objects sorted by GVK, namespace, name for determinism
@@ -233,13 +375,28 @@ func sortObjects(objects []client.Object) []client.Object {
 }
 
 func PropagateLabelsForResult(parent client.Object, planResult *PlanResult, config *LabelPropagationSettings) {
+	for _, obj := range planResult.toCreate {
+		if _, skip := planResult.labelPropagationSkips[obj]; skip {
+			continue
+		}
+		PropagateLabels(parent, obj, config)
+	}
 	for _, obj := range planResult.toApply {
+		if _, skip := planResult.labelPropagationSkips[obj]; skip {
+			continue
+		}
 		PropagateLabels(parent, obj, config)
 	}
 	for _, obj := range planResult.toApplyWithoutOwnerRef {
+		if _, skip := planResult.labelPropagationSkips[obj]; skip {
+			continue
+		}
 		PropagateLabels(parent, obj, config)
 	}
 	for _, obj := range planResult.toApplyWithForce {
+		if _, skip := planResult.labelPropagationSkips[obj]; skip {
+			continue
+		}
 		PropagateLabels(parent, obj, config)
 	}
 }
@@ -248,6 +405,9 @@ func PropagateLabelsForResult(parent client.Object, planResult *PlanResult, conf
 // These labels are added to both the resource metadata and to Job pod templates (if applicable).
 // Labels are merged with existing labels - existing labels are not overwritten.
 func ApplyControllerLabelsToResult(planResult *PlanResult, labels map[string]string) {
+	for _, obj := range planResult.toCreate {
+		applyControllerLabels(obj, labels)
+	}
 	for _, obj := range planResult.toApply {
 		applyControllerLabels(obj, labels)
 	}
@@ -256,6 +416,24 @@ func ApplyControllerLabelsToResult(planResult *PlanResult, labels map[string]str
 	}
 	for _, obj := range planResult.toApplyWithForce {
 		applyControllerLabels(obj, labels)
+	}
+}
+
+// RemoveExcludedLabelsFromResult removes labels excluded for individual planned
+// objects after generic propagation and controller-label stamping have run.
+func RemoveExcludedLabelsFromResult(planResult *PlanResult) {
+	for obj, labels := range planResult.labelExclusions {
+		objLabels := obj.GetLabels()
+		for label := range labels {
+			delete(objLabels, label)
+		}
+		obj.SetLabels(objLabels)
+
+		if job, ok := obj.(*batchv1.Job); ok {
+			for label := range labels {
+				delete(job.Spec.Template.Labels, label)
+			}
+		}
 	}
 }
 

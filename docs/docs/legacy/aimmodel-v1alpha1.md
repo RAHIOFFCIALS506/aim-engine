@@ -3,7 +3,7 @@
 :::{admonition} Deprecated
 :class: warning
 
-The v1alpha1 `AIMModel` shape (`spec.custom`, `spec.modelSources`, `spec.customTemplates`, `spec.profileCopy`, ...) is deprecated. New deployments should use [v1alpha2 AIMModel](../concepts/models.md), which expresses the same outcomes through the three flows (official / fine-tuned / custom). See [Migrating to v1alpha2](migrating.md) for conversion recipes.
+The v1alpha1 `AIMModel` shape (`spec.custom`, `spec.modelSources`, `spec.customTemplates`, `spec.profileCopy`, ...) is deprecated. New deployments should use [v1alpha2 AIMModel](../concepts/models.md), which supports official, generated, fine-tuned, and custom flows. See [Migrating to v1alpha2](migrating.md) for conversion recipes.
 :::
 This page documents the legacy `AIMModel` spec fields and their replacements.
 
@@ -16,7 +16,8 @@ v1alpha1 `AIMModel` had a wide spec that supported several overlapping flows:
 - **Profile-copy** — `spec.profileCopy` for replicating a published profile onto custom weights.
 - **Defaults** — `spec.defaultServiceTemplate`, `spec.runtimeConfigName`, `spec.env` to influence downstream resources.
 
-v1alpha2 collapses these into three flows, each driven by exactly one of `spec.image` or `spec.profiles`.
+v1alpha2 replaces these with four flows, each driven by exactly one of
+`spec.image`, `spec.modelId`, or `spec.profiles`.
 
 ## v1alpha1 spec fields
 
@@ -157,9 +158,15 @@ Each rejection produces a targeted error message naming the v1alpha2 equivalent.
 
 ## Coexistence
 
-Both API versions share a single controller and may be applied to the same cluster simultaneously. The dispatch table for AIMService spec shapes and the full migration-window mechanics live in [Admin → Upgrading → Migration window](../admin/upgrading.md#migration-window).
-
-For AIMModel specifically: v1alpha1 objects continue to produce `AIMServiceTemplate` resources via the OCI-discovery path; image-backed v1alpha2 objects produce `AIMProfile` resources via the v1alpha2 discovery Job. If you update an existing v1alpha1 AIMModel to use v1alpha2-only fields, the controller transitions to the v1alpha2 flow on the next reconcile. Existing template children continue to exist until you delete them.
+Both API versions share one v1alpha2-rooted controller and may be applied to
+the same cluster simultaneously. Output follows the retained spec shape, not
+the endpoint used to read or write the object: legacy inputs continue to
+produce `AIMServiceTemplate` resources, native inputs produce `AIMProfile`
+resources, and a grandfathered image-backed object may retain both outputs
+when both paths apply. See
+[Admin → Upgrading → Migration window](../admin/upgrading.md#migration-window)
+for readiness and ownership behavior. The bridge does not authorize automatic
+template cleanup.
 
 ## Related documentation
 

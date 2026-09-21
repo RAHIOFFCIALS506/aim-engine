@@ -70,10 +70,12 @@ const (
 	// stamps LabelValueRuntimeProjectionLazy on the shadow ServingRuntime (and
 	// its colocated ConfigMap) it materialises; the eager per-profile / model-slug
 	// projection stamps LabelValueRuntimeProjectionEager; hand-authored runtimes
-	// leave it unset. The lazy reconciler uses it to tell its own shadow — which
-	// it must re-apply on every reconcile to self-heal drift / a late cache /
-	// backing-profile changes — apart from an eager projection or hand-authored
-	// runtime of the same name, which it defers to. A namespace-AIMProfile-backed
+	// leave it unset. The lazy reconciler primarily uses it to tell its own
+	// shadow — which it must re-apply on every reconcile to self-heal drift / a
+	// late cache / backing-profile changes — apart from an eager projection or
+	// hand-authored runtime of the same name, which it defers to. Its SSA field
+	// manager is fallback identity if an edit removes this marker. A
+	// namespace-AIMProfile-backed
 	// shadow and a namespace AIMProfile's eager projection carry the SAME
 	// AIMProfile ownerReference, so the ownerRef kind alone cannot make this
 	// distinction; this label can. The eager marker is what settles ownership
@@ -278,12 +280,23 @@ const (
 	MountPathSharedMemory = "/dev/shm"
 	// DefaultSharedMemorySize is the default size for /dev/shm
 	DefaultSharedMemorySize = "8Gi"
+	// VLLMOmniSharedMemorySize is the /dev/shm size used by vLLM-Omni
+	// diffusion workloads, whose multi-process USP/VAE workers require more
+	// shared memory than the generic runtime default.
+	VLLMOmniSharedMemorySize = "32Gi"
 	// DefaultHTTPPort is the default HTTP port for inference services
 	DefaultHTTPPort = 8000
 	// DefaultGatewayPort is the default gateway port
 	DefaultGatewayPort = 80
-	// DefaultGPUResourceName is the default resource name for AMD GPUs
-	DefaultGPUResourceName = "amd.com/gpu"
+	// AMDGPUResourceName is the whole-device resource published by the AMD
+	// Kubernetes device plugin.
+	AMDGPUResourceName = "amd.com/gpu"
+	// NVIDIAGPUResourceName is the whole-device resource published by the NVIDIA
+	// Kubernetes device plugin.
+	NVIDIAGPUResourceName = "nvidia.com/gpu"
+	// DefaultGPUResourceName is retained for legacy v1alpha1 and profiles that
+	// predate acceleratorVendor. Empty vendor continues to mean AMD.
+	DefaultGPUResourceName = AMDGPUResourceName
 	// DefaultCPURequestPerGPU is the default host CPU request for each GPU.
 	DefaultCPURequestPerGPU int64 = 4
 	// DefaultMemoryRequestGiPerGPU is the default host memory request, in GiB,
@@ -322,14 +335,14 @@ const (
 	// VolumeAdapterDisk is the name of the adapter-disk volume on pods/jobs.
 	VolumeAdapterDisk = "adapter-disk"
 
-	// Conservative built-in defaults for the adapter container contract. A later
-	// iteration will source the caps from the resolved profile / runtime config;
-	// until then the controller emits these uniform defaults so they are visible
-	// in the pod spec.
+	// Conservative built-in defaults for the adapter container contract. The
+	// dynamic max-rank default is used only when neither the service nor its
+	// RuntimeConfig supplies one.
 	DefaultAIMAdapterRefreshIntervalSeconds = 30
 	DefaultAIMAdapterMaxCount               = 8
 	DefaultAIMAdapterMaxCPUCount            = 16
 	DefaultAIMAdapterMaxRank                = 32
+	DefaultAIMAdapterRank                   = 16
 
 	// LabelAdapterDynamicAllowed is the namespace label that opts a namespace in
 	// to dynamic adapter mode. Enforcement is not yet wired (see
@@ -355,10 +368,17 @@ const (
 	EnvAIMCachePath = "AIM_CACHE_PATH"
 	// EnvAIMID is the environment variable for the AIM product family identifier
 	EnvAIMID = "AIM_ID"
+	// EnvAIMEngine selects the runtime engine declared by the resolved profile
+	EnvAIMEngine = "AIM_ENGINE"
 	// EnvAIMMetric is the environment variable for the optimization metric
 	EnvAIMMetric = "AIM_METRIC"
 	// EnvAIMModelID is the environment variable for the model ID
 	EnvAIMModelID = "AIM_MODEL_ID"
+	// EnvAIMVLLMModel is the direct-vLLM model argument. Projected runtimes use
+	// Kubernetes argument expansion ($(AIM_VLLM_MODEL)) so an InferenceService
+	// overlay can switch an online model ID to a service-owned cache mount without
+	// replacing the complete generated vLLM argument list.
+	EnvAIMVLLMModel = "AIM_VLLM_MODEL"
 	// EnvAIMPrecision is the environment variable for the numeric precision
 	EnvAIMPrecision = "AIM_PRECISION"
 	// EnvAIMProfileID is the environment variable for the profile ID
@@ -376,6 +396,23 @@ const (
 	// to derive scale-to-zero cooldownPeriod from the predictor's memory
 	// request. Set to 0 to disable the memory contribution.
 	EnvAIMCooldownSecondsPerGiMemory = "AIM_COOLDOWN_SECONDS_PER_GI_MEMORY"
+
+	// EnvAIMGatewayActivationScope selects the label scheme the
+	// scale-from-zero gateway activation trigger queries, matching the OTel
+	// collector deployed on the cluster:
+	//   - GatewayActivationScopeHTTPRoute: Envoy Gateway names the
+	//     upstream cluster httproute/<ns>/<name>/rule/N; the collector labels
+	//     the series by HTTPRoute.
+	//   - GatewayActivationScopeDeployment: legacy kgateway names the cluster
+	//     kube_<ns>_<svc>_<port>; the collector labels the series by the
+	//     predictor Deployment.
+	//   - GatewayActivationScopeCustom: every scale-to-zero service must resolve
+	//     an activationMetricQueryTemplate from its service or RuntimeConfig.
+	//   - GatewayActivationScopeNone: gateway activation is disabled; services
+	//     requesting minReplicas=0 fail configuration validation.
+	// JOINED INVARIANT with the collector: both must match the gateway
+	// implementation, or activation silently never fires.
+	EnvAIMGatewayActivationScope = "AIM_GATEWAY_ACTIVATION_SCOPE"
 )
 
 // keda-otel-add-on defaults
@@ -401,17 +438,35 @@ const (
 	// DefaultGatewayActivationTargetValue is the targetValue of the
 	// gateway-rate activation trigger. Compiled-in, not operator-tunable: the
 	// gateway trigger is activation-only
-	// (0->1); this value is deliberately large so the trigger never influences
-	// the 1->N decision -- it is a neutralizing ceiling, not a req/s target.
-	DefaultGatewayActivationTargetValue = "1000"
+	// (0->1); this value is deliberately unreachable for an activation export
+	// interval so the trigger never influences the 1->N decision. It is a
+	// neutralizing ceiling, not a req/s target.
+	DefaultGatewayActivationTargetValue = "1000000000"
 
 	// DefaultGatewayActivationOperationOverTime is the aggregation the scaler
 	// applies to the gateway series. Compiled-in, not operator-tunable: it must
-	// be `avg` because the collector emits per-scrape deltas via
-	// `cumulativetodelta` -- `rate` would go negative across Envoy counter
-	// resets. This is a JOINED INVARIANT with the collector's processor
-	// pipeline (pinned by TestGatewayActivationInvariant); change them together.
+	// be `avg` because gateway integrations emit delta values -- Envoy Gateway
+	// at the source and kgateway through its collector. Applying `rate` again
+	// would distort those deltas. This is pinned with the provider pipelines by
+	// TestGatewayActivationInvariant; change them together.
 	DefaultGatewayActivationOperationOverTime = "avg"
+
+	// GatewayActivationScopeHTTPRoute scopes the gateway activation trigger by
+	// the HTTPRoute name (Envoy Gateway cluster naming).
+	GatewayActivationScopeHTTPRoute = "httproute"
+
+	// GatewayActivationScopeDeployment scopes the gateway activation trigger by
+	// the predictor Deployment (legacy kgateway cluster naming).
+	GatewayActivationScopeDeployment = "deployment"
+
+	// GatewayActivationScopeCustom requires a service or RuntimeConfig-provided
+	// activation metric query and does not imply a bundled collector.
+	GatewayActivationScopeCustom = "custom"
+
+	// GatewayActivationScopeNone disables gateway activation. It is also the
+	// default when the environment variable is unset or invalid, so non-Helm
+	// installations remain gateway-neutral unless they opt in explicitly.
+	GatewayActivationScopeNone = "none"
 )
 
 // KServe annotation and label keys
@@ -512,6 +567,14 @@ const (
 	// the backing profile's RuntimeProjected condition.
 	AnnotationRuntimeProjectionMessage = AimLabelDomain + "/runtime-projection-message"
 
+	// AnnotationRuntimeProjectionContentHash identifies the workload-affecting
+	// content of a namespaced ServingRuntime and its colocated ConfigMap. Both
+	// objects carry the same hash, computed from ServingRuntime.spec and the
+	// ConfigMap's data, binaryData, and immutable fields. Ephemeral metadata is
+	// deliberately excluded. Consumers use it to wait until both projection
+	// siblings represent the current profile and cache state.
+	AnnotationRuntimeProjectionContentHash = AimLabelDomain + "/runtime-projection-content-hash"
+
 	// AnnotationReconcilerPipeline forces an AIMService onto a specific
 	// reconciliation pipeline, bypassing the default spec-shape dispatch.
 	// Recognised values are ReconcilerPipelineTemplate (v1alpha1 template
@@ -529,6 +592,18 @@ const (
 	// ReconcilerPipelineProfile is the AnnotationReconcilerPipeline value
 	// that forces the v1alpha2 profile-based pipeline.
 	ReconcilerPipelineProfile = "profile"
+
+	// AnnotationMigrationPreserveInferenceServiceGeneration pins the legacy
+	// inline InferenceService during a no-rollout template-to-profile migration.
+	// The profile pipeline honors it only when its decimal value equals the
+	// AIMService generation and AnnotationMigrationPreserveInferenceServiceUID
+	// matches an existing InferenceService with legacy template labels. A later
+	// spec update advances generation and resumes normal profile rendering.
+	AnnotationMigrationPreserveInferenceServiceGeneration = AimLabelDomain + "/migration-preserve-inference-service-generation"
+
+	// AnnotationMigrationPreserveInferenceServiceUID binds an active migration
+	// preservation generation to the exact legacy InferenceService UID.
+	AnnotationMigrationPreserveInferenceServiceUID = AimLabelDomain + "/migration-preserve-inference-service-uid"
 
 	// AnnotationForceRebind, when present (any non-empty value), forces
 	// the v1alpha2 AIMService profile resolver to ignore the current

@@ -30,11 +30,13 @@ import (
 	kserveconstants "github.com/kserve/kserve/pkg/constants"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
+	"sigs.k8s.io/yaml"
 
 	aimv1alpha1 "github.com/amd-enterprise-ai/aim-engine/api/v1alpha1"
 	aimv1alpha2 "github.com/amd-enterprise-ai/aim-engine/api/v1alpha2"
 	"github.com/amd-enterprise-ai/aim-engine/internal/constants"
 	"github.com/amd-enterprise-ai/aim-engine/internal/utils"
+	"github.com/amd-enterprise-ai/aim-engine/internal/v1alpha2/profileyaml"
 )
 
 func gpuResources() *corev1.ResourceRequirements {
@@ -84,6 +86,79 @@ func findMount(mounts []corev1.VolumeMount, name string) *corev1.VolumeMount {
 	return nil
 }
 
+func TestSharedMemoryVolume_EngineDefaults(t *testing.T) {
+	cases := []struct {
+		name   string
+		engine string
+		want   string
+	}{
+		{name: "generic runtime", engine: "vllm", want: constants.DefaultSharedMemorySize},
+		{name: "vLLM Omni", engine: "vllm_omni", want: constants.VLLMOmniSharedMemorySize},
+		{name: "vLLM Omni case insensitive", engine: "VLLM_OMNI", want: constants.VLLMOmniSharedMemorySize},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			volume := sharedMemoryVolume(tc.engine)
+			if volume.EmptyDir == nil || volume.EmptyDir.SizeLimit == nil {
+				t.Fatalf("shared memory volume missing emptyDir size limit: %#v", volume)
+			}
+			if got := volume.EmptyDir.SizeLimit.String(); got != tc.want {
+				t.Errorf("shared memory size = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestBuildNamespaceServingRuntime_WanProfileFidelity(t *testing.T) {
+	const variant = "usp4"
+
+	spec := sampleSpec()
+	spec.ProfileId = "vllm_omni-mi300x-fp16-tp4-latency-usp4"
+	spec.Engine = "vllm_omni"
+	spec.Variant = variant
+	spec.Precision = aimv1alpha1.AIMPrecision("fp16")
+	spec.AcceleratorCount = 4
+
+	runtime, cm, err := BuildNamespaceServingRuntime(NamespaceRuntimeInput{
+		ProfileName:  "wan22-tp4-latency",
+		Namespace:    "aim-testing",
+		Spec:         spec,
+		YAMLContract: profileyaml.CanonicalContract(spec),
+	})
+	if err != nil {
+		t.Fatalf("BuildNamespaceServingRuntime: %v", err)
+	}
+
+	filename := spec.ProfileId + ".yaml"
+	raw, ok := cm.Data[filename]
+	if !ok {
+		t.Fatalf("profile ConfigMap keys = %v, want %q", cm.Data, filename)
+	}
+
+	var emitted ProfileYAML
+	if err := yaml.Unmarshal([]byte(raw), &emitted); err != nil {
+		t.Fatalf("unmarshal projected profile: %v", err)
+	}
+	if emitted.Metadata.Variant != variant {
+		t.Errorf("projected metadata.variant = %q, want usp4", emitted.Metadata.Variant)
+	}
+
+	container := runtime.Spec.Containers[0]
+	wantProfileID := "custom/" + spec.AimId + "/" + spec.ProfileId
+	if got := envMap(container.Env)[constants.EnvAIMProfileID]; got != wantProfileID {
+		t.Errorf("AIM_PROFILE_ID = %q, want %q", got, wantProfileID)
+	}
+
+	dshm := findVolume(runtime.Spec.Volumes, constants.VolumeSharedMemory)
+	if dshm == nil || dshm.EmptyDir == nil || dshm.EmptyDir.SizeLimit == nil {
+		t.Fatalf("runtime missing sized shared-memory volume: %#v", dshm)
+	}
+	if got := dshm.EmptyDir.SizeLimit.String(); got != constants.VLLMOmniSharedMemorySize {
+		t.Errorf("shared memory size = %q, want %q", got, constants.VLLMOmniSharedMemorySize)
+	}
+}
+
 // completeNoCacheRuntime builds the representative projectable, non-caching
 // profile shared by the no-cache assertion tests.
 func completeNoCacheRuntime(t *testing.T) (*kservev1alpha1.ServingRuntime, *corev1.ConfigMap) {
@@ -95,6 +170,7 @@ func completeNoCacheRuntime(t *testing.T) (*kservev1alpha1.ServingRuntime, *core
 		ProfileName:  "qwen3-32b-mi300x",
 		Namespace:    "team-ml",
 		Spec:         spec,
+		YAMLContract: profileyaml.CanonicalContract(spec),
 		Resources:    gpuResources(),
 		NodeAffinity: mi300xAffinity(),
 	})
@@ -177,6 +253,59 @@ func TestBuildNamespaceServingRuntime_FullFidelityAnnotations(t *testing.T) {
 	}
 }
 
+func TestRuntimeProjectionContentHash_TracksWorkloadContentOnly(t *testing.T) {
+	const changed = "changed"
+
+	runtime, cm := completeNoCacheRuntime(t)
+	want := runtime.Annotations[constants.AnnotationRuntimeProjectionContentHash]
+	if len(want) != 64 {
+		t.Fatalf("runtime projection content hash = %q, want a full SHA-256 hex digest", want)
+	}
+	if got := cm.Annotations[constants.AnnotationRuntimeProjectionContentHash]; got != want {
+		t.Fatalf("ConfigMap content hash = %q, want runtime hash %q", got, want)
+	}
+	if got, err := RuntimeProjectionContentHash(runtime, cm); err != nil || got != want {
+		t.Fatalf("recomputed content hash = %q, %v; want %q", got, err, want)
+	}
+
+	metadataOnlyRuntime := runtime.DeepCopy()
+	metadataOnlyConfigMap := cm.DeepCopy()
+	metadataOnlyRuntime.Labels["example.com/ephemeral"] = changed
+	metadataOnlyRuntime.Annotations["example.com/ephemeral"] = changed
+	metadataOnlyRuntime.ResourceVersion = "42"
+	metadataOnlyConfigMap.Labels["example.com/ephemeral"] = changed
+	metadataOnlyConfigMap.Annotations["example.com/ephemeral"] = changed
+	metadataOnlyConfigMap.ResourceVersion = "43"
+	if got, err := RuntimeProjectionContentHash(metadataOnlyRuntime, metadataOnlyConfigMap); err != nil || got != want {
+		t.Fatalf("ephemeral metadata changed content hash to %q, %v; want %q", got, err, want)
+	}
+
+	runtimeContentChanged := runtime.DeepCopy()
+	runtimeContentChanged.Spec.Containers[0].Image += "-updated"
+	if got, err := RuntimeProjectionContentHash(runtimeContentChanged, cm); err != nil || got == want {
+		t.Fatalf("ServingRuntime spec change produced hash %q, %v; want a new hash", got, err)
+	}
+
+	configMapContentChanged := cm.DeepCopy()
+	configMapContentChanged.Data["new-profile.yaml"] = changed
+	if got, err := RuntimeProjectionContentHash(runtime, configMapContentChanged); err != nil || got == want {
+		t.Fatalf("ConfigMap data change produced hash %q, %v; want a new hash", got, err)
+	}
+
+	configMapContentChanged = cm.DeepCopy()
+	configMapContentChanged.BinaryData = map[string][]byte{"profile.bin": {0x01}}
+	if got, err := RuntimeProjectionContentHash(runtime, configMapContentChanged); err != nil || got == want {
+		t.Fatalf("ConfigMap binary data change produced hash %q, %v; want a new hash", got, err)
+	}
+
+	immutable := true
+	configMapContentChanged = cm.DeepCopy()
+	configMapContentChanged.Immutable = &immutable
+	if got, err := RuntimeProjectionContentHash(runtime, configMapContentChanged); err != nil || got == want {
+		t.Fatalf("ConfigMap immutability change produced hash %q, %v; want a new hash", got, err)
+	}
+}
+
 // TestBuildNamespaceServingRuntime_ContainerAndFormat asserts the predictor
 // container (image, resources), the supportedModelFormat/protocol, and the
 // resolved node affinity.
@@ -253,6 +382,67 @@ func TestBuildNamespaceServingRuntime_ProfileConfigMapAndEnv(t *testing.T) {
 	}
 }
 
+func TestBuildNamespaceServingRuntime_ConfigMapUsesInheritedYAMLContract(t *testing.T) {
+	cases := []struct {
+		name     string
+		contract profileyaml.Contract
+		present  []string
+		absent   []string
+	}{
+		{
+			name:     "legacy source",
+			contract: sourceContract(t, "  gpu: MI300X\n  gpu_count: 1\n  manual_selection_only: true\n"),
+			present:  []string{"gpu", "gpu_count", "manual_selection_only"},
+			absent:   []string{"accelerator_model", "accelerator_type", "accelerator_count"},
+		},
+		{
+			name:     "strict source",
+			contract: profileyaml.DefaultContract(),
+			present:  []string{"accelerator_model", "accelerator_type", "accelerator_count"},
+			absent:   []string{"gpu", "gpu_count", "manual_selection_only"},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			spec := sampleSpec()
+			spec.ManualSelectionOnly = true //nolint:staticcheck // Compatibility serialization is under test.
+			_, cm, err := BuildNamespaceServingRuntime(NamespaceRuntimeInput{
+				ProfileName:  "qwen3-32b-mi300x",
+				Namespace:    "team-ml",
+				Spec:         spec,
+				YAMLContract: tc.contract,
+			})
+			if err != nil {
+				t.Fatalf("BuildNamespaceServingRuntime: %v", err)
+			}
+			if len(cm.Data) != 1 {
+				t.Fatalf("ConfigMap entries = %d, want 1", len(cm.Data))
+			}
+
+			var raw string
+			for _, raw = range cm.Data {
+			}
+			var decoded struct {
+				Metadata map[string]any `json:"metadata"`
+			}
+			if err := yaml.Unmarshal([]byte(raw), &decoded); err != nil {
+				t.Fatalf("unmarshal mounted profile YAML: %v", err)
+			}
+			for _, key := range tc.present {
+				if _, ok := decoded.Metadata[key]; !ok {
+					t.Errorf("mounted profile YAML missing %q:\n%s", key, raw)
+				}
+			}
+			for _, key := range tc.absent {
+				if _, ok := decoded.Metadata[key]; ok {
+					t.Errorf("mounted profile YAML unexpectedly contains %q:\n%s", key, raw)
+				}
+			}
+		})
+	}
+}
+
 // TestBuildNamespaceServingRuntime_FrameworkEnvWinsOverProfile pins that the
 // operator-managed AIM_* framework env wins over a colliding profile
 // ContainerEnv: the identity-of-the-profile vars belong to the framework, not
@@ -266,9 +456,10 @@ func TestBuildNamespaceServingRuntime_FrameworkEnvWinsOverProfile(t *testing.T) 
 	}
 
 	runtime, _, err := BuildNamespaceServingRuntime(NamespaceRuntimeInput{
-		ProfileName: "qwen3-32b-mi300x",
-		Namespace:   "team-ml",
-		Spec:        spec,
+		ProfileName:  "qwen3-32b-mi300x",
+		Namespace:    "team-ml",
+		Spec:         spec,
+		YAMLContract: profileyaml.CanonicalContract(spec),
 	})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -312,6 +503,7 @@ func TestBuildNamespaceServingRuntime_WithProfileCache(t *testing.T) {
 		ProfileName:  "qwen3-32b-mi300x",
 		Namespace:    "team-ml",
 		Spec:         spec,
+		YAMLContract: profileyaml.CanonicalContract(spec),
 		Resources:    gpuResources(),
 		NodeAffinity: mi300xAffinity(),
 		Cache:        cache,
@@ -361,10 +553,11 @@ func TestBuildNamespaceServingRuntime_CacheNotReadyOmitsMount(t *testing.T) {
 	}
 
 	runtime, _, err := BuildNamespaceServingRuntime(NamespaceRuntimeInput{
-		ProfileName: "qwen3-32b-mi300x",
-		Namespace:   "team-ml",
-		Spec:        spec,
-		Cache:       cache,
+		ProfileName:  "qwen3-32b-mi300x",
+		Namespace:    "team-ml",
+		Spec:         spec,
+		YAMLContract: profileyaml.CanonicalContract(spec),
+		Cache:        cache,
 	})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -509,9 +702,10 @@ func TestBareCSRProfileID_MatchesShadowConfigMapKey(t *testing.T) {
 			// The complete namespace runtime is the shadow that completes it: it
 			// carries the colocated ConfigMap the env resolves against.
 			runtime, cm, err := BuildNamespaceServingRuntime(NamespaceRuntimeInput{
-				ProfileName: "qwen3-32b-mi300x",
-				Namespace:   "team-ml",
-				Spec:        spec,
+				ProfileName:  "qwen3-32b-mi300x",
+				Namespace:    "team-ml",
+				Spec:         spec,
+				YAMLContract: profileyaml.CanonicalContract(spec),
 			})
 			if err != nil {
 				t.Fatalf("BuildNamespaceServingRuntime: %v", err)

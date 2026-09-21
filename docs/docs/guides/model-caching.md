@@ -21,6 +21,8 @@ apiVersion: aim.eai.amd.com/v1alpha2
 kind: AIMService
 metadata:
   name: qwen-chat
+  annotations:
+    aim.eai.amd.com/reconciler-pipeline: profile
 spec:
   model:
     name: qwen-qwen3-32b
@@ -39,7 +41,15 @@ When caching is active, AIM Engine creates a hierarchy of resources:
 2. **AIMArtifact** — Manages the download of individual model sources
 3. **PVC + Download Job** — The actual storage and download execution
 
-The profile cache is owned by the profile (not the service), so multiple services sharing the same profile reuse the same cache. With `caching.mode: Dedicated`, the cache is owned by the service and is garbage-collected with it.
+When `AIMProfile.spec.caching.enabled` is set, the shared profile cache is owned
+by the profile, so multiple services using that profile reuse it. A dedicated
+cache is owned by its service and is garbage-collected with the service.
+
+A profile-owned cache resolves the namespace or cluster RuntimeConfig named
+`default`; `AIMProfile.spec.caching` has no `runtimeConfigName` selector.
+Consequently, selecting a different RuntimeConfig on an `AIMService` does not
+retarget that shared cache. Service-owned caches use the service's selected
+RuntimeConfig.
 
 ## Download Protocols
 
@@ -81,6 +91,49 @@ spec:
     pvcHeadroomPercent: 15
     defaultStorageClassName: longhorn
 ```
+
+## Repositories with required subdirectories
+
+When no download filter is configured, AIM Engine excludes files in
+subdirectories (equivalent to `exclude: ["*/*"]`). This is suitable for many
+flat model repositories, but repository layouts such as Diffusers commonly
+store required transformer, VAE, text-encoder, scheduler, and tokenizer files
+under nested directories.
+
+Set an explicitly empty filter to download all files:
+
+```yaml
+apiVersion: aim.eai.amd.com/v1alpha1
+kind: AIMRuntimeConfig
+metadata:
+  name: diffusers-model
+  namespace: ml-team
+spec:
+  storage:
+    downloadFilter: {}
+```
+
+For a service-owned cache, reference that RuntimeConfig from the relevant
+`AIMService`:
+
+```yaml
+spec:
+  runtimeConfigName: diffusers-model
+```
+
+For a profile-owned shared cache, configure the download filter on the
+namespace or cluster RuntimeConfig named `default` instead. Avoid changing the
+cluster-wide default unless every affected model needs nested files:
+downloading them can increase transfer time and storage usage for unrelated
+models.
+
+This setting is based on repository layout, not inference engine. For example,
+a Diffusers model served by vLLM-Omni needs it, while a flat repository served
+by the same engine may not.
+
+`AIMArtifact.spec.downloadFilter` is immutable. If an artifact was created with
+the wrong filter, delete and recreate that artifact after changing the runtime
+configuration.
 
 ## Download Verification
 

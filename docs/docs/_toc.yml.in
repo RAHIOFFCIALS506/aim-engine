@@ -57,6 +57,8 @@ subtrees:
                 title: AIM Models
               - file: concepts/profiles
                 title: Profiles
+              - file: concepts/inference-engines
+                title: Inference Engines
               - file: concepts/profilesets
                 title: AIM Profile Sets
               - file: concepts/model-sources
@@ -83,12 +85,20 @@ subtrees:
                 title: Storage Configuration
               - file: admin/upgrading
                 title: Upgrading
+              - file: admin/template-migration
+                title: Bounded Template Migration
               - file: admin/monitoring
                 title: Monitoring
               - file: admin/troubleshooting
                 title: Troubleshooting
               - file: admin/security
                 title: Security
+              - file: admin/envoy-gateway-scale-from-zero
+                title: Envoy Gateway Scale-from-Zero
+              - file: admin/migrating-kgateway-to-envoy-gateway
+                title: Migrate from kgateway to Envoy Gateway
+              - file: admin/kgateway-setup
+                title: kgateway Setup
       - file: reference/reference
         title: Reference
         subtrees:

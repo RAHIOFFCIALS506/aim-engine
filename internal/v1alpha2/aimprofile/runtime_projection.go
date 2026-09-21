@@ -24,6 +24,8 @@ package aimprofile
 
 import (
 	"context"
+	"errors"
+	"fmt"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -37,6 +39,13 @@ import (
 	"github.com/amd-enterprise-ai/aim-engine/internal/v1alpha2/serving"
 )
 
+const (
+	runtimeProjectionComponent              = "RuntimeProjection"
+	runtimeProjectionReadyCondition         = runtimeProjectionComponent + controllerutils.ComponentConditionSuffix
+	runtimeProjectionElectionComponent      = "RuntimeProjectionElection"
+	runtimeProjectionElectionReadyCondition = runtimeProjectionElectionComponent + controllerutils.ComponentConditionSuffix
+)
+
 // runtimeProjectable reports whether a profile should have a runtime projected.
 // A profile is projectable when it is deployable, carries an image, and either
 // needs no accelerator (no hardware constraint to satisfy) or has at least one
@@ -46,26 +55,144 @@ func runtimeProjectable(spec aimv1alpha2.AIMProfileSpecCommon, deployable bool, 
 	if !deployable || spec.Image == "" {
 		return false
 	}
-	if !HasAcceleratorRequirement(spec.AcceleratorModel, spec.AcceleratorCount, spec.Resources) {
+	if !HasProfileAcceleratorRequirement(spec) {
 		return true
 	}
 	return match.MatchingNodes > 0
 }
 
-// modelSlugProjectable reports whether a profile should publish the Reduced-mode
-// model-slug primary runtime for its model.
-//
-// Primary-selection rule (deliberately thin — primary-selection determinism and
-// onPrimaryUnavailable are out of scope for this slice and deferred): a profile
-// publishes the model-slug primary when it is itself projectable AND it is the
-// model's primary (spec.primary == true) AND it carries an aimId (the slug
-// source). Because the primary is named aim-<model-slug> under the reserved
-// prefix and force-applied, all primary profiles of one model converge on a
-// single runtime object; if more than one profile of a model is marked primary,
-// the most-recently-reconciled one wins (last-writer-wins — the deferred
-// determinism concern).
-func modelSlugProjectable(spec aimv1alpha2.AIMProfileSpecCommon, projectable bool) bool {
-	return projectable && spec.Primary && spec.AimId != ""
+// modelSlugProjectable reports whether a profile should publish the
+// Reduced/Both model-slug runtime. A profile must first win the deterministic
+// same-scope election among all declared primaries for its aimId; the normal
+// projectability gate is then applied to that one winner.
+func modelSlugProjectable(spec aimv1alpha2.AIMProfileSpecCommon, projectable, elected bool) bool {
+	return elected && projectable && spec.Primary && spec.AimId != ""
+}
+
+// electNamespaceModelSlugWinner elects exactly one namespace profile among all
+// declared primaries for the same aimId. The shared AIMService profile ranker is
+// used so native model-slug projection and AIMService auto-selection cannot
+// disagree about which profile is preferred.
+func electNamespaceModelSlugWinner(
+	ctx context.Context,
+	c client.Client,
+	profile *aimv1alpha2.AIMProfile,
+) (bool, error) {
+	if profile == nil || !profile.Spec.Primary || profile.Spec.AimId == "" {
+		return false, nil
+	}
+
+	var peers aimv1alpha2.AIMProfileList
+	if err := c.List(
+		ctx,
+		&peers,
+		client.InNamespace(profile.Namespace),
+		client.MatchingFields{aimv1alpha2.ProfileAimIdIndexKey: profile.Spec.AimId},
+	); err != nil {
+		return false, fmt.Errorf("list namespace primary profiles for runtime projection: %w", err)
+	}
+
+	candidates := peers.Items[:0]
+	for i := range peers.Items {
+		if peers.Items[i].Spec.Primary {
+			candidates = append(candidates, peers.Items[i])
+		}
+	}
+	SortNamespaceProfiles(candidates)
+	winner := SelectBestNamespaceProfile(candidates)
+	return winner != nil && winner.Name == profile.Name, nil
+}
+
+// electClusterModelSlugWinner is the cluster-scoped counterpart of
+// electNamespaceModelSlugWinner.
+func electClusterModelSlugWinner(
+	ctx context.Context,
+	c client.Client,
+	profile *aimv1alpha2.AIMClusterProfile,
+) (bool, error) {
+	if profile == nil || !profile.Spec.Primary || profile.Spec.AimId == "" {
+		return false, nil
+	}
+
+	var peers aimv1alpha2.AIMClusterProfileList
+	if err := c.List(
+		ctx,
+		&peers,
+		client.MatchingFields{aimv1alpha2.ProfileAimIdIndexKey: profile.Spec.AimId},
+	); err != nil {
+		return false, fmt.Errorf("list cluster primary profiles for runtime projection: %w", err)
+	}
+
+	candidates := peers.Items[:0]
+	for i := range peers.Items {
+		if peers.Items[i].Spec.Primary {
+			candidates = append(candidates, peers.Items[i])
+		}
+	}
+	SortClusterProfiles(candidates)
+	winner := SelectBestClusterProfile(candidates)
+	return winner != nil && winner.Name == profile.Name, nil
+}
+
+func validateNamespaceRuntimeProjection(
+	mode aimv1alpha2.RuntimeProjectionMode,
+	profile *aimv1alpha2.AIMProfile,
+	obs ProfileObservation,
+) error {
+	if profile == nil {
+		return nil
+	}
+	spec := profile.Spec.AIMProfileSpecCommon
+	input := serving.NamespaceRuntimeInput{
+		ProfileName:  profile.Name,
+		Namespace:    profile.Namespace,
+		Spec:         &spec,
+		YAMLContract: obs.yamlContract,
+		Resources:    obs.resolvedResources,
+		NodeAffinity: obs.matchResult.NodeAffinity,
+		Cache:        obs.profileCache,
+	}
+	if shouldMaintainNamespaceRuntime(mode, profile, obs.projectable) {
+		if _, _, err := serving.BuildNamespaceServingRuntime(input); err != nil {
+			return fmt.Errorf("build per-profile ServingRuntime: %w", err)
+		}
+	}
+	if shouldMaintainNamespaceModelSlugRuntime(mode, profile, obs.projectable, obs.modelSlugWinner) {
+		input.Name = serving.ModelSlugRuntimeName(spec.AimId)
+		if _, _, err := serving.BuildNamespaceServingRuntime(input); err != nil {
+			return fmt.Errorf("build model-slug ServingRuntime: %w", err)
+		}
+	}
+	return nil
+}
+
+func validateClusterRuntimeProjection(
+	mode aimv1alpha2.RuntimeProjectionMode,
+	profile *aimv1alpha2.AIMClusterProfile,
+	obs ClusterProfileObservation,
+) error {
+	if profile == nil {
+		return nil
+	}
+	spec := profile.Spec.AIMProfileSpecCommon
+	input := serving.ClusterRuntimeInput{
+		ProfileName:  profile.Name,
+		Spec:         &spec,
+		Resources:    obs.resolvedResources,
+		NodeAffinity: obs.matchResult.NodeAffinity,
+	}
+	if shouldMaintainClusterRuntime(mode, profile, obs.projectable) {
+		if _, err := serving.BuildClusterServingRuntime(input); err != nil {
+			return fmt.Errorf("build per-profile ClusterServingRuntime: %w", err)
+		}
+	}
+	if shouldMaintainClusterModelSlugRuntime(mode, profile, obs.projectable, obs.modelSlugWinner) {
+		input.Name = serving.ModelSlugRuntimeName(spec.AimId)
+		if _, err := serving.BuildClusterServingRuntime(input); err != nil {
+			return fmt.Errorf("build model-slug ClusterServingRuntime: %w", err)
+		}
+	}
+	return nil
 }
 
 // fetchMountableCache resolves the Ready, profile-owned (Shared) AIMProfileCache
@@ -80,16 +207,20 @@ func modelSlugProjectable(spec aimv1alpha2.AIMProfileSpecCommon, projectable boo
 // <profile>-cache-<hash> and never flips the profile's caching flag, yet it must
 // still be mounted here or a Shared-mode service resolving to a namespace profile
 // would cold-pull weights on every pod start (an outright failure air-gapped).
-// A list error is logged and treated as "no cache yet" so a transient API hiccup
-// defers the mount to the next reconcile — driven by the AIMProfileCache watch —
-// rather than failing the whole projection.
-func fetchMountableCache(ctx context.Context, c client.Client, profile *aimv1alpha2.AIMProfile) *aimv1alpha2.AIMProfileCache {
+// A list error must remain distinguishable from "no Ready cache": treating an
+// unknown result as nil would force-apply a cacheless runtime and remove a
+// working PVC mount. The caller reports the infrastructure failure and skips
+// projection apply, preserving the last known-good runtime.
+func fetchMountableCache(
+	ctx context.Context,
+	c client.Client,
+	profile *aimv1alpha2.AIMProfile,
+) (*aimv1alpha2.AIMProfileCache, error) {
 	cache, err := profilecache.FindReadyShared(ctx, c, profile.Namespace, profile.Name, aimv1alpha1.AIMResolutionScopeNamespace)
 	if err != nil {
-		log.FromContext(ctx).V(1).Info("failed to resolve profile cache for runtime projection", "profile", profile.Name, "error", err)
-		return nil
+		return nil, err
 	}
-	return cache
+	return cache, nil
 }
 
 // planNamespaceRuntime appends the eager ServingRuntime (+ colocated profile
@@ -98,38 +229,36 @@ func fetchMountableCache(ctx context.Context, c client.Client, profile *aimv1alp
 // under the reserved prefix, always ≤63 chars and unguessable) and are routed
 // through the force-apply bucket so AIM Engine authoritatively reconciles drift;
 // the pipeline sets the owner reference for garbage collection. Force-apply is
-// safe by the reserved aim- prefix policy (CONTEXT.md "Authoritative apply", ADR
-// 0008); the hashed name adds an EXTRA margin specific to the per-profile scheme
+// safe by the reserved aim- prefix policy (CONTEXT.md "Authoritative apply");
+// the hashed name adds an EXTRA margin specific to the per-profile scheme
 // — it cannot collide with a hand-authored object even by accident, so a
 // force-apply only ever clobbers a runtime AIM Engine owns.
 //
-// Projection is purely additive, like every other resource in this pipeline: we
-// emit the runtime only when the profile is projectable. A later gate flip (e.g.
-// nodes vanish) simply stops emitting it — the apply pipeline never prunes owned
-// objects that are absent from the plan (see reconciler.go Phase 5: only
-// plan.Delete objects are removed), so the existing runtime survives untouched.
-// This is the asymmetric teardown: creation is gated, removal is not — a
-// projected runtime is torn out only by ownerRef GC on profile delete or an
-// explicit disable. The Degraded signal for a kept-but-ungated runtime is
-// recorded separately in decorateRuntimeProjection.
+// Projection is additive: a runtime is first emitted only while the profile is
+// projectable. Once status records that projection, later gate failures keep
+// reasserting it instead of leaving stale content behind. This matters when an
+// AIMService resource override can still use a profile whose default footprint
+// no longer fits a node. Removal remains asymmetric — the runtime is torn out
+// only by ownerRef GC on profile delete or an explicit disable.
 func planNamespaceRuntime(
 	ctx context.Context,
 	plan *controllerutils.PlanResult,
+	mode aimv1alpha2.RuntimeProjectionMode,
 	profile *aimv1alpha2.AIMProfile,
 	obs ProfileObservation,
 ) {
-	if !obs.projectable {
+	if !shouldMaintainNamespaceRuntime(mode, profile, obs.projectable) {
 		return
 	}
 	spec := profile.Spec.AIMProfileSpecCommon
 	if spec.Image == "" {
 		return
 	}
-
 	runtime, configMap, err := serving.BuildNamespaceServingRuntime(serving.NamespaceRuntimeInput{
 		ProfileName:  profile.Name,
 		Namespace:    profile.Namespace,
 		Spec:         &spec,
+		YAMLContract: obs.yamlContract,
 		Resources:    obs.resolvedResources,
 		NodeAffinity: obs.matchResult.NodeAffinity,
 		Cache:        obs.profileCache,
@@ -143,6 +272,22 @@ func planNamespaceRuntime(
 	markEagerProjection(configMap)
 	plan.ApplyWithForce(runtime)
 	plan.ApplyWithForce(configMap)
+}
+
+func shouldMaintainNamespaceRuntime(
+	mode aimv1alpha2.RuntimeProjectionMode,
+	profile *aimv1alpha2.AIMProfile,
+	projectable bool,
+) bool {
+	if profile == nil {
+		return false
+	}
+	// Projection mode controls first publication, not ownership of an existing
+	// eager projection. Once status records the per-profile runtime, keep
+	// reasserting it across an Exhaustive/Both -> Reduced switch: the lazy
+	// controller intentionally defers to its eager marker.
+	return (mode.ProjectsPerProfile() && projectable) ||
+		profile.Status.ProjectedRuntimeName == serving.RuntimeName(profile.Name)
 }
 
 // markEagerProjection stamps the eager-projection marker on a per-profile /
@@ -187,10 +332,11 @@ func markEagerProjection(obj metav1.Object) {
 func planClusterRuntime(
 	ctx context.Context,
 	plan *controllerutils.PlanResult,
+	mode aimv1alpha2.RuntimeProjectionMode,
 	profile *aimv1alpha2.AIMClusterProfile,
 	obs ClusterProfileObservation,
 ) {
-	if !obs.projectable {
+	if !shouldMaintainClusterRuntime(mode, profile, obs.projectable) {
 		return
 	}
 	spec := profile.Spec.AIMProfileSpecCommon
@@ -212,11 +358,25 @@ func planClusterRuntime(
 	plan.ApplyWithForce(runtime)
 }
 
-// planNamespaceModelSlugRuntime appends the Reduced-mode model-slug primary
-// ServingRuntime (+ colocated profile ConfigMap) for a namespace profile that is
-// its model's primary. The objects are named aim-<model-slug> (derived from
-// spec.aimId, vendor/precision-independent), giving native KServe
-// InferenceServices one stable runtime name per model to reference explicitly.
+func shouldMaintainClusterRuntime(
+	mode aimv1alpha2.RuntimeProjectionMode,
+	profile *aimv1alpha2.AIMClusterProfile,
+	projectable bool,
+) bool {
+	if profile == nil {
+		return false
+	}
+	// Match the namespace lifecycle: changing mode stops new per-profile
+	// publication but does not abandon a runtime already recorded in status.
+	return (mode.ProjectsPerProfile() && projectable) ||
+		profile.Status.ProjectedRuntimeName == serving.RuntimeName(profile.Name)
+}
+
+// planNamespaceModelSlugRuntime appends the Reduced/Both model-slug primary
+// ServingRuntime (+ colocated profile ConfigMap) for the elected namespace
+// primary. The objects are named aim-<model-slug> (derived from spec.aimId,
+// vendor/precision-independent), giving native KServe InferenceServices one
+// stable runtime name per model to reference explicitly.
 // autoSelect stays OFF (like every projected runtime): all runtimes share the
 // single model format, so autoSelect would collide across models rather than
 // resolve one. The correlator labels still point to the backing primary profile.
@@ -224,7 +384,7 @@ func planClusterRuntime(
 // Both objects route through the authoritative force-apply bucket (SSA +
 // ForceOwnership); the pipeline sets the owner reference for GC. Force-apply here
 // is safe by the reserved aim- prefix policy ALONE (CONTEXT.md "Reserved `aim-`
-// prefix" / "Authoritative apply", ADR 0008): AIM Engine owns everything under
+// prefix" / "Authoritative apply"): AIM Engine owns everything under
 // aim- exclusively and is authoritative over it, so it force-applies
 // unconditionally — no pre-apply Get, no per-name branching. The justification is
 // the reserved PREFIX, not name unguessability: unlike the per-profile runtime,
@@ -232,26 +392,28 @@ func planClusterRuntime(
 // guessable, so the per-profile hashed-name "cannot collide by accident" argument
 // (see serving.RuntimeName) does NOT cover this path — and does not need to.
 //
-// Unlike the per-profile path there is no asymmetric-teardown re-apply here: the
-// primary is published while the profile is projectable and left untouched
-// otherwise (never deleted; GC'd on profile delete). onPrimaryUnavailable
-// (degrade vs repoint) is out of scope for this slice.
+// Projection mode controls first publication and active winner election. Once
+// status records this profile as the model-slug owner, a mode that disables
+// model-slug publication still reasserts the existing runtime so its eager marker
+// cannot strand stale content. When model-slug publication is active, the live
+// election remains authoritative and a losing profile stops applying the name.
 func planNamespaceModelSlugRuntime(
 	ctx context.Context,
 	plan *controllerutils.PlanResult,
+	mode aimv1alpha2.RuntimeProjectionMode,
 	profile *aimv1alpha2.AIMProfile,
 	obs ProfileObservation,
 ) {
 	spec := profile.Spec.AIMProfileSpecCommon
-	if !modelSlugProjectable(spec, obs.projectable) {
+	if !shouldMaintainNamespaceModelSlugRuntime(mode, profile, obs.projectable, obs.modelSlugWinner) {
 		return
 	}
-
 	runtime, configMap, err := serving.BuildNamespaceServingRuntime(serving.NamespaceRuntimeInput{
 		ProfileName:  profile.Name,
 		Name:         serving.ModelSlugRuntimeName(spec.AimId),
 		Namespace:    profile.Namespace,
 		Spec:         &spec,
+		YAMLContract: obs.yamlContract,
 		Resources:    obs.resolvedResources,
 		NodeAffinity: obs.matchResult.NodeAffinity,
 		Cache:        obs.profileCache,
@@ -267,24 +429,40 @@ func planNamespaceModelSlugRuntime(
 	plan.ApplyWithForce(configMap)
 }
 
-// planClusterModelSlugRuntime appends the Reduced-mode model-slug primary
-// ClusterServingRuntime for a cluster profile that is its model's primary. The
-// bare CSR (no colocated ConfigMap) is named aim-<model-slug>; autoSelect stays
-// OFF (native consumers reference it by name). It is force-applied
+func shouldMaintainNamespaceModelSlugRuntime(
+	mode aimv1alpha2.RuntimeProjectionMode,
+	profile *aimv1alpha2.AIMProfile,
+	projectable, modelSlugWinner bool,
+) bool {
+	if profile == nil {
+		return false
+	}
+	if mode.ProjectsModelSlug() {
+		return modelSlugProjectable(profile.Spec.AIMProfileSpecCommon, projectable, modelSlugWinner)
+	}
+	return profile.Status.ProjectedModelSlugRuntimeName ==
+		serving.ModelSlugRuntimeName(profile.Spec.AimId)
+}
+
+// planClusterModelSlugRuntime appends the Reduced/Both model-slug primary
+// ClusterServingRuntime for the elected cluster primary. The bare CSR (no
+// colocated ConfigMap) is named aim-<model-slug>; autoSelect stays OFF (native
+// consumers reference it by name). It is force-applied
 // authoritatively (SSA + ForceOwnership), safe by the reserved aim- prefix policy
 // — NOT by name unguessability: the model-slug name is readable and guessable, so
 // the per-profile hashed-name collision argument does not apply here (see
 // planNamespaceModelSlugRuntime and serving.ModelSlugRuntimeName; CONTEXT.md
-// "Reserved `aim-` prefix" / "Authoritative apply", ADR 0008). See
+// "Reserved `aim-` prefix" / "Authoritative apply"). See
 // planNamespaceModelSlugRuntime for the lifecycle notes.
 func planClusterModelSlugRuntime(
 	ctx context.Context,
 	plan *controllerutils.PlanResult,
+	mode aimv1alpha2.RuntimeProjectionMode,
 	profile *aimv1alpha2.AIMClusterProfile,
 	obs ClusterProfileObservation,
 ) {
 	spec := profile.Spec.AIMProfileSpecCommon
-	if !modelSlugProjectable(spec, obs.projectable) {
+	if !shouldMaintainClusterModelSlugRuntime(mode, profile, obs.projectable, obs.modelSlugWinner) {
 		return
 	}
 
@@ -303,41 +481,86 @@ func planClusterModelSlugRuntime(
 	plan.ApplyWithForce(runtime)
 }
 
+func shouldMaintainClusterModelSlugRuntime(
+	mode aimv1alpha2.RuntimeProjectionMode,
+	profile *aimv1alpha2.AIMClusterProfile,
+	projectable, modelSlugWinner bool,
+) bool {
+	if profile == nil {
+		return false
+	}
+	if mode.ProjectsModelSlug() {
+		return modelSlugProjectable(profile.Spec.AIMProfileSpecCommon, projectable, modelSlugWinner)
+	}
+	return profile.Status.ProjectedModelSlugRuntimeName ==
+		serving.ModelSlugRuntimeName(profile.Spec.AimId)
+}
+
 // recordProjectedRuntimeNames publishes the projected runtime name(s) on status
 // so a profile maps to its runtime without reversing the opaque hashed name.
 //
 // It follows the projection's additive/degrade lifecycle: a name is written
-// while the profile projects that runtime and left in place (never cleared here)
-// when the gate later flips but the runtime survives. The per-profile and
-// model-slug fields are each set only under a mode that projects them, matching
-// the plan guards.
+// while the profile projects that runtime and retained when only the
+// projectability gate later flips. The model-slug field is cleared when the
+// profile loses the election because another profile now owns the shared
+// runtime. The per-profile and model-slug fields are each set only under a mode
+// that projects them, matching the plan guards.
 func recordProjectedRuntimeNames(
 	status *aimv1alpha2.AIMProfileStatus,
 	mode aimv1alpha2.RuntimeProjectionMode,
 	spec aimv1alpha2.AIMProfileSpecCommon,
 	profileName string,
-	projectable bool,
+	projectable, modelSlugWinner bool,
 ) {
 	if mode.ProjectsPerProfile() && projectable {
 		status.ProjectedRuntimeName = serving.RuntimeName(profileName)
 	}
-	if mode.ProjectsModelSlug() && modelSlugProjectable(spec, projectable) {
-		status.ProjectedModelSlugRuntimeName = serving.ModelSlugRuntimeName(spec.AimId)
+	if mode.ProjectsModelSlug() {
+		switch {
+		case modelSlugProjectable(spec, projectable, modelSlugWinner):
+			status.ProjectedModelSlugRuntimeName = serving.ModelSlugRuntimeName(spec.AimId)
+		case !modelSlugWinner:
+			// Losing an election is different from a projectability gate flip:
+			// another profile now owns and publishes the shared runtime, so this
+			// profile must stop claiming the model-slug name in status.
+			status.ProjectedModelSlugRuntimeName = ""
+		}
 	}
 }
 
 // decorateProjectionCondition records the RuntimeProjected condition for the
-// mode in effect. Per-profile modes (Exhaustive/Both) always reflect this
-// profile's own projection. Reduced-only mode has no per-profile runtime, so it
-// reflects the condition only for the model's primary profile (the one that
-// publishes the model-slug primary); non-primary profiles project nothing and
-// stay silent.
+// mode in effect. A builder error records False/RuntimeProjectionFailed, while
+// an infrastructure error preserves the prior informational condition.
+// Otherwise per-profile modes (Exhaustive/Both) reflect this profile's own
+// projection. Reduced-only mode has no per-profile runtime, so it reflects the
+// condition only for the elected primary profile (the one that publishes the
+// model-slug runtime); non-winners project nothing and stay silent.
 func decorateProjectionCondition(
 	cm *controllerutils.ConditionManager,
 	mode aimv1alpha2.RuntimeProjectionMode,
-	primary, projectable bool,
+	modelSlugWinner, projectable bool,
 	nodeErr error,
+	projectionErr error,
 ) {
+	if projectionErr != nil {
+		var categorized controllerutils.StateEngineError
+		if errors.As(projectionErr, &categorized) &&
+			categorized.Category() == controllerutils.ErrorCategoryInfrastructure {
+			return
+		}
+		cm.MarkFalse(
+			aimv1alpha2.AIMProfileConditionRuntimeProjected,
+			aimv1alpha2.AIMProfileReasonRuntimeProjectionFailed,
+			fmt.Sprintf("Failed to build projected runtime: %v", projectionErr),
+		)
+		return
+	}
+
+	// RuntimeProjectionReady is emitted by component health only while runtime
+	// construction is failing. Remove the old component condition explicitly
+	// after recovery so it cannot continue gating aggregate readiness.
+	cm.Delete(runtimeProjectionReadyCondition)
+
 	switch {
 	case mode.ProjectsPerProfile():
 		// Exhaustive/Both project a per-profile runtime. Asymmetric teardown: when
@@ -346,7 +569,7 @@ func decorateProjectionCondition(
 		// silent. "Was projected before" is read from the last-reconcile condition
 		// the ConditionManager was seeded with — no client call.
 		decorateRuntimeProjection(cm, projectable, priorRuntimeProjected(cm), nodeErr)
-	case mode.ProjectsModelSlug() && primary:
+	case mode.ProjectsModelSlug() && modelSlugWinner:
 		// Reduced publishes only the model-slug primary. onPrimaryUnavailable
 		// (degrade vs repoint of the shared slug runtime) is deferred, so this path
 		// never degrades: it reports True while projectable and stays silent

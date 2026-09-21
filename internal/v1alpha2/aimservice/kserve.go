@@ -24,6 +24,7 @@ package aimservice
 
 import (
 	"context"
+	"fmt"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -38,8 +39,11 @@ import (
 	aimv1alpha2 "github.com/amd-enterprise-ai/aim-engine/api/v1alpha2"
 	"github.com/amd-enterprise-ai/aim-engine/internal/constants"
 	controllerutils "github.com/amd-enterprise-ai/aim-engine/internal/controller/utils"
+	"github.com/amd-enterprise-ai/aim-engine/internal/trust"
 	"github.com/amd-enterprise-ai/aim-engine/internal/utils"
+	"github.com/amd-enterprise-ai/aim-engine/internal/v1alpha1/aimartifact"
 	v1alpha1svc "github.com/amd-enterprise-ai/aim-engine/internal/v1alpha1/aimservice"
+	"github.com/amd-enterprise-ai/aim-engine/internal/v1alpha2/aimprofile"
 	"github.com/amd-enterprise-ai/aim-engine/internal/v1alpha2/serving"
 )
 
@@ -63,7 +67,7 @@ func fetchInferenceService(
 	}, &servingv1beta1.InferenceService{})
 }
 
-// fetchLegacyProfileConfigMap fetches the pre-ADR-0008 service-owned profile
+// fetchLegacyProfileConfigMap fetches the legacy inline-predictor service-owned profile
 // ConfigMap (<service>-profile-<hash>) by its deterministic legacy name. It is
 // present only for services created before the runtime-reference rewrite; a
 // not-found result is the normal case and is left for PlanResources to skip. A
@@ -90,9 +94,10 @@ func fetchLegacyProfileConfigMap(
 // (aim-<profile.Name>) and overlays only service-specific fields. The inline
 // predictor — image, base resources, affinity, profile ConfigMap, the full
 // profile-derived framework env, and the profile-owned cache mount — lives on
-// the referenced ServingRuntime (projected lazily by the InferenceService-watch
-// reconciler or eagerly by the profile reconcilers), so the service and any
-// native KServe consumer share one serving definition.
+// the referenced ServingRuntime (pre-materialized by the AIMService, projected
+// lazily by the InferenceService-watch reconciler, or eagerly by the profile
+// reconcilers), so the service and any native KServe consumer share one serving
+// definition.
 //
 // The overlay carries only service-owned bits: replicas/autoscaling, auth
 // annotations, service-level resource / pull-secret / service-account
@@ -106,20 +111,32 @@ func buildInferenceServiceFromProfile(
 	if profileSpec == nil || profileStatus == nil {
 		return nil
 	}
+	if profileStatus.Status != constants.AIMStatusReady && service.Spec.Resources == nil {
+		return nil
+	}
 	if obs.isvcName == "" {
 		return nil
 	}
 
-	// The model overlay references the runtime by name and carries only the
-	// service-level resource override; base resources come from the runtime.
-	// KServe merges predictor.model over the runtime container by name with the
-	// ISVC winning, so this override beats the runtime's resources when set.
+	// The model overlay references the runtime by name. When the service carries
+	// a resource override, write the fully merged block rather than the partial
+	// override: KServe preserves omitted runtime keys during its overlay, which
+	// could otherwise leave a service request above the retained runtime limit.
 	model := &servingv1beta1.ModelSpec{
 		ModelFormat: servingv1beta1.ModelFormat{Name: serving.RuntimeModelFormat},
-		Runtime:     ptr.To(stickyRuntimeName(obs)),
+		Runtime:     ptr.To(serving.RuntimeName(obs.profileName)),
 	}
 	if service.Spec.Resources != nil {
-		model.Resources = *service.Spec.Resources
+		if obs.effectiveResources != nil {
+			model.Resources = *obs.effectiveResources.DeepCopy()
+		} else {
+			model.Resources = resolveResourcesFromProfile(service, profileSpec, profileStatus)
+		}
+	}
+
+	serviceAccountName := service.Spec.ServiceAccountName
+	if serviceAccountName == "" {
+		serviceAccountName = profileSpec.ServiceAccountName
 	}
 
 	isvc := &servingv1beta1.InferenceService{
@@ -137,7 +154,7 @@ func buildInferenceServiceFromProfile(
 			Predictor: servingv1beta1.PredictorSpec{
 				PodSpec: servingv1beta1.PodSpec{
 					ImagePullSecrets:   utils.CopyPullSecrets(service.Spec.ImagePullSecrets),
-					ServiceAccountName: service.Spec.ServiceAccountName,
+					ServiceAccountName: serviceAccountName,
 					PriorityClassName:  service.Spec.PriorityClassName,
 				},
 				Model: model,
@@ -153,22 +170,38 @@ func buildInferenceServiceFromProfile(
 	// A service-owned (Dedicated) cache is overlaid onto the referenced runtime;
 	// a profile-owned (Shared) cache is mounted by the runtime itself.
 	addServiceOwnedCacheOverlay(isvc, service, obs)
+	addRuntimeTrustOverlay(
+		isvc,
+		obs.mergedRuntimeConfig.Value,
+		obs.additionalCABundle.Value,
+	)
 
 	return isvc
 }
 
-// stickyRuntimeName returns the runtime name the ISVC should reference. An
-// existing ISVC keeps whatever runtime it already references (sticky), so a
-// projection-mode change never re-rolls a live ISVC; a fresh ISVC references
-// aim-<profile.Name> from the resolved profile.
-func stickyRuntimeName(obs ServiceObservation) string {
-	if existing := obs.inferenceService.Value; existing != nil &&
-		existing.Spec.Predictor.Model != nil &&
-		existing.Spec.Predictor.Model.Runtime != nil &&
-		*existing.Spec.Predictor.Model.Runtime != "" {
-		return *existing.Spec.Predictor.Model.Runtime
+func addRuntimeTrustOverlay(
+	isvc *servingv1beta1.InferenceService,
+	runtimeConfig *aimv1alpha1.AIMRuntimeConfigCommon,
+	caConfigMap *corev1.ConfigMap,
+) {
+	if runtimeConfig == nil ||
+		runtimeConfig.AdditionalCABundleRef == nil ||
+		caConfigMap == nil ||
+		isvc.Spec.Predictor.Model == nil {
+		return
 	}
-	return serving.RuntimeName(obs.profileName)
+	projection := trust.BuildProjection(trust.Options{
+		AdditionalCABundleRef: runtimeConfig.AdditionalCABundleRef,
+		Image:                 aimartifact.ResolveDownloadImage(nil, runtimeConfig),
+	})
+	if projection == nil {
+		return
+	}
+	predictor := &isvc.Spec.Predictor
+	predictor.InitContainers = append(predictor.InitContainers, projection.InitContainer)
+	predictor.Volumes = append(predictor.Volumes, projection.Volumes...)
+	predictor.Model.VolumeMounts = append(predictor.Model.VolumeMounts, projection.VolumeMounts...)
+	predictor.Model.Env = trust.UpsertEnv(predictor.Model.Env, projection.Env)
 }
 
 // buildInferenceServiceLabels builds the correlator labels stamped on the
@@ -270,6 +303,7 @@ func addServiceOwnedCacheOverlay(
 	}
 
 	model.Env = upsertEnvVars(model.Env, buildFrameworkEnvVars(obs.resolvedProfileSpec, obs.profileYAMLName))
+	model.Env = upsertEnvVars(model.Env, serving.BuildDirectVLLMCacheEnv(obs.resolvedProfileSpec, obs.profileCache.Value))
 
 	for _, resolved := range sortedReadyArtifacts(obs.profileCache.Value) {
 		volumeName := strings.ReplaceAll(utils.MakeRFC1123Compliant(resolved.Name), ".", "-")
@@ -329,14 +363,17 @@ func buildFrameworkEnvVars(profileSpec *aimv1alpha2.AIMProfileSpecCommon, profil
 }
 
 // resolveEffectiveResourcesFromProfile returns the fully-merged predictor
-// ResourceRequirements, or nil when the profile is not yet Ready.
+// ResourceRequirements, or nil until the profile has produced status.
 // PlanScaledObject uses this to derive a memory-aware cooldown.
 func resolveEffectiveResourcesFromProfile(
 	service *aimv1alpha1.AIMService,
 	profileSpec *aimv1alpha2.AIMProfileSpecCommon,
 	profileStatus *aimv1alpha2.AIMProfileStatus,
 ) *corev1.ResourceRequirements {
-	if profileSpec == nil || profileStatus == nil || profileStatus.Status != constants.AIMStatusReady {
+	if profileSpec == nil || profileStatus == nil {
+		return nil
+	}
+	if profileStatus.Status != constants.AIMStatusReady && service.Spec.Resources == nil {
 		return nil
 	}
 	rr := resolveResourcesFromProfile(service, profileSpec, profileStatus)
@@ -360,20 +397,132 @@ func resolveResourcesFromProfile(
 	profileSpec *aimv1alpha2.AIMProfileSpecCommon,
 	profileStatus *aimv1alpha2.AIMProfileStatus,
 ) corev1.ResourceRequirements {
-	// Service-level resource overrides take precedence
-	if service.Spec.Resources != nil {
-		return *service.Spec.Resources
-	}
-
 	// Use profile status.resources (computed by profile controller)
 	if profileStatus != nil && profileStatus.Resources != nil {
-		return *profileStatus.Resources
+		return mergeResourceRequirements(profileStatus.Resources, service.Spec.Resources)
 	}
 
 	// Fall back to spec.resources
 	if profileSpec.Resources != nil {
-		return *profileSpec.Resources
+		return mergeResourceRequirements(profileSpec.Resources, service.Spec.Resources)
 	}
 
-	return corev1.ResourceRequirements{}
+	return mergeResourceRequirements(nil, service.Spec.Resources)
+}
+
+// effectiveResourcesForService resolves profile defaults directly when status
+// has not populated resources yet, then applies the service's per-key overlay.
+func effectiveResourcesForService(
+	service *aimv1alpha1.AIMService,
+	profileSpec *aimv1alpha2.AIMProfileSpecCommon,
+	profileStatus *aimv1alpha2.AIMProfileStatus,
+) *corev1.ResourceRequirements {
+	if profileSpec == nil {
+		return nil
+	}
+	if profileStatus != nil && profileStatus.Resources != nil {
+		merged := mergeResourceRequirements(profileStatus.Resources, service.Spec.Resources)
+		return &merged
+	}
+	base := aimprofile.ResolveProfileResources(*profileSpec)
+	merged := mergeResourceRequirements(base, service.Spec.Resources)
+	return &merged
+}
+
+// mergeResourceRequirements overlays requests and limits independently and
+// returns a deep copy, preserving unspecified profile keys.
+func mergeResourceRequirements(
+	base *corev1.ResourceRequirements,
+	override *corev1.ResourceRequirements,
+) corev1.ResourceRequirements {
+	var merged corev1.ResourceRequirements
+	if base != nil {
+		merged = *base.DeepCopy()
+	}
+	if override == nil {
+		return merged
+	}
+	if len(override.Requests) > 0 {
+		if merged.Requests == nil {
+			merged.Requests = make(corev1.ResourceList)
+		}
+		for name, qty := range override.Requests {
+			merged.Requests[name] = qty.DeepCopy()
+		}
+	}
+	if len(override.Limits) > 0 {
+		if merged.Limits == nil {
+			merged.Limits = make(corev1.ResourceList)
+		}
+		for name, qty := range override.Limits {
+			merged.Limits[name] = qty.DeepCopy()
+		}
+	}
+
+	// Extended device resources are non-overcommitable: when a service changes
+	// only one side, mirror it to the other side instead of retaining a
+	// different runtime value.
+	for name, request := range override.Requests {
+		if isExtendedDeviceResource(name) {
+			if _, explicitlyLimited := override.Limits[name]; !explicitlyLimited {
+				if merged.Limits == nil {
+					merged.Limits = make(corev1.ResourceList)
+				}
+				merged.Limits[name] = request.DeepCopy()
+			}
+		}
+	}
+	for name, limit := range override.Limits {
+		if isExtendedDeviceResource(name) {
+			if _, explicitlyRequested := override.Requests[name]; !explicitlyRequested {
+				if merged.Requests == nil {
+					merged.Requests = make(corev1.ResourceList)
+				}
+				merged.Requests[name] = limit.DeepCopy()
+			}
+		}
+	}
+
+	// A one-sided service override is authoritative over the inherited pair.
+	// Adjust the omitted side when retaining it would violate request<=limit.
+	for name, request := range override.Requests {
+		if _, explicitlyLimited := override.Limits[name]; explicitlyLimited {
+			continue
+		}
+		if limit, exists := merged.Limits[name]; exists && request.Cmp(limit) > 0 {
+			merged.Limits[name] = request.DeepCopy()
+		}
+	}
+	for name, limit := range override.Limits {
+		if _, explicitlyRequested := override.Requests[name]; explicitlyRequested {
+			continue
+		}
+		if request, exists := merged.Requests[name]; exists && request.Cmp(limit) > 0 {
+			merged.Requests[name] = limit.DeepCopy()
+		}
+	}
+	return merged
+}
+
+func validateResourceRequirements(resources *corev1.ResourceRequirements) error {
+	if resources == nil {
+		return nil
+	}
+	for name, request := range resources.Requests {
+		if limit, exists := resources.Limits[name]; exists &&
+			(request.Cmp(limit) > 0 || isExtendedDeviceResource(name) && request.Cmp(limit) != 0) {
+			return fmt.Errorf(
+				"requests.%s (%s) is incompatible with limits.%s (%s)",
+				name,
+				request.String(),
+				name,
+				limit.String(),
+			)
+		}
+	}
+	return nil
+}
+
+func isExtendedDeviceResource(name corev1.ResourceName) bool {
+	return strings.Contains(string(name), "/")
 }

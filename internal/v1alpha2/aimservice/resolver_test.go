@@ -1204,6 +1204,12 @@ func TestProfileLess(t *testing.T) {
 			aWins: true,
 		},
 		{
+			name:  "tier 5: fp64 beats unset precision",
+			a:     spec{Type: aimv1alpha1.AIMProfileTypeOptimized, AcceleratorModel: "MI300X", Metric: "latency"},
+			b:     spec{Type: aimv1alpha1.AIMProfileTypeOptimized, AcceleratorModel: "MI300X", Metric: "latency", Precision: "fp64"},
+			aWins: false,
+		},
+		{
 			name: "tier 6: smaller count wins on tie",
 			a: spec{
 				Type: aimv1alpha1.AIMProfileTypeOptimized, AcceleratorModel: "MI300X", Metric: "latency",
@@ -1251,6 +1257,34 @@ func TestProfileLess(t *testing.T) {
 			},
 			aVer:  "2.0.0",
 			bVer:  "1.9.0",
+			aWins: true,
+		},
+		{
+			name: "tier 8: calendar full release beats rc",
+			a: spec{
+				Type: aimv1alpha1.AIMProfileTypeOptimized, AcceleratorModel: "MI300X", Metric: "latency",
+				Precision: "fp8", AcceleratorCount: 1, AcceleratorType: aimv1alpha1.AcceleratorTypeGPU,
+			},
+			b: spec{
+				Type: aimv1alpha1.AIMProfileTypeOptimized, AcceleratorModel: "MI300X", Metric: "latency",
+				Precision: "fp8", AcceleratorCount: 1, AcceleratorType: aimv1alpha1.AcceleratorTypeGPU,
+			},
+			aVer:  "2026.8.0",
+			bVer:  "2026.8.0-rc1",
+			aWins: true,
+		},
+		{
+			name: "tier 8: unpadded October beats September",
+			a: spec{
+				Type: aimv1alpha1.AIMProfileTypeOptimized, AcceleratorModel: "MI300X", Metric: "latency",
+				Precision: "fp8", AcceleratorCount: 1, AcceleratorType: aimv1alpha1.AcceleratorTypeGPU,
+			},
+			b: spec{
+				Type: aimv1alpha1.AIMProfileTypeOptimized, AcceleratorModel: "MI300X", Metric: "latency",
+				Precision: "fp8", AcceleratorCount: 1, AcceleratorType: aimv1alpha1.AcceleratorTypeGPU,
+			},
+			aVer:  "2026.10.0-preview",
+			bVer:  "2026.9.0",
 			aWins: true,
 		},
 		{
@@ -1650,6 +1684,240 @@ func TestStickyBinding_ClusterScopedBoundProfile(t *testing.T) {
 		if contains(ev, aimv1alpha1.AIMServiceReasonProfileRebound) {
 			t.Errorf("unexpected ProfileRebound event on sticky cluster-keep path: %q", ev)
 		}
+	}
+}
+
+func TestResolveBySelector_AnyAutoSelectionPolicySelectedAfterOptimizedPassIsEmpty(t *testing.T) {
+	t.Parallel()
+
+	scheme := newResolverTestScheme(t)
+	labels := map[string]string{constants.LabelKeyProfileRole: constants.LabelValueProfileRoleDeployable}
+	fallback := resolverProfileBuilder("nvidia-fallback", "ns", "aim/nvidia", "fp16", labels)
+	fallback.Spec.Type = aimv1alpha1.AIMProfileTypeUnoptimized
+	fallback.Spec.AutoSelectionPolicy = aimv1alpha1.AIMProfileAutoSelectionPolicyAny
+	c := newResolverClient(t, scheme, fallback)
+	service := &aimv1alpha1.AIMService{
+		ObjectMeta: metav1.ObjectMeta{Name: "svc", Namespace: "ns"},
+		Spec: aimv1alpha1.AIMServiceSpec{
+			Profile: &aimv1alpha1.AIMServiceProfileConfig{
+				Selector: &aimv1alpha1.ProfileSelector{AimId: "aim/nvidia"},
+			},
+		},
+	}
+
+	ns, cluster, resolution := resolveProfileCandidates(
+		context.Background(), c, record.NewFakeRecorder(10), service)
+	if ns.Value == nil || ns.Value.Name != fallback.Name {
+		t.Fatalf("namespace winner = %+v, want fallback profile %q", ns.Value, fallback.Name)
+	}
+	if cluster.Value != nil {
+		t.Fatalf("cluster winner = %+v, want nil", cluster.Value)
+	}
+	if resolution.notFoundMessage != "" {
+		t.Fatalf("notFoundMessage = %q, want empty", resolution.notFoundMessage)
+	}
+}
+
+func TestResolveBySelector_ClusterAnyAutoSelectionPolicySelected(t *testing.T) {
+	t.Parallel()
+
+	scheme := newResolverTestScheme(t)
+	labels := map[string]string{constants.LabelKeyProfileRole: constants.LabelValueProfileRoleDeployable}
+	seed := resolverProfileBuilder("cluster-nvidia-fallback", "unused", "aim/nvidia", "fp16", labels)
+	seed.Spec.Type = aimv1alpha1.AIMProfileTypeUnoptimized
+	seed.Spec.AutoSelectionPolicy = aimv1alpha1.AIMProfileAutoSelectionPolicyAny
+	fallback := &aimv1alpha2.AIMClusterProfile{
+		ObjectMeta: metav1.ObjectMeta{Name: seed.Name, Labels: labels},
+		Spec: aimv1alpha2.AIMClusterProfileSpec{
+			AIMProfileSpecCommon: *seed.Spec.AIMProfileSpecCommon.DeepCopy(),
+		},
+		Status: seed.Status,
+	}
+	c := newResolverClient(t, scheme, fallback)
+	service := &aimv1alpha1.AIMService{
+		ObjectMeta: metav1.ObjectMeta{Name: "svc", Namespace: "ns"},
+		Spec: aimv1alpha1.AIMServiceSpec{
+			Profile: &aimv1alpha1.AIMServiceProfileConfig{
+				Selector: &aimv1alpha1.ProfileSelector{AimId: "aim/nvidia"},
+			},
+		},
+	}
+
+	ns, cluster, _ := resolveProfileCandidates(
+		context.Background(), c, record.NewFakeRecorder(10), service)
+	if ns.Value != nil {
+		t.Fatalf("namespace winner = %+v, want nil", ns.Value)
+	}
+	if cluster.Value == nil || cluster.Value.Name != fallback.Name {
+		t.Fatalf("cluster winner = %+v, want fallback profile %q", cluster.Value, fallback.Name)
+	}
+}
+
+func TestResolveBySelector_OptimizedPolicyLowerTierRemainsExcluded(t *testing.T) {
+	t.Parallel()
+
+	scheme := newResolverTestScheme(t)
+	labels := map[string]string{constants.LabelKeyProfileRole: constants.LabelValueProfileRoleDeployable}
+	lowerTier := resolverProfileBuilder("amd-preview", "ns", "aim/amd", "fp16", labels)
+	lowerTier.Spec.Type = aimv1alpha1.AIMProfileTypePreview
+	c := newResolverClient(t, scheme, lowerTier)
+	service := &aimv1alpha1.AIMService{
+		ObjectMeta: metav1.ObjectMeta{Name: "svc", Namespace: "ns"},
+		Spec: aimv1alpha1.AIMServiceSpec{
+			Profile: &aimv1alpha1.AIMServiceProfileConfig{
+				Selector: &aimv1alpha1.ProfileSelector{AimId: "aim/amd"},
+			},
+		},
+	}
+
+	ns, cluster, resolution := resolveProfileCandidates(
+		context.Background(), c, record.NewFakeRecorder(10), service)
+	if ns.Value != nil || cluster.Value != nil {
+		t.Fatalf("unexpected lower-tier winner: namespace=%+v cluster=%+v", ns.Value, cluster.Value)
+	}
+	if !contains(resolution.notFoundMessage, "minimumType=optimized") {
+		t.Fatalf("notFoundMessage = %q, want optimized-floor diagnostic", resolution.notFoundMessage)
+	}
+}
+
+func TestResolveBySelector_OptimizedClusterProfileBeatsNamespaceAnyPolicy(t *testing.T) {
+	t.Parallel()
+
+	scheme := newResolverTestScheme(t)
+	labels := map[string]string{constants.LabelKeyProfileRole: constants.LabelValueProfileRoleDeployable}
+	nsFallback := resolverProfileBuilder("namespace-fallback", "ns", "aim/shared", "fp16", labels)
+	nsFallback.Spec.Type = aimv1alpha1.AIMProfileTypeUnoptimized
+	nsFallback.Spec.AutoSelectionPolicy = aimv1alpha1.AIMProfileAutoSelectionPolicyAny
+
+	clusterSeed := resolverProfileBuilder("cluster-optimized", "unused", "aim/shared", "fp8", labels)
+	clusterOptimized := &aimv1alpha2.AIMClusterProfile{
+		ObjectMeta: metav1.ObjectMeta{Name: clusterSeed.Name, Labels: labels},
+		Spec: aimv1alpha2.AIMClusterProfileSpec{
+			AIMProfileSpecCommon: *clusterSeed.Spec.AIMProfileSpecCommon.DeepCopy(),
+		},
+		Status: clusterSeed.Status,
+	}
+	c := newResolverClient(t, scheme, nsFallback, clusterOptimized)
+	service := &aimv1alpha1.AIMService{
+		ObjectMeta: metav1.ObjectMeta{Name: "svc", Namespace: "ns"},
+		Spec: aimv1alpha1.AIMServiceSpec{
+			Profile: &aimv1alpha1.AIMServiceProfileConfig{
+				Selector: &aimv1alpha1.ProfileSelector{AimId: "aim/shared"},
+			},
+		},
+	}
+
+	ns, cluster, _ := resolveProfileCandidates(
+		context.Background(), c, record.NewFakeRecorder(10), service)
+	if ns.Value != nil {
+		t.Fatalf("namespace winner = %+v, want nil", ns.Value)
+	}
+	if cluster.Value == nil || cluster.Value.Name != clusterOptimized.Name {
+		t.Fatalf("cluster winner = %+v, want optimized profile %q", cluster.Value, clusterOptimized.Name)
+	}
+}
+
+func TestResolveBySelector_ExplicitMinimumTypeBlocksAnyAutoSelectionPolicy(t *testing.T) {
+	t.Parallel()
+
+	scheme := newResolverTestScheme(t)
+	labels := map[string]string{constants.LabelKeyProfileRole: constants.LabelValueProfileRoleDeployable}
+	fallback := resolverProfileBuilder("nvidia-fallback", "ns", "aim/nvidia", "fp16", labels)
+	fallback.Spec.Type = aimv1alpha1.AIMProfileTypeUnoptimized
+	fallback.Spec.AutoSelectionPolicy = aimv1alpha1.AIMProfileAutoSelectionPolicyAny
+	c := newResolverClient(t, scheme, fallback)
+	service := &aimv1alpha1.AIMService{
+		ObjectMeta: metav1.ObjectMeta{Name: "svc", Namespace: "ns"},
+		Spec: aimv1alpha1.AIMServiceSpec{
+			Profile: &aimv1alpha1.AIMServiceProfileConfig{
+				Selector: &aimv1alpha1.ProfileSelector{
+					AimId:       "aim/nvidia",
+					MinimumType: aimv1alpha1.AIMProfileTypeFloorOptimized,
+				},
+			},
+		},
+	}
+
+	ns, cluster, _ := resolveProfileCandidates(
+		context.Background(), c, record.NewFakeRecorder(10), service)
+	if ns.Value != nil || cluster.Value != nil {
+		t.Fatalf("explicit optimized floor must block fallback: namespace=%+v cluster=%+v",
+			ns.Value, cluster.Value)
+	}
+}
+
+func TestStickyBinding_KeepsAnyAutoSelectionProfileWithImplicitFloor(t *testing.T) {
+	t.Parallel()
+
+	scheme := newResolverTestScheme(t)
+	labels := map[string]string{constants.LabelKeyProfileRole: constants.LabelValueProfileRoleDeployable}
+	bound := resolverProfileBuilderWithUID("bound-fallback", "fp16", labels, stickyTestBoundUID)
+	bound.Spec.Type = aimv1alpha1.AIMProfileTypeUnoptimized
+	bound.Spec.AutoSelectionPolicy = aimv1alpha1.AIMProfileAutoSelectionPolicyAny
+	c := newResolverClient(t, scheme, bound)
+	service := serviceWithBinding(
+		&aimv1alpha1.ProfileSelector{AimId: stickyTestAimID},
+		bound.Name)
+
+	ns, _, _ := resolveProfileCandidates(context.Background(), c, record.NewFakeRecorder(10), service)
+	if ns.Value == nil || ns.Value.Name != bound.Name {
+		t.Fatalf("sticky fallback binding = %+v, want %q", ns.Value, bound.Name)
+	}
+}
+
+// Naming a model narrows *which* profiles are candidates; it does not lower the
+// optimization floor. Lower-tier profiles remain excluded unless the service
+// explicitly lowers minimumType or the profile opts into any-tier automatic
+// selection.
+func TestComposeServiceSelector_ExplicitModelStillDefaultsOptimized(t *testing.T) {
+	t.Parallel()
+
+	service := &aimv1alpha1.AIMService{
+		Spec: aimv1alpha1.AIMServiceSpec{
+			Model: &aimv1alpha1.AIMServiceModel{Name: ptr.To("qwen")},
+		},
+	}
+	selector := composeServiceSelector(service)
+	if selector.MinimumType != aimv1alpha1.AIMProfileTypeFloorOptimized {
+		t.Fatalf("minimumType = %q, want optimized for explicit model", selector.MinimumType)
+	}
+	if selector.ModelRef == nil || selector.ModelRef.Name != "qwen" {
+		t.Fatalf("modelRef = %#v, want qwen", selector.ModelRef)
+	}
+}
+
+func TestComposeServiceSelector_GlobalSelectionStillDefaultsOptimized(t *testing.T) {
+	t.Parallel()
+
+	service := &aimv1alpha1.AIMService{
+		Spec: aimv1alpha1.AIMServiceSpec{
+			Profile: &aimv1alpha1.AIMServiceProfileConfig{
+				Selector: &aimv1alpha1.ProfileSelector{AimId: "Qwen/Qwen3.5-0.8B"},
+			},
+		},
+	}
+	selector := composeServiceSelector(service)
+	if selector.MinimumType != aimv1alpha1.AIMProfileTypeFloorOptimized {
+		t.Fatalf("minimumType = %q, want optimized", selector.MinimumType)
+	}
+}
+
+func TestComposeServiceSelector_ExplicitMinimumTypeWins(t *testing.T) {
+	t.Parallel()
+
+	service := &aimv1alpha1.AIMService{
+		Spec: aimv1alpha1.AIMServiceSpec{
+			Model: &aimv1alpha1.AIMServiceModel{Name: ptr.To("qwen")},
+			Profile: &aimv1alpha1.AIMServiceProfileConfig{
+				Selector: &aimv1alpha1.ProfileSelector{
+					MinimumType: aimv1alpha1.AIMProfileTypeFloorOptimized,
+				},
+			},
+		},
+	}
+	selector := composeServiceSelector(service)
+	if selector.MinimumType != aimv1alpha1.AIMProfileTypeFloorOptimized {
+		t.Fatalf("minimumType = %q, want explicit optimized", selector.MinimumType)
 	}
 }
 

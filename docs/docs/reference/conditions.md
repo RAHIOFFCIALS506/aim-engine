@@ -47,6 +47,7 @@ Whether the resource's spec is valid and all referenced resources exist.
 | `True` | `ConfigurationValid` | Configuration is valid |
 | `False` | `InvalidSpec` | Configuration validation failed |
 | `False` | `RoutingRequiredForScaleToZero` | `minReplicas: 0` is set but routing is not enabled. See [ScaleToZeroConfig](#scaletozeroconfig). |
+| `False` | `ActivationMetricQueryInvalid` | The scale-from-zero activation metric query cannot be resolved. See [ScaleToZeroConfig](#scaletozeroconfig). |
 | `False` | `AutoscalingRequiresMetrics` | Autoscaling is configured but no scaling trigger resolves. See [AutoscalingConfig](#autoscalingconfig). |
 | `False` | `ReferenceNotFound` | A referenced resource does not exist |
 
@@ -59,6 +60,27 @@ Overall readiness — the aggregate of all other conditions and component health
 | `True` | `AllComponentsReady` | All components are ready |
 | `False` | `ComponentsNotReady` | One or more components are not ready |
 | `False` | `Progressing` | Waiting for components to become ready |
+
+## Migration condition
+
+### MigrationRequired
+
+`MigrationRequired=True` with reason `TemplateAPIDeprecated` identifies a live
+resource that still uses the deprecated template API or produces template
+outputs. It appears on template-pipeline `AIMService` objects, legacy-shaped
+`AIMModel` / `AIMClusterModel` objects (including deprecated `profileCopy` and
+flat `derivedFrom` shapes, plus image models that still emit templates),
+`AIMServiceTemplate`, `AIMClusterServiceTemplate`, and `AIMTemplateCache`.
+Follow the
+[bounded template migration runbook](../admin/template-migration.md) before
+removing the v1alpha1 template APIs.
+
+This condition is informational and does not participate in the `Ready`
+rollup. It is removed when an overlapping service uses the profile pipeline or
+a model uses only native profile inputs and no longer emits templates.
+`AIMArtifact`, `AIMRuntimeConfig`, `AIMClusterRuntimeConfig`, and
+`AIMClusterModelSource` do not report it because native profile pipelines still
+use those APIs or their outputs.
 
 ## AIMService conditions (v1alpha2)
 
@@ -106,6 +128,23 @@ Replaces v1alpha1's `CacheReady`. Tracks the `AIMProfileCache` lifecycle.
 | `False` | `CacheFailed` | Cache download failed |
 | `False` | `CacheLost` | Previously-ready cache is no longer available |
 
+### ProfileRuntimeReady
+
+Tracks the namespaced profile `ServingRuntime` and its same-name ConfigMap
+before AIM Engine creates or updates the InferenceService.
+
+| Status | Reason | Description |
+|---|---|---|
+| `True` | `ProfileRuntimeReady` | Both projection siblings match the current profile and cache content hash |
+| `False` | `ProfileRuntimeMaterializing` | One or both projection siblings do not exist yet |
+| `False` | `ProfileRuntimeConverging` | Both siblings exist, but one or both have not converged to the expected content hash |
+| `False` | `FetchError` | AIM Engine could not read one of the projection siblings |
+
+`ProfileRuntimeConverging` can be transient because the two resources are
+updated independently. If it persists, check for unsupported out-of-band
+changes to generated `aim-*` resources. See
+[Consistency and rollout guarantees](../guides/bring-your-own-kserve.md#consistency-and-rollout-guarantees).
+
 ### InferenceServiceReady
 
 | Status | Reason | Description |
@@ -139,13 +178,34 @@ Set only when `spec.minReplicas` / `spec.maxReplicas` are configured.
 | `False` | `HPANotFound` | Waiting for KEDA to create HPA |
 | `False` | `WaitingForMetrics` | InferenceService not ready yet; metrics unavailable |
 
+### ActivationMetricAvailable
+
+Reports whether the HPA has read KEDA's zero-to-one activation trigger. AIM Engine first verifies that scale-to-zero routing and the selected gateway provider's activation query are valid. It then checks that the HPA spec contains the expected number of external metrics—one activation trigger plus every resolved user scaling trigger—before resolving the exact `s0-*` metric and requiring the same name with a current value in `HPA.status.currentMetrics`. This prevents a stale user-only HPA from being mistaken for activation evidence during configuration changes. A reported value of zero is valid evidence that the query is readable.
+
+The aggregate HPA `ScalingActive` condition is diagnostic context only because any `s1-*` or later user metric can make it `True`. When `s0-*` is unavailable, the condition message lists any other external metrics that the HPA did report, but those metrics do not affect the activation verdict.
+
+This condition is **informational only** — unlike the `*Ready` conditions it is deliberately excluded from the `Ready` rollup, so it never changes the service's status or its scaling behaviour. AIM Engine reports the signal; acting on it is the cluster administrator's call.
+
+Set only when **all** of the following hold: `spec.minReplicas: 0`, routing is enabled, the provider-neutral activation query resolves, the KEDA-managed HPA is observable, and the predictor is currently running at least one replica. Invalid routing or activation-query configuration is reported by `ScaleToZeroConfig` instead, avoiding duplicate or misleading conditions. The running-replica constraint makes runtime availability unambiguous — KEDA normally retains replicas when a trigger cannot be evaluated. At zero replicas an absent series can be the gateway counter's normal lazy resting state, so the condition is removed rather than reported.
+
+| Status | Reason | Description |
+|---|---|---|
+| `True` | `MetricAvailable` | The HPA reported the exact `s0-*` zero-to-one metric in `currentMetrics`; the activation query is readable |
+| `Unknown` | `AwaitingActivationMetric` | Waiting for the HPA to report that exact metric, within the grace period covering HPA creation and transient collector restarts |
+| `False` | `ActivationMetricUnavailable` | The HPA has not reported that exact metric for longer than the grace period; the service may not wake after scaling to zero. Emits a warning event. |
+
+When `ActivationMetricUnavailable` is reported, compare the HPA's `s0-*` spec metric with its `currentMetrics` entries, then verify the selected gateway provider's activation counter and scale-from-zero collector path. For Envoy Gateway, also verify that the Lua `EnvoyExtensionPolicy` is accepted and that the gateway has served at least one request for this service's `HTTPRoute` (the counter is created lazily on first request). See [Optional Envoy Gateway scale-from-zero](../admin/envoy-gateway-scale-from-zero.md) for policy installation and verification.
+
 ### ScaleToZeroConfig
 
-Validates the scale-from-zero prerequisite that routing be enabled. Reported only when `spec.minReplicas: 0` is set **and** routing is disabled (neither `spec.routing.enabled` nor a cluster-wide `runtimeConfig.routing.enabled` default is on). The 0->1 activation trigger scrapes gateway-side Envoy metrics that only exist once an `HTTPRoute` is created, so a routing-less scale-to-zero service could never wake — AIM Engine therefore rejects the spec instead of creating it.
+Validates that routing is enabled when `spec.minReplicas: 0` is set. The
+scale-from-zero trigger depends on a gateway metric associated with an
+`HTTPRoute`; without routing, the service could not wake from zero replicas.
 
 | Status | Reason | Description |
 |---|---|---|
 | `False` | `RoutingRequiredForScaleToZero` | `minReplicas: 0` with routing disabled. Drives `ConfigValid=False` (`InvalidSpec` category) and emits an `InvalidSpec` event. Fix by enabling routing (`spec.routing.enabled: true` or `runtimeConfig.routing.enabled`) or setting `minReplicas >= 1`. |
+| `False` | `ActivationMetricQueryInvalid` | Gateway activation is disabled with `gatewayProvider=none`, the selected custom provider has no `scaleFromZero.activationMetricQueryTemplate`, the template contains an unsupported placeholder, or its resource names cannot be derived. Drives `ConfigValid=False` and prevents creation of a scale-to-zero configuration that cannot wake. |
 
 When valid, this check is silent — no condition or component-health entry is emitted.
 
@@ -198,6 +258,8 @@ Set only for the fine-tuned and custom flows (`spec.profiles` set). Mirrors the 
 | `True` | `ManagedProfilesPartiallyReady` | Some profiles ready, others `NotAvailable` (typically missing hardware) |
 | `False` | `ManagedProfilesNotAvailable` | No managed profile is ready and at least one is `NotAvailable` |
 | `False` | `NoSupportedProfiles` | Discovery completed but no supported profiles found |
+| `False` | `NoCompatibleRuntime` | A model-ID declaration has no configured fallback matching available hardware; the message identifies rejected fallbacks and node-level causes such as missing labels or insufficient allocatable resources |
+| `False` | `HardwareNotAvailable` | Generated profiles exist, but their matching hardware is no longer available |
 | `False` | `BuildFailed` | Building the desired profile set failed |
 | `False` | `NodeInventoryAvailable` | Node-inventory snapshot built (intermediate state) |
 
@@ -236,14 +298,31 @@ Reports whether the profile is currently projecting a native KServe runtime (`Se
 |---|---|---|
 | `True` | `RuntimeProjected` | A runtime is projected for this profile |
 | `False` | `RuntimeDegraded` | The projection gate is no longer satisfied (e.g. matching nodes drained, or the profile is no longer deployable), but a previously-projected runtime is **kept, not deleted** |
+| `False` | `RuntimeProjectionFailed` | AIM Engine could not construct a valid projected runtime from the profile |
 
-The condition is silent (absent) when the profile has never projected a runtime, and during a transient node-list failure (so an API hiccup doesn't flap it to `Degraded`).
+The condition is silent (absent) when the profile has never projected a runtime. Transient node-list or shared-cache lookup failures preserve its prior value; those outages are reported through framework dependency health instead of being mislabeled as runtime build failures.
 
 :::{admonition} Degraded without garbage collection
 :class: note
 
 Projection is additive with **asymmetric teardown**: a runtime is created only while the profile is projectable, but is never deleted merely because the gate later flips — only when the profile itself is deleted (owner-reference GC). So a runtime object can persist while its profile reports `RuntimeProjected=False / RuntimeDegraded`. This deliberately avoids yanking a runtime out from under a native `InferenceService` that references it. The `aim.eai.amd.com/runtime-projection-state` label on the runtime object marks provenance (`projected`) and does not currently flip to `degraded`, so this condition on the profile is the authoritative degraded signal; the runtime's ownerRef / `aim.eai.amd.com/projected.profile` annotation is the way back to it.
 :::
+
+### RuntimeProjectionReady
+
+Appears only while runtime construction or its shared-cache lookup is failing,
+and gates aggregate `Ready`. It is removed after recovery.
+
+| Status | Reason | Description |
+|---|---|---|
+| `False` | `RuntimeProjectionFailed` | The profile could not be converted into a valid projected runtime |
+| `False` | `ProfileCacheLookupFailed` | Shared-cache readiness is temporarily unknown; AIM Engine leaves the last-known runtime untouched and retries |
+
+### RuntimeProjectionElectionReady
+
+Appears only when AIM Engine cannot list the profiles needed to elect a
+model-slug runtime winner, and gates aggregate `Ready`. The reason reflects the
+categorized dependency error. It is removed after election succeeds.
 
 ## AIMProfileCache conditions
 
@@ -286,7 +365,10 @@ When an AIMModel still emits `AIMServiceTemplate` resources, its `Ready` rollup 
 
 ## Condition polarity
 
-All AIM conditions follow positive polarity — `status: True` means healthy. When building dashboards or alerting:
+Readiness and health conditions follow positive polarity — `status: True` means
+healthy. `MigrationRequired` is the explicit non-health exception: `True`
+means administrator action is still required, and it never gates readiness.
+When building dashboards or alerting:
 
 - **Green** — condition `status: True`
 - **Yellow** — condition `status: False` with reason containing `Progressing`, `Creating`, `Awaiting`, `Started`
