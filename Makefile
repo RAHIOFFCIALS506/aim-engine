@@ -856,6 +856,8 @@ generate-crd-docs:
 	go install github.com/elastic/crd-ref-docs@latest
 	crd-ref-docs --source-path api/v1alpha1/ --renderer=markdown --output-path=docs/docs/reference/api/v1alpha1.md --config docs/crd-ref-docs-config.yaml
 	crd-ref-docs --source-path api/v1alpha2/ --renderer=markdown --output-path=docs/docs/reference/api/v1alpha2.md --config docs/crd-ref-docs-config.yaml
+	python3 -B hack/test_format_crd_docs.py
+	python3 hack/format-crd-docs.py docs/docs/reference/api/v1alpha1.md docs/docs/reference/api/v1alpha2.md
 
 .PHONY: generate-helm-docs
 generate-helm-docs: ## Generate Helm chart values reference from config/helm/values.yaml.

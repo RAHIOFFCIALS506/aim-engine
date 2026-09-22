@@ -74,11 +74,10 @@ spec:
             description: |-
               AIMModelSpec defines the desired state of AIMModel.
 
-              Per-version constraints (v1alpha1 forbids derivedFrom and profiles;
-              v1alpha2 forbids profileCopy/custom/customTemplates/top-level modelSources,
-              requires image XOR profiles, and forbids profiles mixed with legacy scalar
-              fields) live on the version-specific AIMModel / AIMClusterModel root types
-              in the per-version *_types.go files.
+              v1alpha2 accepts exactly one of image, profiles, or modelId.
+              v1alpha1 forbids derivedFrom and profiles. v1alpha2 forbids
+              profileCopy/custom/customTemplates/top-level modelSources on new resources
+              and rejects profiles mixed with legacy scalar fields.
             properties:
               accelerator:
                 description: |-
@@ -646,15 +645,12 @@ spec:
                         type: string
                       acceleratorPartitioningMode:
                         description: |-
-                          AcceleratorPartitioningMode replaces the copied profile's
-                          acceleratorPartitioningMode. Complete replacement, not a merge; an empty
-                          override string leaves the source profile's mode untouched. Same reserved
-                          values as AIMProfileSpecCommon.AcceleratorPartitioningMode. Whenever this
-                          override is set (to any value, including "unpartitioned"), the CEL rule on the
-                          enclosing spec also requires AcceleratorCount to be set: partition mode
-                          changes the per-unit interpretation of acceleratorCount, and CEL cannot
-                          read the base profile to tell whether the meaning actually changed, so it
-                          conservatively requires the count be restated.
+                          AcceleratorPartitioningMode replaces the source partitioning mode.
+                          An empty override leaves the source mode unchanged. Uses the same values
+                          as AIMProfileSpecCommon.acceleratorPartitioningMode. When set,
+                          profile-set and model derivation require explicit source
+                          selector.acceleratorCount and target overrides.acceleratorCount.
+                          Tensor-parallel size remains an independent engine argument.
                         type: string
                       acceleratorVendor:
                         description: AcceleratorVendor replaces the copied profile's
@@ -853,10 +849,10 @@ spec:
                         x-kubernetes-list-type: set
                       image:
                         description: |-
-                          Image overrides the runtime container image used by the derived
-                          profiles. When empty the deployment image is rebased onto the source
-                          profile's base-image (status.baseImage) so private mirrors stay
-                          self-contained.
+                          Image overrides the runtime container image. With no explicit image
+                          override, replacing modelSources on a deployable source resolves its
+                          base runtime; hardware-only and environment-only overrides retain the
+                          source image. This takes precedence over a profile set's top-level image.
                         type: string
                       modelId:
                         description: |-
@@ -1193,9 +1189,8 @@ spec:
                         type: string
                       modelRef:
                         description: |-
-                          ModelRef narrows candidates to those produced by a specific
-                          AIM(Cluster)Model, matched via the `aim.eai.amd.com/source-model[-scope]`
-                          labels stamped by the AIMModel reconcilers. Iteration 1 (v1alpha2 only).
+                          ModelRef optionally narrows candidates to definitions and profiles
+                          published by a specific AIM(Cluster)Model. Omit to select across models.
                         properties:
                           name:
                             description: Name is the owning AIM(Cluster)Model name.
@@ -1216,9 +1211,9 @@ spec:
                         type: object
                       origin:
                         description: |-
-                          Origin filters by the `aim.eai.amd.com/profile-origin` label. When unset
-                          (empty) the selector does not filter by origin. Iteration 1 (v1alpha2
-                          only).
+                          Origin filters source provenance across catalog and resource
+                          representations.
+                          Empty means no origin filter.
                         enum:
                         - discovered
                         - derived
@@ -1268,9 +1263,12 @@ spec:
                   sourceRef:
                     description: |-
                       SourceRef points to an alternate discovery cache source.
-                      When omitted, derivation uses visible AIMProfile and AIMClusterProfile objects.
+                      When omitted, derivation uses published image-model definitions and visible
+                      copyable AIMProfile and AIMClusterProfile objects, with namespace-first fallback.
                       For AIMProfileSet, the referenced ConfigMap is read from the same namespace.
                       For AIMClusterProfileSet, it is read from the operator namespace.
+                      Mutually exclusive with selector.modelRef; other selector fields may
+                      filter the catalog contents.
                     properties:
                       name:
                         description: Name is the discovery cache ConfigMap name.
@@ -1297,10 +1295,13 @@ spec:
                   rule: has(self.sourceRef) || has(self.selector.aimId) || has(self.selector.modelId)
                     || has(self.selector.profileId) || has(self.selector.engine) ||
                     has(self.selector.metric) || has(self.selector.precision) || has(self.selector.type)
-                    || has(self.selector.acceleratorModel) || has(self.selector.acceleratorVendor)
+                    || has(self.selector.minimumType) || has(self.selector.acceleratorModel)
+                    || has(self.selector.acceleratorVendor) || has(self.selector.acceleratorPartitioningMode)
                     || has(self.selector.acceleratorType) || has(self.selector.acceleratorCount)
                     || has(self.selector.engineArgs) || has(self.selector.modelRef)
                     || has(self.selector.origin)
+                - message: sourceRef and selector.modelRef are mutually exclusive
+                  rule: '!has(self.sourceRef) || !has(self.selector) || !has(self.selector.modelRef)'
                 - message: version is required when versionPolicy is pinned
                   rule: has(self.version) || (has(self.versionPolicy) && self.versionPolicy
                     != 'pinned')
@@ -1310,14 +1311,15 @@ spec:
                 - message: selector.aimId/modelId/profileId are not allowed when selector.role=base;
                     set overrides.aimId/modelId/profileId instead (base profiles have
                     no source identity to filter on)
-                  rule: '!(has(self.selector.role) && self.selector.role == ''base'')
-                    || (!has(self.selector.aimId) && !has(self.selector.modelId) &&
-                    !has(self.selector.profileId))'
+                  rule: '!has(self.selector) || !(has(self.selector.role) && self.selector.role
+                    == ''base'') || (!has(self.selector.aimId) && !has(self.selector.modelId)
+                    && !has(self.selector.profileId))'
                 - message: selector.role=base requires overrides.aimId and overrides.modelId
                     (base profiles carry no identity of their own; overrides supply
                     it)
-                  rule: '!(has(self.selector.role) && self.selector.role == ''base'')
-                    || (has(self.overrides) && has(self.overrides.aimId) && has(self.overrides.modelId))'
+                  rule: '!has(self.selector) || !(has(self.selector.role) && self.selector.role
+                    == ''base'') || (has(self.overrides) && has(self.overrides.aimId)
+                    && has(self.overrides.modelId))'
                 - message: overrides.acceleratorCount must be specified together with
                     any overrides.acceleratorPartitioningMode; partition mode changes
                     the per-unit interpretation of acceleratorCount
@@ -2001,15 +2003,12 @@ spec:
                         type: string
                       acceleratorPartitioningMode:
                         description: |-
-                          AcceleratorPartitioningMode replaces the copied profile's
-                          acceleratorPartitioningMode. Complete replacement, not a merge; an empty
-                          override string leaves the source profile's mode untouched. Same reserved
-                          values as AIMProfileSpecCommon.AcceleratorPartitioningMode. Whenever this
-                          override is set (to any value, including "unpartitioned"), the CEL rule on the
-                          enclosing spec also requires AcceleratorCount to be set: partition mode
-                          changes the per-unit interpretation of acceleratorCount, and CEL cannot
-                          read the base profile to tell whether the meaning actually changed, so it
-                          conservatively requires the count be restated.
+                          AcceleratorPartitioningMode replaces the source partitioning mode.
+                          An empty override leaves the source mode unchanged. Uses the same values
+                          as AIMProfileSpecCommon.acceleratorPartitioningMode. When set,
+                          profile-set and model derivation require explicit source
+                          selector.acceleratorCount and target overrides.acceleratorCount.
+                          Tensor-parallel size remains an independent engine argument.
                         type: string
                       acceleratorVendor:
                         description: AcceleratorVendor replaces the copied profile's
@@ -2208,10 +2207,10 @@ spec:
                         x-kubernetes-list-type: set
                       image:
                         description: |-
-                          Image overrides the runtime container image used by the derived
-                          profiles. When empty the deployment image is rebased onto the source
-                          profile's base-image (status.baseImage) so private mirrors stay
-                          self-contained.
+                          Image overrides the runtime container image. With no explicit image
+                          override, replacing modelSources on a deployable source resolves its
+                          base runtime; hardware-only and environment-only overrides retain the
+                          source image. This takes precedence over a profile set's top-level image.
                         type: string
                       modelId:
                         description: |-
@@ -2548,9 +2547,8 @@ spec:
                         type: string
                       modelRef:
                         description: |-
-                          ModelRef narrows candidates to those produced by a specific
-                          AIM(Cluster)Model, matched via the `aim.eai.amd.com/source-model[-scope]`
-                          labels stamped by the AIMModel reconcilers. Iteration 1 (v1alpha2 only).
+                          ModelRef optionally narrows candidates to definitions and profiles
+                          published by a specific AIM(Cluster)Model. Omit to select across models.
                         properties:
                           name:
                             description: Name is the owning AIM(Cluster)Model name.
@@ -2571,9 +2569,9 @@ spec:
                         type: object
                       origin:
                         description: |-
-                          Origin filters by the `aim.eai.amd.com/profile-origin` label. When unset
-                          (empty) the selector does not filter by origin. Iteration 1 (v1alpha2
-                          only).
+                          Origin filters source provenance across catalog and resource
+                          representations.
+                          Empty means no origin filter.
                         enum:
                         - discovered
                         - derived
@@ -2623,9 +2621,12 @@ spec:
                   sourceRef:
                     description: |-
                       SourceRef points to an alternate discovery cache source.
-                      When omitted, derivation uses visible AIMProfile and AIMClusterProfile objects.
+                      When omitted, derivation uses published image-model definitions and visible
+                      copyable AIMProfile and AIMClusterProfile objects, with namespace-first fallback.
                       For AIMProfileSet, the referenced ConfigMap is read from the same namespace.
                       For AIMClusterProfileSet, it is read from the operator namespace.
+                      Mutually exclusive with selector.modelRef; other selector fields may
+                      filter the catalog contents.
                     properties:
                       name:
                         description: Name is the discovery cache ConfigMap name.
@@ -2652,10 +2653,13 @@ spec:
                   rule: has(self.sourceRef) || has(self.selector.aimId) || has(self.selector.modelId)
                     || has(self.selector.profileId) || has(self.selector.engine) ||
                     has(self.selector.metric) || has(self.selector.precision) || has(self.selector.type)
-                    || has(self.selector.acceleratorModel) || has(self.selector.acceleratorVendor)
+                    || has(self.selector.minimumType) || has(self.selector.acceleratorModel)
+                    || has(self.selector.acceleratorVendor) || has(self.selector.acceleratorPartitioningMode)
                     || has(self.selector.acceleratorType) || has(self.selector.acceleratorCount)
                     || has(self.selector.engineArgs) || has(self.selector.modelRef)
                     || has(self.selector.origin)
+                - message: sourceRef and selector.modelRef are mutually exclusive
+                  rule: '!has(self.sourceRef) || !has(self.selector) || !has(self.selector.modelRef)'
                 - message: version is required when versionPolicy is pinned
                   rule: has(self.version) || (has(self.versionPolicy) && self.versionPolicy
                     != 'pinned')
@@ -2665,14 +2669,15 @@ spec:
                 - message: selector.aimId/modelId/profileId are not allowed when selector.role=base;
                     set overrides.aimId/modelId/profileId instead (base profiles have
                     no source identity to filter on)
-                  rule: '!(has(self.selector.role) && self.selector.role == ''base'')
-                    || (!has(self.selector.aimId) && !has(self.selector.modelId) &&
-                    !has(self.selector.profileId))'
+                  rule: '!has(self.selector) || !(has(self.selector.role) && self.selector.role
+                    == ''base'') || (!has(self.selector.aimId) && !has(self.selector.modelId)
+                    && !has(self.selector.profileId))'
                 - message: selector.role=base requires overrides.aimId and overrides.modelId
                     (base profiles carry no identity of their own; overrides supply
                     it)
-                  rule: '!(has(self.selector.role) && self.selector.role == ''base'')
-                    || (has(self.overrides) && has(self.overrides.aimId) && has(self.overrides.modelId))'
+                  rule: '!has(self.selector) || !(has(self.selector.role) && self.selector.role
+                    == ''base'') || (has(self.overrides) && has(self.overrides.aimId)
+                    && has(self.overrides.modelId))'
                 - message: overrides.acceleratorCount must be specified together with
                     any overrides.acceleratorPartitioningMode; partition mode changes
                     the per-unit interpretation of acceleratorCount
@@ -2680,27 +2685,18 @@ spec:
                     || size(self.overrides.acceleratorPartitioningMode) == 0 || has(self.overrides.acceleratorCount)'
               profiles:
                 description: |-
-                  Profiles is the v1alpha2 fine-tune / custom-model onboarding surface.
-                  It groups the source descriptor (`profiles.derivedFrom.selector` /
-                  `profiles.derivedFrom.sourceRef`), the version filter
-                  (`profiles.versionPolicy` / `profiles.version`), and the modifications
-                  applied to copies (`profiles.overrides`). When set, the AIMModel
-                  reconciler synthesises a child AIMProfileSet from this block.
-
-                  Mutually exclusive with spec.image (exactly one of the two is required
-                  for v1alpha2 AIMModel). v1alpha1 rejects spec.profiles via per-version
-                  CEL.
+                  Profiles selects definitions and applies overrides through a child
+                  AIMProfileSet. derivedFrom selects external sources and is required.
+                  Exclusive with spec.image and spec.modelId.
+                  v1alpha1 rejects spec.profiles.
                 properties:
                   derivedFrom:
-                    description: DerivedFrom identifies the source profiles to copy
-                      from.
+                    description: DerivedFrom selects source definitions and profiles.
                     properties:
                       selector:
                         description: |-
-                          Selector chooses which source profiles to derive from. Discovery of a
-                          deployable AIM image stamps role=deployable; selector.role=base targets
-                          the base profiles emitted by base-image discovery (custom-model
-                          derivation source material).
+                          Selector filters source definitions before overrides. The default role
+                          is deployable; role=base selects base definitions.
                         properties:
                           acceleratorCount:
                             description: AcceleratorCount filters by accelerator unit
@@ -2784,9 +2780,8 @@ spec:
                             type: string
                           modelRef:
                             description: |-
-                              ModelRef narrows candidates to those produced by a specific
-                              AIM(Cluster)Model, matched via the `aim.eai.amd.com/source-model[-scope]`
-                              labels stamped by the AIMModel reconcilers. Iteration 1 (v1alpha2 only).
+                              ModelRef optionally narrows candidates to definitions and profiles
+                              published by a specific AIM(Cluster)Model. Omit to select across models.
                             properties:
                               name:
                                 description: Name is the owning AIM(Cluster)Model
@@ -2807,9 +2802,9 @@ spec:
                             type: object
                           origin:
                             description: |-
-                              Origin filters by the `aim.eai.amd.com/profile-origin` label. When unset
-                              (empty) the selector does not filter by origin. Iteration 1 (v1alpha2
-                              only).
+                              Origin filters source provenance across catalog and resource
+                              representations.
+                              Empty means no origin filter.
                             enum:
                             - discovered
                             - derived
@@ -2855,9 +2850,10 @@ spec:
                         type: object
                       sourceRef:
                         description: |-
-                          SourceRef points to an alternate discovery cache source (a
-                          pre-populated ConfigMap of profile YAMLs) instead of using the
-                          visible AIMProfile / AIMClusterProfile objects.
+                          SourceRef selects an alternate catalog ConfigMap in place of the default
+                          model-definition and copyable-profile pool.
+                          Mutually exclusive with selector.modelRef; other selector fields may
+                          filter the catalog contents.
                         properties:
                           name:
                             description: Name is the discovery cache ConfigMap name.
@@ -2866,6 +2862,9 @@ spec:
                         - name
                         type: object
                     type: object
+                    x-kubernetes-validations:
+                    - message: sourceRef and selector.modelRef are mutually exclusive
+                      rule: '!has(self.sourceRef) || !has(self.selector) || !has(self.selector.modelRef)'
                   overrides:
                     description: |-
                       Overrides mutates the copied profile spec after selection and version
@@ -2883,15 +2882,12 @@ spec:
                         type: string
                       acceleratorPartitioningMode:
                         description: |-
-                          AcceleratorPartitioningMode replaces the copied profile's
-                          acceleratorPartitioningMode. Complete replacement, not a merge; an empty
-                          override string leaves the source profile's mode untouched. Same reserved
-                          values as AIMProfileSpecCommon.AcceleratorPartitioningMode. Whenever this
-                          override is set (to any value, including "unpartitioned"), the CEL rule on the
-                          enclosing spec also requires AcceleratorCount to be set: partition mode
-                          changes the per-unit interpretation of acceleratorCount, and CEL cannot
-                          read the base profile to tell whether the meaning actually changed, so it
-                          conservatively requires the count be restated.
+                          AcceleratorPartitioningMode replaces the source partitioning mode.
+                          An empty override leaves the source mode unchanged. Uses the same values
+                          as AIMProfileSpecCommon.acceleratorPartitioningMode. When set,
+                          profile-set and model derivation require explicit source
+                          selector.acceleratorCount and target overrides.acceleratorCount.
+                          Tensor-parallel size remains an independent engine argument.
                         type: string
                       acceleratorVendor:
                         description: AcceleratorVendor replaces the copied profile's
@@ -3090,10 +3086,10 @@ spec:
                         x-kubernetes-list-type: set
                       image:
                         description: |-
-                          Image overrides the runtime container image used by the derived
-                          profiles. When empty the deployment image is rebased onto the source
-                          profile's base-image (status.baseImage) so private mirrors stay
-                          self-contained.
+                          Image overrides the runtime container image. With no explicit image
+                          override, replacing modelSources on a deployable source resolves its
+                          base runtime; hardware-only and environment-only overrides retain the
+                          source image. This takes precedence over a profile set's top-level image.
                         type: string
                       modelId:
                         description: |-
@@ -3351,8 +3347,8 @@ spec:
                     type: string
                   versionPolicy:
                     default: pinned
-                    description: VersionPolicy controls how matching profiles are
-                      filtered by version.
+                    description: VersionPolicy controls matching source versions (defaults
+                      to pinned).
                     enum:
                     - pinned
                     - latest
@@ -3372,13 +3368,15 @@ spec:
                 - message: derivedFrom.selector.aimId/modelId/profileId are not allowed
                     when selector.role=base; set overrides.aimId/modelId/profileId
                     instead (base profiles have no source identity to filter on)
-                  rule: '!(has(self.derivedFrom.selector.role) && self.derivedFrom.selector.role
+                  rule: '!has(self.derivedFrom) || !has(self.derivedFrom.selector)
+                    || !(has(self.derivedFrom.selector.role) && self.derivedFrom.selector.role
                     == ''base'') || (!has(self.derivedFrom.selector.aimId) && !has(self.derivedFrom.selector.modelId)
                     && !has(self.derivedFrom.selector.profileId))'
                 - message: derivedFrom.selector.role=base requires overrides.aimId
                     and overrides.modelId (base profiles carry no identity of their
                     own; overrides supply it)
-                  rule: '!(has(self.derivedFrom.selector.role) && self.derivedFrom.selector.role
+                  rule: '!has(self.derivedFrom) || !has(self.derivedFrom.selector)
+                    || !(has(self.derivedFrom.selector.role) && self.derivedFrom.selector.role
                     == ''base'') || (has(self.overrides) && has(self.overrides.aimId)
                     && has(self.overrides.modelId))'
               resources:
@@ -3754,8 +3752,9 @@ spec:
                 - type
                 x-kubernetes-list-type: map
               discoveredProfiles:
-                description: DiscoveredProfiles summarizes the profiles found during
-                  image discovery.
+                description: |-
+                  DiscoveredProfiles summarizes raw discovered definitions and their
+                  hardware support.
                 properties:
                   byHardware:
                     description: |-
@@ -3882,8 +3881,8 @@ spec:
                 type: object
               discoveryCacheRef:
                 description: |-
-                  DiscoveryCacheRef points at the normalized discovery cache ConfigMap for image-backed flows.
-                  Populated by the v1alpha2 controller after image inspection succeeds.
+                  DiscoveryCacheRef points to the raw profile YAML and metadata cache
+                  ConfigMap for image-backed flows. Populated after image inspection succeeds.
                 properties:
                   name:
                     description: Name is the ConfigMap name.
@@ -4073,18 +4072,15 @@ spec:
                 - Generated
                 type: string
               managedProfiles:
-                description: ManagedProfiles summarizes the direct promoted or derived
-                  profiles owned or managed by this model.
+                description: |-
+                  ManagedProfiles summarizes actual managed outputs. Standalone sets'
+                  outputs are counted by those sets.
                 properties:
                   base:
                     description: |-
-                      Base is the number of managed profiles whose spec is structurally
-                      incomplete (missing aimId or modelSources). Base profiles cannot back
-                      an AIMService directly and exist purely as source material for
-                      derivation via AIMModel.spec.profiles.derivedFrom with
-                      selector.role=base. A non-zero value is the canonical operational
-                      signal that this model is a base-image model (the source of
-                      custom-model derivation).
+                      Base counts managed base profile resources with empty aimId and
+                      modelSources. They supply custom-model derivation with selector.role=base.
+                      Catalog base definitions remain selectable when this materialised count is zero.
                     format: int32
                     type: integer
                   deployable:
@@ -4144,8 +4140,9 @@ spec:
                     type: string
                 type: object
               profileSetRef:
-                description: ProfileSetRef identifies the child profile set synthesized
-                  for derivation flows.
+                description: |-
+                  ProfileSetRef identifies the child profile set created when spec.profiles
+                  is configured.
                 properties:
                   name:
                     description: Name is the profile set name.
@@ -4300,11 +4297,10 @@ spec:
             description: |-
               AIMModelSpec defines the desired state of AIMModel.
 
-              Per-version constraints (v1alpha1 forbids derivedFrom and profiles;
-              v1alpha2 forbids profileCopy/custom/customTemplates/top-level modelSources,
-              requires image XOR profiles, and forbids profiles mixed with legacy scalar
-              fields) live on the version-specific AIMModel / AIMClusterModel root types
-              in the per-version *_types.go files.
+              v1alpha2 accepts exactly one of image, profiles, or modelId.
+              v1alpha1 forbids derivedFrom and profiles. v1alpha2 forbids
+              profileCopy/custom/customTemplates/top-level modelSources on new resources
+              and rejects profiles mixed with legacy scalar fields.
             properties:
               accelerator:
                 description: |-
@@ -4872,15 +4868,12 @@ spec:
                         type: string
                       acceleratorPartitioningMode:
                         description: |-
-                          AcceleratorPartitioningMode replaces the copied profile's
-                          acceleratorPartitioningMode. Complete replacement, not a merge; an empty
-                          override string leaves the source profile's mode untouched. Same reserved
-                          values as AIMProfileSpecCommon.AcceleratorPartitioningMode. Whenever this
-                          override is set (to any value, including "unpartitioned"), the CEL rule on the
-                          enclosing spec also requires AcceleratorCount to be set: partition mode
-                          changes the per-unit interpretation of acceleratorCount, and CEL cannot
-                          read the base profile to tell whether the meaning actually changed, so it
-                          conservatively requires the count be restated.
+                          AcceleratorPartitioningMode replaces the source partitioning mode.
+                          An empty override leaves the source mode unchanged. Uses the same values
+                          as AIMProfileSpecCommon.acceleratorPartitioningMode. When set,
+                          profile-set and model derivation require explicit source
+                          selector.acceleratorCount and target overrides.acceleratorCount.
+                          Tensor-parallel size remains an independent engine argument.
                         type: string
                       acceleratorVendor:
                         description: AcceleratorVendor replaces the copied profile's
@@ -5079,10 +5072,10 @@ spec:
                         x-kubernetes-list-type: set
                       image:
                         description: |-
-                          Image overrides the runtime container image used by the derived
-                          profiles. When empty the deployment image is rebased onto the source
-                          profile's base-image (status.baseImage) so private mirrors stay
-                          self-contained.
+                          Image overrides the runtime container image. With no explicit image
+                          override, replacing modelSources on a deployable source resolves its
+                          base runtime; hardware-only and environment-only overrides retain the
+                          source image. This takes precedence over a profile set's top-level image.
                         type: string
                       modelId:
                         description: |-
@@ -5419,9 +5412,8 @@ spec:
                         type: string
                       modelRef:
                         description: |-
-                          ModelRef narrows candidates to those produced by a specific
-                          AIM(Cluster)Model, matched via the `aim.eai.amd.com/source-model[-scope]`
-                          labels stamped by the AIMModel reconcilers. Iteration 1 (v1alpha2 only).
+                          ModelRef optionally narrows candidates to definitions and profiles
+                          published by a specific AIM(Cluster)Model. Omit to select across models.
                         properties:
                           name:
                             description: Name is the owning AIM(Cluster)Model name.
@@ -5442,9 +5434,9 @@ spec:
                         type: object
                       origin:
                         description: |-
-                          Origin filters by the `aim.eai.amd.com/profile-origin` label. When unset
-                          (empty) the selector does not filter by origin. Iteration 1 (v1alpha2
-                          only).
+                          Origin filters source provenance across catalog and resource
+                          representations.
+                          Empty means no origin filter.
                         enum:
                         - discovered
                         - derived
@@ -5494,9 +5486,12 @@ spec:
                   sourceRef:
                     description: |-
                       SourceRef points to an alternate discovery cache source.
-                      When omitted, derivation uses visible AIMProfile and AIMClusterProfile objects.
+                      When omitted, derivation uses published image-model definitions and visible
+                      copyable AIMProfile and AIMClusterProfile objects, with namespace-first fallback.
                       For AIMProfileSet, the referenced ConfigMap is read from the same namespace.
                       For AIMClusterProfileSet, it is read from the operator namespace.
+                      Mutually exclusive with selector.modelRef; other selector fields may
+                      filter the catalog contents.
                     properties:
                       name:
                         description: Name is the discovery cache ConfigMap name.
@@ -5523,10 +5518,13 @@ spec:
                   rule: has(self.sourceRef) || has(self.selector.aimId) || has(self.selector.modelId)
                     || has(self.selector.profileId) || has(self.selector.engine) ||
                     has(self.selector.metric) || has(self.selector.precision) || has(self.selector.type)
-                    || has(self.selector.acceleratorModel) || has(self.selector.acceleratorVendor)
+                    || has(self.selector.minimumType) || has(self.selector.acceleratorModel)
+                    || has(self.selector.acceleratorVendor) || has(self.selector.acceleratorPartitioningMode)
                     || has(self.selector.acceleratorType) || has(self.selector.acceleratorCount)
                     || has(self.selector.engineArgs) || has(self.selector.modelRef)
                     || has(self.selector.origin)
+                - message: sourceRef and selector.modelRef are mutually exclusive
+                  rule: '!has(self.sourceRef) || !has(self.selector) || !has(self.selector.modelRef)'
                 - message: version is required when versionPolicy is pinned
                   rule: has(self.version) || (has(self.versionPolicy) && self.versionPolicy
                     != 'pinned')
@@ -5536,14 +5534,15 @@ spec:
                 - message: selector.aimId/modelId/profileId are not allowed when selector.role=base;
                     set overrides.aimId/modelId/profileId instead (base profiles have
                     no source identity to filter on)
-                  rule: '!(has(self.selector.role) && self.selector.role == ''base'')
-                    || (!has(self.selector.aimId) && !has(self.selector.modelId) &&
-                    !has(self.selector.profileId))'
+                  rule: '!has(self.selector) || !(has(self.selector.role) && self.selector.role
+                    == ''base'') || (!has(self.selector.aimId) && !has(self.selector.modelId)
+                    && !has(self.selector.profileId))'
                 - message: selector.role=base requires overrides.aimId and overrides.modelId
                     (base profiles carry no identity of their own; overrides supply
                     it)
-                  rule: '!(has(self.selector.role) && self.selector.role == ''base'')
-                    || (has(self.overrides) && has(self.overrides.aimId) && has(self.overrides.modelId))'
+                  rule: '!has(self.selector) || !(has(self.selector.role) && self.selector.role
+                    == ''base'') || (has(self.overrides) && has(self.overrides.aimId)
+                    && has(self.overrides.modelId))'
                 - message: overrides.acceleratorCount must be specified together with
                     any overrides.acceleratorPartitioningMode; partition mode changes
                     the per-unit interpretation of acceleratorCount
@@ -6227,15 +6226,12 @@ spec:
                         type: string
                       acceleratorPartitioningMode:
                         description: |-
-                          AcceleratorPartitioningMode replaces the copied profile's
-                          acceleratorPartitioningMode. Complete replacement, not a merge; an empty
-                          override string leaves the source profile's mode untouched. Same reserved
-                          values as AIMProfileSpecCommon.AcceleratorPartitioningMode. Whenever this
-                          override is set (to any value, including "unpartitioned"), the CEL rule on the
-                          enclosing spec also requires AcceleratorCount to be set: partition mode
-                          changes the per-unit interpretation of acceleratorCount, and CEL cannot
-                          read the base profile to tell whether the meaning actually changed, so it
-                          conservatively requires the count be restated.
+                          AcceleratorPartitioningMode replaces the source partitioning mode.
+                          An empty override leaves the source mode unchanged. Uses the same values
+                          as AIMProfileSpecCommon.acceleratorPartitioningMode. When set,
+                          profile-set and model derivation require explicit source
+                          selector.acceleratorCount and target overrides.acceleratorCount.
+                          Tensor-parallel size remains an independent engine argument.
                         type: string
                       acceleratorVendor:
                         description: AcceleratorVendor replaces the copied profile's
@@ -6434,10 +6430,10 @@ spec:
                         x-kubernetes-list-type: set
                       image:
                         description: |-
-                          Image overrides the runtime container image used by the derived
-                          profiles. When empty the deployment image is rebased onto the source
-                          profile's base-image (status.baseImage) so private mirrors stay
-                          self-contained.
+                          Image overrides the runtime container image. With no explicit image
+                          override, replacing modelSources on a deployable source resolves its
+                          base runtime; hardware-only and environment-only overrides retain the
+                          source image. This takes precedence over a profile set's top-level image.
                         type: string
                       modelId:
                         description: |-
@@ -6774,9 +6770,8 @@ spec:
                         type: string
                       modelRef:
                         description: |-
-                          ModelRef narrows candidates to those produced by a specific
-                          AIM(Cluster)Model, matched via the `aim.eai.amd.com/source-model[-scope]`
-                          labels stamped by the AIMModel reconcilers. Iteration 1 (v1alpha2 only).
+                          ModelRef optionally narrows candidates to definitions and profiles
+                          published by a specific AIM(Cluster)Model. Omit to select across models.
                         properties:
                           name:
                             description: Name is the owning AIM(Cluster)Model name.
@@ -6797,9 +6792,9 @@ spec:
                         type: object
                       origin:
                         description: |-
-                          Origin filters by the `aim.eai.amd.com/profile-origin` label. When unset
-                          (empty) the selector does not filter by origin. Iteration 1 (v1alpha2
-                          only).
+                          Origin filters source provenance across catalog and resource
+                          representations.
+                          Empty means no origin filter.
                         enum:
                         - discovered
                         - derived
@@ -6849,9 +6844,12 @@ spec:
                   sourceRef:
                     description: |-
                       SourceRef points to an alternate discovery cache source.
-                      When omitted, derivation uses visible AIMProfile and AIMClusterProfile objects.
+                      When omitted, derivation uses published image-model definitions and visible
+                      copyable AIMProfile and AIMClusterProfile objects, with namespace-first fallback.
                       For AIMProfileSet, the referenced ConfigMap is read from the same namespace.
                       For AIMClusterProfileSet, it is read from the operator namespace.
+                      Mutually exclusive with selector.modelRef; other selector fields may
+                      filter the catalog contents.
                     properties:
                       name:
                         description: Name is the discovery cache ConfigMap name.
@@ -6878,10 +6876,13 @@ spec:
                   rule: has(self.sourceRef) || has(self.selector.aimId) || has(self.selector.modelId)
                     || has(self.selector.profileId) || has(self.selector.engine) ||
                     has(self.selector.metric) || has(self.selector.precision) || has(self.selector.type)
-                    || has(self.selector.acceleratorModel) || has(self.selector.acceleratorVendor)
+                    || has(self.selector.minimumType) || has(self.selector.acceleratorModel)
+                    || has(self.selector.acceleratorVendor) || has(self.selector.acceleratorPartitioningMode)
                     || has(self.selector.acceleratorType) || has(self.selector.acceleratorCount)
                     || has(self.selector.engineArgs) || has(self.selector.modelRef)
                     || has(self.selector.origin)
+                - message: sourceRef and selector.modelRef are mutually exclusive
+                  rule: '!has(self.sourceRef) || !has(self.selector) || !has(self.selector.modelRef)'
                 - message: version is required when versionPolicy is pinned
                   rule: has(self.version) || (has(self.versionPolicy) && self.versionPolicy
                     != 'pinned')
@@ -6891,14 +6892,15 @@ spec:
                 - message: selector.aimId/modelId/profileId are not allowed when selector.role=base;
                     set overrides.aimId/modelId/profileId instead (base profiles have
                     no source identity to filter on)
-                  rule: '!(has(self.selector.role) && self.selector.role == ''base'')
-                    || (!has(self.selector.aimId) && !has(self.selector.modelId) &&
-                    !has(self.selector.profileId))'
+                  rule: '!has(self.selector) || !(has(self.selector.role) && self.selector.role
+                    == ''base'') || (!has(self.selector.aimId) && !has(self.selector.modelId)
+                    && !has(self.selector.profileId))'
                 - message: selector.role=base requires overrides.aimId and overrides.modelId
                     (base profiles carry no identity of their own; overrides supply
                     it)
-                  rule: '!(has(self.selector.role) && self.selector.role == ''base'')
-                    || (has(self.overrides) && has(self.overrides.aimId) && has(self.overrides.modelId))'
+                  rule: '!has(self.selector) || !(has(self.selector.role) && self.selector.role
+                    == ''base'') || (has(self.overrides) && has(self.overrides.aimId)
+                    && has(self.overrides.modelId))'
                 - message: overrides.acceleratorCount must be specified together with
                     any overrides.acceleratorPartitioningMode; partition mode changes
                     the per-unit interpretation of acceleratorCount
@@ -6906,27 +6908,18 @@ spec:
                     || size(self.overrides.acceleratorPartitioningMode) == 0 || has(self.overrides.acceleratorCount)'
               profiles:
                 description: |-
-                  Profiles is the v1alpha2 fine-tune / custom-model onboarding surface.
-                  It groups the source descriptor (`profiles.derivedFrom.selector` /
-                  `profiles.derivedFrom.sourceRef`), the version filter
-                  (`profiles.versionPolicy` / `profiles.version`), and the modifications
-                  applied to copies (`profiles.overrides`). When set, the AIMModel
-                  reconciler synthesises a child AIMProfileSet from this block.
-
-                  Mutually exclusive with spec.image (exactly one of the two is required
-                  for v1alpha2 AIMModel). v1alpha1 rejects spec.profiles via per-version
-                  CEL.
+                  Profiles selects definitions and applies overrides through a child
+                  AIMProfileSet. derivedFrom selects external sources and is required.
+                  Exclusive with spec.image and spec.modelId.
+                  v1alpha1 rejects spec.profiles.
                 properties:
                   derivedFrom:
-                    description: DerivedFrom identifies the source profiles to copy
-                      from.
+                    description: DerivedFrom selects source definitions and profiles.
                     properties:
                       selector:
                         description: |-
-                          Selector chooses which source profiles to derive from. Discovery of a
-                          deployable AIM image stamps role=deployable; selector.role=base targets
-                          the base profiles emitted by base-image discovery (custom-model
-                          derivation source material).
+                          Selector filters source definitions before overrides. The default role
+                          is deployable; role=base selects base definitions.
                         properties:
                           acceleratorCount:
                             description: AcceleratorCount filters by accelerator unit
@@ -7010,9 +7003,8 @@ spec:
                             type: string
                           modelRef:
                             description: |-
-                              ModelRef narrows candidates to those produced by a specific
-                              AIM(Cluster)Model, matched via the `aim.eai.amd.com/source-model[-scope]`
-                              labels stamped by the AIMModel reconcilers. Iteration 1 (v1alpha2 only).
+                              ModelRef optionally narrows candidates to definitions and profiles
+                              published by a specific AIM(Cluster)Model. Omit to select across models.
                             properties:
                               name:
                                 description: Name is the owning AIM(Cluster)Model
@@ -7033,9 +7025,9 @@ spec:
                             type: object
                           origin:
                             description: |-
-                              Origin filters by the `aim.eai.amd.com/profile-origin` label. When unset
-                              (empty) the selector does not filter by origin. Iteration 1 (v1alpha2
-                              only).
+                              Origin filters source provenance across catalog and resource
+                              representations.
+                              Empty means no origin filter.
                             enum:
                             - discovered
                             - derived
@@ -7081,9 +7073,10 @@ spec:
                         type: object
                       sourceRef:
                         description: |-
-                          SourceRef points to an alternate discovery cache source (a
-                          pre-populated ConfigMap of profile YAMLs) instead of using the
-                          visible AIMProfile / AIMClusterProfile objects.
+                          SourceRef selects an alternate catalog ConfigMap in place of the default
+                          model-definition and copyable-profile pool.
+                          Mutually exclusive with selector.modelRef; other selector fields may
+                          filter the catalog contents.
                         properties:
                           name:
                             description: Name is the discovery cache ConfigMap name.
@@ -7092,6 +7085,9 @@ spec:
                         - name
                         type: object
                     type: object
+                    x-kubernetes-validations:
+                    - message: sourceRef and selector.modelRef are mutually exclusive
+                      rule: '!has(self.sourceRef) || !has(self.selector) || !has(self.selector.modelRef)'
                   overrides:
                     description: |-
                       Overrides mutates the copied profile spec after selection and version
@@ -7109,15 +7105,12 @@ spec:
                         type: string
                       acceleratorPartitioningMode:
                         description: |-
-                          AcceleratorPartitioningMode replaces the copied profile's
-                          acceleratorPartitioningMode. Complete replacement, not a merge; an empty
-                          override string leaves the source profile's mode untouched. Same reserved
-                          values as AIMProfileSpecCommon.AcceleratorPartitioningMode. Whenever this
-                          override is set (to any value, including "unpartitioned"), the CEL rule on the
-                          enclosing spec also requires AcceleratorCount to be set: partition mode
-                          changes the per-unit interpretation of acceleratorCount, and CEL cannot
-                          read the base profile to tell whether the meaning actually changed, so it
-                          conservatively requires the count be restated.
+                          AcceleratorPartitioningMode replaces the source partitioning mode.
+                          An empty override leaves the source mode unchanged. Uses the same values
+                          as AIMProfileSpecCommon.acceleratorPartitioningMode. When set,
+                          profile-set and model derivation require explicit source
+                          selector.acceleratorCount and target overrides.acceleratorCount.
+                          Tensor-parallel size remains an independent engine argument.
                         type: string
                       acceleratorVendor:
                         description: AcceleratorVendor replaces the copied profile's
@@ -7316,10 +7309,10 @@ spec:
                         x-kubernetes-list-type: set
                       image:
                         description: |-
-                          Image overrides the runtime container image used by the derived
-                          profiles. When empty the deployment image is rebased onto the source
-                          profile's base-image (status.baseImage) so private mirrors stay
-                          self-contained.
+                          Image overrides the runtime container image. With no explicit image
+                          override, replacing modelSources on a deployable source resolves its
+                          base runtime; hardware-only and environment-only overrides retain the
+                          source image. This takes precedence over a profile set's top-level image.
                         type: string
                       modelId:
                         description: |-
@@ -7577,8 +7570,8 @@ spec:
                     type: string
                   versionPolicy:
                     default: pinned
-                    description: VersionPolicy controls how matching profiles are
-                      filtered by version.
+                    description: VersionPolicy controls matching source versions (defaults
+                      to pinned).
                     enum:
                     - pinned
                     - latest
@@ -7598,13 +7591,15 @@ spec:
                 - message: derivedFrom.selector.aimId/modelId/profileId are not allowed
                     when selector.role=base; set overrides.aimId/modelId/profileId
                     instead (base profiles have no source identity to filter on)
-                  rule: '!(has(self.derivedFrom.selector.role) && self.derivedFrom.selector.role
+                  rule: '!has(self.derivedFrom) || !has(self.derivedFrom.selector)
+                    || !(has(self.derivedFrom.selector.role) && self.derivedFrom.selector.role
                     == ''base'') || (!has(self.derivedFrom.selector.aimId) && !has(self.derivedFrom.selector.modelId)
                     && !has(self.derivedFrom.selector.profileId))'
                 - message: derivedFrom.selector.role=base requires overrides.aimId
                     and overrides.modelId (base profiles carry no identity of their
                     own; overrides supply it)
-                  rule: '!(has(self.derivedFrom.selector.role) && self.derivedFrom.selector.role
+                  rule: '!has(self.derivedFrom) || !has(self.derivedFrom.selector)
+                    || !(has(self.derivedFrom.selector.role) && self.derivedFrom.selector.role
                     == ''base'') || (has(self.overrides) && has(self.overrides.aimId)
                     && has(self.overrides.modelId))'
               resources:
@@ -7980,8 +7975,9 @@ spec:
                 - type
                 x-kubernetes-list-type: map
               discoveredProfiles:
-                description: DiscoveredProfiles summarizes the profiles found during
-                  image discovery.
+                description: |-
+                  DiscoveredProfiles summarizes raw discovered definitions and their
+                  hardware support.
                 properties:
                   byHardware:
                     description: |-
@@ -8108,8 +8104,8 @@ spec:
                 type: object
               discoveryCacheRef:
                 description: |-
-                  DiscoveryCacheRef points at the normalized discovery cache ConfigMap for image-backed flows.
-                  Populated by the v1alpha2 controller after image inspection succeeds.
+                  DiscoveryCacheRef points to the raw profile YAML and metadata cache
+                  ConfigMap for image-backed flows. Populated after image inspection succeeds.
                 properties:
                   name:
                     description: Name is the ConfigMap name.
@@ -8299,18 +8295,15 @@ spec:
                 - Generated
                 type: string
               managedProfiles:
-                description: ManagedProfiles summarizes the direct promoted or derived
-                  profiles owned or managed by this model.
+                description: |-
+                  ManagedProfiles summarizes actual managed outputs. Standalone sets'
+                  outputs are counted by those sets.
                 properties:
                   base:
                     description: |-
-                      Base is the number of managed profiles whose spec is structurally
-                      incomplete (missing aimId or modelSources). Base profiles cannot back
-                      an AIMService directly and exist purely as source material for
-                      derivation via AIMModel.spec.profiles.derivedFrom with
-                      selector.role=base. A non-zero value is the canonical operational
-                      signal that this model is a base-image model (the source of
-                      custom-model derivation).
+                      Base counts managed base profile resources with empty aimId and
+                      modelSources. They supply custom-model derivation with selector.role=base.
+                      Catalog base definitions remain selectable when this materialised count is zero.
                     format: int32
                     type: integer
                   deployable:
@@ -8370,8 +8363,9 @@ spec:
                     type: string
                 type: object
               profileSetRef:
-                description: ProfileSetRef identifies the child profile set synthesized
-                  for derivation flows.
+                description: |-
+                  ProfileSetRef identifies the child profile set created when spec.profiles
+                  is configured.
                 properties:
                   name:
                     description: Name is the profile set name.

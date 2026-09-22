@@ -81,10 +81,7 @@ func derivationSpec(spec *aimv1alpha1.AIMModelSpec) *aimv1alpha1.AIMProfileSetSp
 // spec shape. Returns one of AIMModelKindImage, AIMModelKindDerived,
 // AIMModelKindCustom, or empty when the spec doesn't match any known flow.
 //
-// Precedence: spec.image wins over spec.profiles when both are somehow
-// set (CEL should prevent this, but if it leaks through we treat the
-// image as authoritative since image discovery would dominate the
-// resulting profile set).
+// Image and profiles are mutually exclusive on new v1alpha2 objects.
 //
 // Within the derivation flows, the discriminator is the source profile's
 // role: a `base`-role selector means "overlay onto a generic base

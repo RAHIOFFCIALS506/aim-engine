@@ -358,6 +358,7 @@ func (r *ModelReconciler) ComposeState(
 					obs.DesiredProfiles, obs.BuildErr = buildDesiredOfficialProfiles(
 						fetch.model, catalog, fetch.nodes.Value,
 						recommendedDeploymentsFrom(legacyMetadata),
+						fetch.existingProfiles.Value...,
 					)
 					desiredProfilesKnown = obs.BuildErr == nil
 				}
@@ -412,6 +413,7 @@ func (r *ModelReconciler) ComposeState(
 		obs.ProfileSetStatus,
 		obs.ManagedProfiles,
 	)
+	preserveCopyability(obs.DesiredProfiles, fetch.existingProfiles.Value)
 	obs.componentHealth = buildModelComponentHealth(obs)
 	if obs.legacyObservation != nil {
 		obs.componentHealth = append(obs.componentHealth, obs.legacyObservation.GetComponentHealth()...)
@@ -494,7 +496,8 @@ func (r *ModelReconciler) PlanResources(
 			}
 		}
 	}
-	if derivation == nil && obs.childProfileSet.OK() && obs.childProfileSet.Value != nil {
+	if derivation == nil && obs.childProfileSet.OK() && obs.childProfileSet.Value != nil &&
+		metav1.IsControlledBy(obs.childProfileSet.Value, obs.model) {
 		plan.Delete(obs.childProfileSet.Value)
 	}
 	return plan
@@ -667,9 +670,12 @@ func profilePruneSafe(
 		managedProfiles.Ready == managedProfiles.Total
 }
 
-func classifyProfileSetTerminalStatus(status constants.AIMStatus) (reason, message string, terminal bool) {
+func classifyProfileSetTerminalStatus(status constants.AIMStatus, total int32) (reason, message string, terminal bool) {
 	switch status {
 	case constants.AIMStatusNotAvailable:
+		if total == 0 {
+			return "NoMatchingProfiles", "No source profiles match the model's profile selection", true
+		}
 		return "ManagedProfilesNotAvailable", "No ready derived profiles available for this model", true
 	case constants.AIMStatusDegraded:
 		return "ManagedProfilesDegraded", "Managed profile set is degraded", true
@@ -789,7 +795,7 @@ func buildModelComponentHealth(obs ModelObservation) []controllerutils.Component
 			})
 			return health
 		}
-		if reason, message, terminal := classifyProfileSetTerminalStatus(obs.ProfileSetStatus); terminal {
+		if reason, message, terminal := classifyProfileSetTerminalStatus(obs.ProfileSetStatus, obs.ManagedProfiles.Total); terminal {
 			health = append(health, controllerutils.ComponentHealth{
 				Component: componentProfileSet,
 				State:     obs.ProfileSetStatus,
@@ -1172,18 +1178,24 @@ func buildDesiredOfficialProfiles(
 	catalog aimprofile.DiscoveryCatalog,
 	nodes []corev1.Node,
 	recommendedDeployments []aimv1alpha1.RecommendedDeployment,
+	existing ...managedProfile,
 ) ([]desiredProfile, error) {
 	desired := make([]desiredProfile, 0, len(catalog.Profiles))
+	optedOut := ownedCopyabilityOptOuts(model, existing)
 	for _, entry := range catalog.Profiles {
-		if !isSupportedProfile(entry.Spec, nodes) {
-			continue
-		}
 		name, err := utils.GenerateDerivedName(
 			[]string{model.Name, entry.Spec.ProfileId},
 			utils.WithHashSource(model.Name, entry.Spec.ProfileId),
 		)
 		if err != nil {
 			return nil, fmt.Errorf("generate discovered profile name: %w", err)
+		}
+		// The user-owned opt-out lives on this profile. Retain that small
+		// policy-bearing object when hardware disappears, rather than
+		// publishing its catalog definition again. Removed catalog entries
+		// still disappear normally because they never enter this loop.
+		if !isSupportedProfile(entry.Spec, nodes) && !optedOut[name] {
+			continue
 		}
 		profile := &aimv1alpha2.AIMProfile{}
 		profile.Namespace = model.Namespace
@@ -1196,6 +1208,10 @@ func buildDesiredOfficialProfiles(
 			annotationBaseImage:      entry.BaseImage,
 		}, aimprofile.ProfileSourceImage), true)
 		profile.Annotations = profileyaml.Mark(profile.Annotations, entry.YAMLContract)
+		group := CatalogSourceGroup("AIMModel", model.Namespace, model.Name, string(model.UID))
+		profile.Annotations[aimprofile.AnnotationSourceGroup] = group
+		profile.Annotations[aimprofile.AnnotationSourceID] = group + "/" + entry.RelPath
+		profile.Annotations[aimprofile.AnnotationLegacyCatalogNaming] = "true"
 		// Image-discovery profiles are always `discovered`; the role label
 		// reflects structural classification of the catalog entry:
 		// deployable when the spec carries identity (aimId + modelSources),
@@ -1213,9 +1229,6 @@ func buildDesiredOfficialProfiles(
 				Namespace: model.Namespace,
 			},
 		)
-		spec := *entry.Spec.DeepCopy()
-		spec.ImagePullSecrets = copyPullSecrets(model.Spec.ImagePullSecrets)
-		spec.ServiceAccountName = model.Spec.ServiceAccountName
 		// Recommended-deployment fallback for the v1alpha2 → in-image
 		// `primary` migration. Newer images stamp `metadata.primary`
 		// directly in the per-profile YAML, in which case the catalog
@@ -1227,10 +1240,8 @@ func buildDesiredOfficialProfiles(
 		// `spec.model.name` shortcut still resolves to a sensible
 		// candidate without forcing every operator to upgrade their image
 		// inventory in lockstep with the operator.
-		if !entry.PrimaryExplicit {
-			spec.Primary = matchesRecommendedDeployment(spec, recommendedDeployments)
-		}
-		profile.Spec = aimv1alpha2.AIMProfileSpec{AIMProfileSpecCommon: spec}
+		spec := CatalogProfileSpec(entry, &model.Spec, recommendedDeployments)
+		profile.Spec = aimv1alpha2.AIMProfileSpec{AIMProfileSpecCommon: *spec.DeepCopy()}
 		desired = append(desired, desiredProfile{Object: profile})
 	}
 	return desired, nil
@@ -1401,15 +1412,6 @@ func listManagedClusterProfiles(ctx context.Context, c client.Client, modelUID s
 		})
 	}
 	return profiles, nil
-}
-
-func copyPullSecrets(in []corev1.LocalObjectReference) []corev1.LocalObjectReference {
-	if len(in) == 0 {
-		return nil
-	}
-	out := make([]corev1.LocalObjectReference, len(in))
-	copy(out, in)
-	return out
 }
 
 func firstNonEmpty(values ...string) string {

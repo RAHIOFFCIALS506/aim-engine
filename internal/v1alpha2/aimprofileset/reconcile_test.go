@@ -748,9 +748,9 @@ func TestLoadNamespaceCandidates_BaseRoleMatchesNothingInIteration1(t *testing.T
 // A derived AIMProfile's name is
 //
 //	GenerateDerivedName([setName, profileId],
-//	    WithHashSource(setName, candidateIdentity(source)))
+//	    WithHashSource(setName, legacyNamingIdentity(source)))
 //
-// so the hash suffix is a pure function of candidateIdentity's field list.
+// so the hash suffix is a pure function of legacyNamingIdentity's field list.
 // Any change to that list silently renames every derived profile across the
 // engine — exactly what PR #139 did when it dropped manualSelectionOnly from
 // the fingerprint, invalidating hard-coded names in e2e fixtures and any
@@ -764,7 +764,7 @@ func TestDerivedProfileName_Stable(t *testing.T) {
 	t.Parallel()
 
 	source := aimprofile.ProfileCopyCandidate{
-		Name: "stable-source",
+		Name: "stable-source", SourceID: "AIMProfile/team/stable-source/new-uid",
 		Spec: aimv1alpha2.AIMProfileSpecCommon{
 			AimId:            "acme/model",
 			ModelId:          "acme/model",
@@ -780,10 +780,7 @@ func TestDerivedProfileName_Stable(t *testing.T) {
 		Status: aimv1alpha2.AIMProfileStatus{Version: "0.2.0"},
 	}
 
-	name, err := utils.GenerateDerivedName(
-		[]string{"stable-set", firstNonEmpty(source.Spec.ProfileId, source.Name)},
-		utils.WithHashSource("stable-set", candidateIdentity(source)),
-	)
+	name, err := derivedProfileName("stable-set", source)
 	if err != nil {
 		t.Fatalf("GenerateDerivedName() error = %v", err)
 	}

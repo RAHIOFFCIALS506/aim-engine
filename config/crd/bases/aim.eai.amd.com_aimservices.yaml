@@ -1341,9 +1341,8 @@ spec:
                         type: string
                       modelRef:
                         description: |-
-                          ModelRef narrows candidates to those produced by a specific
-                          AIM(Cluster)Model, matched via the `aim.eai.amd.com/source-model[-scope]`
-                          labels stamped by the AIMModel reconcilers. Iteration 1 (v1alpha2 only).
+                          ModelRef optionally narrows candidates to definitions and profiles
+                          published by a specific AIM(Cluster)Model. Omit to select across models.
                         properties:
                           name:
                             description: Name is the owning AIM(Cluster)Model name.
@@ -1364,9 +1363,9 @@ spec:
                         type: object
                       origin:
                         description: |-
-                          Origin filters by the `aim.eai.amd.com/profile-origin` label. When unset
-                          (empty) the selector does not filter by origin. Iteration 1 (v1alpha2
-                          only).
+                          Origin filters source provenance across catalog and resource
+                          representations.
+                          Empty means no origin filter.
                         enum:
                         - discovered
                         - derived
@@ -4055,9 +4054,8 @@ spec:
                         type: string
                       modelRef:
                         description: |-
-                          ModelRef narrows candidates to those produced by a specific
-                          AIM(Cluster)Model, matched via the `aim.eai.amd.com/source-model[-scope]`
-                          labels stamped by the AIMModel reconcilers. Iteration 1 (v1alpha2 only).
+                          ModelRef optionally narrows candidates to definitions and profiles
+                          published by a specific AIM(Cluster)Model. Omit to select across models.
                         properties:
                           name:
                             description: Name is the owning AIM(Cluster)Model name.
@@ -4078,9 +4076,9 @@ spec:
                         type: object
                       origin:
                         description: |-
-                          Origin filters by the `aim.eai.amd.com/profile-origin` label. When unset
-                          (empty) the selector does not filter by origin. Iteration 1 (v1alpha2
-                          only).
+                          Origin filters source provenance across catalog and resource
+                          representations.
+                          Empty means no origin filter.
                         enum:
                         - discovered
                         - derived

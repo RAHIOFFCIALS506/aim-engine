@@ -24,13 +24,13 @@ package aimprofileset
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sort"
 
 	corev1 "k8s.io/api/core/v1"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
-	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -50,7 +50,8 @@ const (
 	annotationProfileSetNamespace = constants.AimLabelDomain + "/profile-set-namespace"
 	ManagedProfileSetUIDIndexKey  = ".metadata.annotations." + annotationProfileSetUID
 
-	componentDerivation = "Derivation"
+	componentDerivation      = "Derivation"
+	legacyCatalogNamingValue = "true"
 )
 
 func AnnotationProfileSetName() string {
@@ -102,10 +103,12 @@ type desiredProfile struct {
 // candidates already carry an inspected contract and are marked resolved.
 type profileSetCandidate struct {
 	aimprofile.ProfileCopyCandidate
-	annotations      map[string]string
-	labels           map[string]string
-	sourceKind       string
-	contractResolved bool
+	annotations        map[string]string
+	labels             map[string]string
+	sourceKind         string
+	modelOwnerUID      string
+	profileSetOwnerUID string
+	contractResolved   bool
 }
 
 type ProfileSetFetchResult struct {
@@ -184,18 +187,18 @@ func (r *ProfileSetReconciler) ComposeState(
 	fetch ProfileSetFetchResult,
 ) ProfileSetObservation {
 	obs := ProfileSetObservation{}
-	if fetch.candidates.Error == nil {
+	if fetch.candidates.Error == nil && fetch.managed.Error == nil {
 		var selected []aimprofile.ProfileCopyCandidate
 		selected, obs.buildErr = resolveSelectedProfileSetCandidates(fetch.candidates.Value, profileCopyRequest(fetch.set.Spec))
-		if obs.buildErr == nil {
-			obs.desiredProfiles, obs.buildErr = buildDesiredNamespaceProfiles(fetch.set, selected)
-		}
+		var buildErr error
+		obs.desiredProfiles, buildErr = buildDesiredNamespaceProfiles(fetch.set, selected)
+		obs.buildErr = errors.Join(obs.buildErr, buildErr)
 	}
+	obs.pruneSafe = fetch.candidates.Error == nil && fetch.managed.Error == nil && obs.buildErr == nil
 	if fetch.managed.Error == nil {
 		obs.existingManaged = fetch.managed.Value
 		obs.managedProfiles, obs.existingDesiredCount = summarizeManagedProfiles(obs.desiredProfiles, fetch.managed.Value)
 	}
-	obs.pruneSafe = fetch.candidates.Error == nil && fetch.managed.Error == nil && obs.buildErr == nil
 	obs.componentHealth = buildComponentHealth(collectErrors(fetch.candidates.Error, fetch.managed.Error), obs.buildErr, obs.managedProfiles, obs.existingDesiredCount)
 	return obs
 }
@@ -206,18 +209,18 @@ func (r *ClusterProfileSetReconciler) ComposeState(
 	fetch ClusterProfileSetFetchResult,
 ) ClusterProfileSetObservation {
 	obs := ClusterProfileSetObservation{}
-	if fetch.candidates.Error == nil {
+	if fetch.candidates.Error == nil && fetch.managed.Error == nil {
 		var selected []aimprofile.ProfileCopyCandidate
 		selected, obs.buildErr = resolveSelectedProfileSetCandidates(fetch.candidates.Value, profileCopyRequest(fetch.set.Spec))
-		if obs.buildErr == nil {
-			obs.desiredProfiles, obs.buildErr = buildDesiredClusterProfiles(fetch.set, selected)
-		}
+		var buildErr error
+		obs.desiredProfiles, buildErr = buildDesiredClusterProfiles(fetch.set, selected)
+		obs.buildErr = errors.Join(obs.buildErr, buildErr)
 	}
+	obs.pruneSafe = fetch.candidates.Error == nil && fetch.managed.Error == nil && obs.buildErr == nil
 	if fetch.managed.Error == nil {
 		obs.existingManaged = fetch.managed.Value
 		obs.managedProfiles, obs.existingDesiredCount = summarizeManagedProfiles(obs.desiredProfiles, fetch.managed.Value)
 	}
-	obs.pruneSafe = fetch.candidates.Error == nil && fetch.managed.Error == nil && obs.buildErr == nil
 	obs.componentHealth = buildComponentHealth(collectErrors(fetch.candidates.Error, fetch.managed.Error), obs.buildErr, obs.managedProfiles, obs.existingDesiredCount)
 	return obs
 }
@@ -228,14 +231,11 @@ func (r *ProfileSetReconciler) PlanResources(
 	obs ProfileSetObservation,
 ) controllerutils.PlanResult {
 	var plan controllerutils.PlanResult
-	if obs.buildErr != nil {
+	if !obs.pruneSafe {
 		return plan
 	}
 	for _, desired := range obs.desiredProfiles {
 		plan.Apply(desired.Object)
-	}
-	if !obs.pruneSafe {
-		return plan
 	}
 	desiredNames := desiredProfileNames(obs.desiredProfiles)
 	for _, existingProfile := range obs.existingManaged {
@@ -252,14 +252,11 @@ func (r *ClusterProfileSetReconciler) PlanResources(
 	obs ClusterProfileSetObservation,
 ) controllerutils.PlanResult {
 	var plan controllerutils.PlanResult
-	if obs.buildErr != nil {
+	if !obs.pruneSafe {
 		return plan
 	}
 	for _, desired := range obs.desiredProfiles {
 		plan.Apply(desired.Object)
-	}
-	if !obs.pruneSafe {
-		return plan
 	}
 	desiredNames := desiredProfileNames(obs.desiredProfiles)
 	for _, existingProfile := range obs.existingManaged {
@@ -293,33 +290,39 @@ func buildDesiredNamespaceProfiles(set *aimv1alpha2.AIMProfileSet, candidates []
 		return nil, controllerutils.NewInvalidSpecError("InvalidProfileSelection", err.Error(), err)
 	}
 	desired := make([]desiredProfile, 0, len(matched))
+	failures := &sourceErrors{}
 	for _, source := range matched {
-		name, err := utils.GenerateDerivedName(
-			[]string{set.Name, firstNonEmpty(source.Spec.ProfileId, source.Name)},
-			utils.WithHashSource(set.Name, candidateIdentity(source)),
-		)
+		name, err := derivedProfileName(set.Name, source)
 		if err != nil {
-			return nil, fmt.Errorf("generate derived profile name: %w", err)
+			failures.add(source.SourceGroup, fmt.Errorf("generate derived profile name: %w", err))
+			continue
 		}
 		copiedSpec, err := aimprofile.ApplyProfileCopyOverrides(source.Spec, set.Spec.Overrides, set.Spec.Image, source.BaseImage)
 		if err != nil {
-			return nil, err
+			failures.add(source.SourceGroup, err)
+			continue
 		}
 		profile := &aimv1alpha2.AIMProfile{}
 		profile.Namespace = set.Namespace
 		profile.Name = name
 		profile.Annotations = aimprofile.MarkProfileSource(map[string]string{
-			annotationProfileSetUID:       string(set.UID),
-			annotationProfileSetName:      set.Name,
-			annotationProfileSetNamespace: set.Namespace,
+			annotationProfileSetUID:          string(set.UID),
+			annotationProfileSetName:         set.Name,
+			annotationProfileSetNamespace:    set.Namespace,
+			aimprofile.AnnotationSourceID:    source.SourceID,
+			aimprofile.AnnotationSourceGroup: source.SourceGroup,
+			aimprofile.AnnotationBaseImage:   source.BaseImage,
 		}, aimprofile.ProfileSourceCopy)
 		profile.Annotations = profileyaml.Mark(profile.Annotations, source.YAMLContract)
+		if inheritsLegacyCatalogNaming(source, set.Spec) {
+			profile.Annotations[aimprofile.AnnotationLegacyCatalogNaming] = legacyCatalogNamingValue
+		}
 		profile.Spec = aimv1alpha2.AIMProfileSpec{AIMProfileSpecCommon: copiedSpec}
 		profile.Spec.ImagePullSecrets = inheritedPullSecrets(set.Spec, source.Spec)
 		profile.Spec.ServiceAccountName = inheritedServiceAccount(set.Spec, source.Spec)
 		desired = append(desired, desiredProfile{Object: profile})
 	}
-	return desired, nil
+	return desired, errors.Join(failures.err(), validateDerivedNames(desired))
 }
 
 func buildDesiredClusterProfiles(set *aimv1alpha2.AIMClusterProfileSet, candidates []aimprofile.ProfileCopyCandidate) ([]desiredProfile, error) {
@@ -329,31 +332,69 @@ func buildDesiredClusterProfiles(set *aimv1alpha2.AIMClusterProfileSet, candidat
 		return nil, controllerutils.NewInvalidSpecError("InvalidProfileSelection", err.Error(), err)
 	}
 	desired := make([]desiredProfile, 0, len(matched))
+	failures := &sourceErrors{}
 	for _, source := range matched {
-		name, err := utils.GenerateDerivedName(
-			[]string{set.Name, firstNonEmpty(source.Spec.ProfileId, source.Name)},
-			utils.WithHashSource(set.Name, candidateIdentity(source)),
-		)
+		name, err := derivedProfileName(set.Name, source)
 		if err != nil {
-			return nil, fmt.Errorf("generate derived profile name: %w", err)
+			failures.add(source.SourceGroup, fmt.Errorf("generate derived profile name: %w", err))
+			continue
 		}
 		copiedSpec, err := aimprofile.ApplyProfileCopyOverrides(source.Spec, set.Spec.Overrides, set.Spec.Image, source.BaseImage)
 		if err != nil {
-			return nil, err
+			failures.add(source.SourceGroup, err)
+			continue
 		}
 		profile := &aimv1alpha2.AIMClusterProfile{}
 		profile.Name = name
 		profile.Annotations = aimprofile.MarkProfileSource(map[string]string{
-			annotationProfileSetUID:  string(set.UID),
-			annotationProfileSetName: set.Name,
+			annotationProfileSetUID:          string(set.UID),
+			annotationProfileSetName:         set.Name,
+			aimprofile.AnnotationSourceID:    source.SourceID,
+			aimprofile.AnnotationSourceGroup: source.SourceGroup,
+			aimprofile.AnnotationBaseImage:   source.BaseImage,
 		}, aimprofile.ProfileSourceCopy)
 		profile.Annotations = profileyaml.Mark(profile.Annotations, source.YAMLContract)
+		if inheritsLegacyCatalogNaming(source, set.Spec) {
+			profile.Annotations[aimprofile.AnnotationLegacyCatalogNaming] = legacyCatalogNamingValue
+		}
 		profile.Spec = aimv1alpha2.AIMClusterProfileSpec{AIMProfileSpecCommon: copiedSpec}
 		profile.Spec.ImagePullSecrets = inheritedPullSecrets(set.Spec, source.Spec)
 		profile.Spec.ServiceAccountName = inheritedServiceAccount(set.Spec, source.Spec)
 		desired = append(desired, desiredProfile{Object: profile})
 	}
-	return desired, nil
+	return desired, errors.Join(failures.err(), validateDerivedNames(desired))
+}
+
+func validateDerivedNames(profiles []desiredProfile) error {
+	seen := make(map[string]bool, len(profiles))
+	for _, p := range profiles {
+		key := client.ObjectKeyFromObject(p.Object).String()
+		if seen[key] {
+			return controllerutils.NewInvalidSpecError("AmbiguousDerivedNames",
+				fmt.Sprintf("multiple source definitions produce derived profile %q; narrow the selector", key), nil)
+		}
+		seen[key] = true
+	}
+	return nil
+}
+
+func inheritsLegacyCatalogNaming(source aimprofile.ProfileCopyCandidate, spec aimv1alpha1.AIMProfileSetSpec) bool {
+	// Explicit vendor overrides were already modeled before catalog selection.
+	// A downstream derivation must include those in its historical fingerprint.
+	return source.LegacyCatalogNaming && (spec.Overrides == nil || spec.Overrides.AcceleratorVendor == "")
+}
+
+func derivedProfileName(setName string, source aimprofile.ProfileCopyCandidate) (string, error) {
+	// The old catalog parser did not decode vendor. Keep that historical
+	// fingerprint for catalog lineage while retaining vendor in actual specs.
+	// Direct CRD sources were already vendor-aware and keep that behavior.
+	if source.LegacyCatalogNaming {
+		source.Spec.AcceleratorVendor = ""
+	}
+	return utils.GenerateDerivedName(
+		[]string{setName, firstNonEmpty(source.Spec.ProfileId, source.Name)},
+		utils.WithHashSource(setName, legacyNamingIdentity(source)),
+	)
 }
 
 func profileCopyRequest(spec aimv1alpha1.AIMProfileSetSpec) aimprofile.ProfileCopyRequest {
@@ -381,14 +422,16 @@ func resolveSelectedProfileSetCandidates(
 	}
 
 	resolved := make([]aimprofile.ProfileCopyCandidate, 0, len(selectedIndexes))
+	failures := &sourceErrors{}
 	for _, index := range selectedIndexes {
 		candidate, err := candidates[index].resolved()
 		if err != nil {
-			return nil, err
+			failures.add(candidates[index].SourceGroup, err)
+			continue
 		}
 		resolved = append(resolved, candidate)
 	}
-	return resolved, nil
+	return resolved, failures.err()
 }
 
 func (candidate profileSetCandidate) resolved() (aimprofile.ProfileCopyCandidate, error) {
@@ -462,6 +505,13 @@ func summarizeManagedProfiles(desired []desiredProfile, existing []managedProfil
 		if !found {
 			continue
 		}
+		desiredSpec, _ := profileSpecCommon(desired.Object)
+		currentSpec, _ := profileSpecCommon(profile.Object)
+		if !profileSpecsEqual(desiredSpec, currentSpec) ||
+			profile.Status.ObservedGeneration != profile.Object.GetGeneration() ||
+			desired.Object.GetAnnotations()[profileyaml.AnnotationContract] != profile.Object.GetAnnotations()[profileyaml.AnnotationContract] {
+			continue
+		}
 		existingDesiredCount++
 		switch profile.Status.Status {
 		case constants.AIMStatusReady:
@@ -471,6 +521,23 @@ func summarizeManagedProfiles(desired []desiredProfile, existing []managedProfil
 		}
 	}
 	return result, existingDesiredCount
+}
+
+func profileSpecsEqual(left, right aimv1alpha2.AIMProfileSpecCommon) bool {
+	// Compare the admitted wire representation: empty optional collections
+	// disappear on serialization, and CRD defaults need not be explicit in
+	// desired objects. Type has no default: unset and optimized are distinct.
+	normalize := func(spec aimv1alpha2.AIMProfileSpecCommon) string {
+		if spec.AutoSelectionPolicy == "" {
+			spec.AutoSelectionPolicy = aimv1alpha1.AIMProfileAutoSelectionPolicyOptimized
+		}
+		if spec.AcceleratorPartitioningMode == "" {
+			spec.AcceleratorPartitioningMode = "unpartitioned"
+		}
+		raw, _ := json.Marshal(spec)
+		return string(raw)
+	}
+	return normalize(left) == normalize(right)
 }
 
 // profileSpecCommon extracts the AIMProfileSpecCommon embedded in either an
@@ -550,13 +617,9 @@ func buildComponentHealth(fetchErrs []error, buildErr error, managed aimv1alpha1
 
 func loadNamespaceCandidates(ctx context.Context, c client.Client, reader client.Reader, set *aimv1alpha2.AIMProfileSet) ([]profileSetCandidate, error) {
 	if set.Spec.SourceRef != nil {
-		_, catalog, err := aimprofile.LoadDiscoveryCatalog(ctx, reader, *set.Spec.SourceRef, set.Namespace)
-		if err != nil {
-			return nil, err
-		}
-		return resolvedProfileSetCandidates(catalog.ToCandidates()), nil
+		return loadExplicitCatalog(ctx, reader, set.Spec, set.Namespace)
 	}
-	provenance, scope, err := aimprofile.ProvenanceLabelSelector(set.Spec.Selector)
+	_, scope, err := aimprofile.ProvenanceLabelSelector(set.Spec.Selector)
 	if err != nil {
 		return nil, err
 	}
@@ -565,122 +628,49 @@ func loadNamespaceCandidates(ctx context.Context, c client.Client, reader client
 	// when selector.role=base, so base-role selections never reach this
 	// path with a non-empty aimId — target identity for derived profiles
 	// is supplied via overrides.aimId (see ApplyProfileCopyOverrides).
-	aimIDFilter := set.Spec.Selector.AimId
 	// Selector.modelRef.scope==Cluster skips namespace AIMProfiles entirely.
 	if scope == aimprofile.SelectorScopeCluster {
-		return listClusterProfileCandidatesWithLabels(ctx, c, aimIDFilter, provenance)
+		return loadDefaultScope(ctx, c, "", true, set.Spec, string(set.UID))
 	}
-	namespaceCandidates, err := listNamespaceProfileCandidatesWithLabels(ctx, c, set.Namespace, aimIDFilter, provenance)
+	namespaceCandidates, err := loadDefaultScope(ctx, c, set.Namespace, false, set.Spec, string(set.UID))
 	if err != nil {
-		return nil, err
+		return namespaceCandidates, err
 	}
 	// Selector.modelRef.scope==Namespace already restricts to namespace
 	// profiles via the source-model-scope label, so no cluster fallback is
 	// needed there. SelectorScopeAny (the default) falls back to cluster
 	// profiles when no namespace match was found.
-	if scope == aimprofile.SelectorScopeNamespace || len(namespaceCandidates) > 0 {
+	plain := make([]aimprofile.ProfileCopyCandidate, len(namespaceCandidates))
+	for i := range namespaceCandidates {
+		plain[i] = namespaceCandidates[i].ProfileCopyCandidate
+	}
+	// Empty version policy is tolerated by direct unit callers; API admission
+	// defaults and validates it before reconciliation.
+	matches, err := aimprofile.FilterProfileCopyCandidateIndexes(plain, aimprofile.ProfileCopyRequest{Selector: set.Spec.Selector, VersionPolicy: set.Spec.VersionPolicy, Version: set.Spec.Version})
+	if err != nil {
+		return nil, err
+	}
+	if scope == aimprofile.SelectorScopeNamespace || len(matches) > 0 {
 		return namespaceCandidates, nil
 	}
-	return listClusterProfileCandidatesWithLabels(ctx, c, aimIDFilter, provenance)
+	return loadDefaultScope(ctx, c, "", true, set.Spec, string(set.UID))
 }
 
 func loadClusterCandidates(ctx context.Context, c client.Client, reader client.Reader, set *aimv1alpha2.AIMClusterProfileSet) ([]profileSetCandidate, error) {
 	if set.Spec.SourceRef != nil {
 		namespace := constants.GetOperatorNamespace()
-		_, catalog, err := aimprofile.LoadDiscoveryCatalog(ctx, reader, *set.Spec.SourceRef, namespace)
-		if err != nil {
-			return nil, fmt.Errorf("load sourceRef %q from operator namespace %q: %w", set.Spec.SourceRef.Name, namespace, err)
-		}
-		return resolvedProfileSetCandidates(catalog.ToCandidates()), nil
+		return loadExplicitCatalog(ctx, reader, set.Spec, namespace)
 	}
-	provenance, _, err := aimprofile.ProvenanceLabelSelector(set.Spec.Selector)
+	_, scope, err := aimprofile.ProvenanceLabelSelector(set.Spec.Selector)
 	if err != nil {
 		return nil, err
 	}
 	// See loadNamespaceCandidates: Base-role selectors target aimId-less
 	// base profiles; the index filter on selector.AimId would exclude them.
-	aimIDFilter := set.Spec.Selector.AimId
-	if set.Spec.Selector.Role == aimv1alpha1.ProfileSelectorRoleBase {
-		aimIDFilter = ""
+	if scope == aimprofile.SelectorScopeNamespace {
+		return nil, nil
 	}
-	return listClusterProfileCandidatesWithLabels(ctx, c, aimIDFilter, provenance)
-}
-
-func listClusterProfileCandidatesWithLabels(ctx context.Context, c client.Client, aimID string, provenance labels.Selector) ([]profileSetCandidate, error) {
-	var list aimv1alpha2.AIMClusterProfileList
-	opts := []client.ListOption{}
-	if aimID != "" {
-		opts = append(opts, client.MatchingFields{aimv1alpha2.ProfileAimIdIndexKey: aimID})
-	}
-	if provenance != nil && !provenance.Empty() {
-		opts = append(opts, client.MatchingLabelsSelector{Selector: provenance})
-	}
-	if err := c.List(ctx, &list, opts...); err != nil {
-		return nil, err
-	}
-	out := make([]profileSetCandidate, 0, len(list.Items))
-	for i := range list.Items {
-		if !aimprofile.IsProfileCopyable(list.Items[i].Annotations) {
-			continue
-		}
-		spec := list.Items[i].Spec.AIMProfileSpecCommon
-		out = append(out, profileSetCandidate{
-			ProfileCopyCandidate: aimprofile.ProfileCopyCandidate{
-				Name:      list.Items[i].Name,
-				Spec:      spec,
-				Status:    list.Items[i].Status,
-				BaseImage: aimprofile.BaseImageFromProfile(&list.Items[i], list.Items[i].Status.BaseImage),
-			},
-			annotations: list.Items[i].Annotations,
-			labels:      list.Items[i].Labels,
-			sourceKind:  "AIMClusterProfile",
-		})
-	}
-	return out, nil
-}
-
-func listNamespaceProfileCandidatesWithLabels(ctx context.Context, c client.Client, namespace, aimID string, provenance labels.Selector) ([]profileSetCandidate, error) {
-	var list aimv1alpha2.AIMProfileList
-	opts := []client.ListOption{client.InNamespace(namespace)}
-	if aimID != "" {
-		opts = append(opts, client.MatchingFields{aimv1alpha2.ProfileAimIdIndexKey: aimID})
-	}
-	if provenance != nil && !provenance.Empty() {
-		opts = append(opts, client.MatchingLabelsSelector{Selector: provenance})
-	}
-	if err := c.List(ctx, &list, opts...); err != nil {
-		return nil, err
-	}
-	out := make([]profileSetCandidate, 0, len(list.Items))
-	for i := range list.Items {
-		if !aimprofile.IsProfileCopyable(list.Items[i].Annotations) {
-			continue
-		}
-		spec := list.Items[i].Spec.AIMProfileSpecCommon
-		out = append(out, profileSetCandidate{
-			ProfileCopyCandidate: aimprofile.ProfileCopyCandidate{
-				Name:      list.Items[i].Name,
-				Spec:      spec,
-				Status:    list.Items[i].Status,
-				BaseImage: aimprofile.BaseImageFromProfile(&list.Items[i], list.Items[i].Status.BaseImage),
-			},
-			annotations: list.Items[i].Annotations,
-			labels:      list.Items[i].Labels,
-			sourceKind:  "AIMProfile",
-		})
-	}
-	return out, nil
-}
-
-func resolvedProfileSetCandidates(candidates []aimprofile.ProfileCopyCandidate) []profileSetCandidate {
-	resolved := make([]profileSetCandidate, len(candidates))
-	for i := range candidates {
-		resolved[i] = profileSetCandidate{
-			ProfileCopyCandidate: candidates[i],
-			contractResolved:     true,
-		}
-	}
-	return resolved
+	return loadDefaultScope(ctx, c, "", true, set.Spec, string(set.UID))
 }
 
 func mergeCandidates(clusterCandidates, namespaceCandidates []aimprofile.ProfileCopyCandidate) []aimprofile.ProfileCopyCandidate {
@@ -704,6 +694,15 @@ func mergeCandidates(clusterCandidates, namespaceCandidates []aimprofile.Profile
 }
 
 func candidateIdentity(candidate aimprofile.ProfileCopyCandidate) string {
+	if candidate.SourceID != "" {
+		return candidate.SourceID
+	}
+	return legacyNamingIdentity(candidate)
+}
+
+// legacyNamingIdentity is a compatibility contract, independent of the logical
+// source ID used for selection. Keep its field list and encoding stable.
+func legacyNamingIdentity(candidate aimprofile.ProfileCopyCandidate) string {
 	// manualSelectionOnly is intentionally omitted: it is deprecated and no
 	// longer affects selection, so two candidates differing only by it are
 	// equivalent for dedup purposes.
