@@ -37,6 +37,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/record"
+	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -124,6 +125,7 @@ func (w *canonicalAIMServiceStatusWriter) Update(
 // (v1alpha2) using the shared explicit-or-spec-shape selection contract.
 type AIMServiceReconciler struct {
 	client.Client
+	APIReader client.Reader
 	Scheme    *runtime.Scheme
 	Recorder  record.EventRecorder
 	Clientset kubernetes.Interface
@@ -285,8 +287,35 @@ func (r *AIMServiceReconciler) persistPipelineStatus(
 	ctx context.Context,
 	service *aimv1alpha2.AIMService,
 ) (ctrl.Result, error) {
-	if err := r.Status().Update(ctx, service); err != nil {
+	key := client.ObjectKeyFromObject(service)
+	// Conflict retries must read directly from the API server. Requeueing or
+	// reading through the informer cache can return the same stale resource
+	// version that lost a race with another metadata writer.
+	reader := r.APIReader
+	if reader == nil {
+		reader = r.Client
+	}
+	serviceDeleted := false
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		var latest aimv1alpha2.AIMService
+		if err := reader.Get(ctx, key, &latest); err != nil {
+			if apierrors.IsNotFound(err) {
+				serviceDeleted = true
+				return nil
+			}
+			return err
+		}
+		pipeline := servicepolicy.SelectPipeline(servicepolicy.LegacyView(&latest))
+		if !servicepolicy.PrepareStatusForPipeline(&latest.Status, pipeline) {
+			return nil
+		}
+		return r.Status().Update(ctx, &latest)
+	})
+	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("persist AIMService pipeline status: %w", err)
+	}
+	if serviceDeleted {
+		return ctrl.Result{}, nil
 	}
 	return ctrl.Result{Requeue: true}, nil
 }
@@ -305,6 +334,9 @@ func (r *AIMServiceReconciler) persistPipelineStatus(
 func (r *AIMServiceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	ctx := context.Background()
 	c := mgr.GetClient()
+	if r.APIReader == nil {
+		r.APIReader = mgr.GetAPIReader()
+	}
 	recorder := mgr.GetEventRecorderFor("aim-" + serviceName + "-controller")
 
 	r.templateReconciler = &aimservice.ServiceReconciler{
