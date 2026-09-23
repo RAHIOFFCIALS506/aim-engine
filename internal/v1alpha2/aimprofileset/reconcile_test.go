@@ -596,7 +596,7 @@ func TestMergeCandidates_KeepsDistinctTypesInDeterministicOrder(t *testing.T) {
 	}
 }
 
-func TestBuildComponentHealth_PartialReadinessIsDegraded(t *testing.T) {
+func TestBuildComponentHealth_PartialReadinessIsReady(t *testing.T) {
 	t.Parallel()
 
 	health := buildComponentHealth(nil, nil, aimv1alpha1.ManagedProfileCounts{
@@ -607,8 +607,8 @@ func TestBuildComponentHealth_PartialReadinessIsDegraded(t *testing.T) {
 	if len(health) != 1 {
 		t.Fatalf("len(health) = %d, want 1", len(health))
 	}
-	if health[0].State != constants.AIMStatusDegraded {
-		t.Fatalf("state = %q, want %q", health[0].State, constants.AIMStatusDegraded)
+	if health[0].State != constants.AIMStatusReady {
+		t.Fatalf("state = %q, want %q", health[0].State, constants.AIMStatusReady)
 	}
 }
 

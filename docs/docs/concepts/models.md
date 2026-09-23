@@ -322,6 +322,10 @@ The v1alpha2 CRD explicitly forbids legacy fields such as `spec.modelSources`, `
 
 The `managedProfiles` counts always serialise zero values explicitly (no `omitempty`), so `kubectl` printcolumns and assertions on `.status.managedProfiles.{total,ready,...}` are stable.
 
+For models using `spec.profiles`, the child profile set provides alternative profiles, not a requirement that every hardware variant be available. A valid, current child set with at least one ready profile can make the model `Ready`, even if other alternatives are unavailable, failed, or still reconciling. The child must be controlled by this model, match the model's current requested profile-set spec, and have current observed status. Errors establishing that desired state still block readiness; individual alternative diagnostics remain on the profiles.
+
+Availability does not relax replacement safety: pruning predecessor profiles during a transition to derivation still waits for the complete current replacement set to be ready.
+
 ## Resolution and precedence
 
 When an `AIMService` references a model by name, AIM Engine resolves it in this order:

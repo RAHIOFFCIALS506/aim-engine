@@ -120,10 +120,15 @@ func sourceClient(t *testing.T, objects ...client.Object) client.Client {
 		t.Fatal(err)
 	}
 	index := func(obj client.Object) []string { return []string{obj.GetAnnotations()[annotationProfileSetUID]} }
+	modelIndex := func(obj client.Object) []string {
+		return []string{obj.GetAnnotations()[constants.AimLabelDomain+"/model-uid"]}
+	}
 	return fake.NewClientBuilder().WithScheme(scheme).
-		WithStatusSubresource(&aimv1alpha2.AIMProfile{}, &aimv1alpha2.AIMClusterProfile{}, &aimv1alpha2.AIMProfileSet{}, &aimv1alpha2.AIMClusterProfileSet{}).
+		WithStatusSubresource(&aimv1alpha2.AIMProfile{}, &aimv1alpha2.AIMClusterProfile{}, &aimv1alpha2.AIMProfileSet{}, &aimv1alpha2.AIMClusterProfileSet{}, &aimv1alpha2.AIMModel{}, &aimv1alpha2.AIMClusterModel{}).
 		WithIndex(&aimv1alpha2.AIMProfile{}, ManagedProfileSetUIDIndexKey, index).
 		WithIndex(&aimv1alpha2.AIMClusterProfile{}, ManagedProfileSetUIDIndexKey, index).
+		WithIndex(&aimv1alpha2.AIMProfile{}, aimmodel.ManagedModelUIDIndexKey, modelIndex).
+		WithIndex(&aimv1alpha2.AIMClusterProfile{}, aimmodel.ManagedModelUIDIndexKey, modelIndex).
 		WithObjects(objects...).Build()
 }
 

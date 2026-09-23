@@ -31,6 +31,7 @@ import (
 
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -400,7 +401,7 @@ func (r *ModelReconciler) ComposeState(
 		obs.ManagedProfiles,
 			obs.ExistingDesiredCount,
 			obs.ProfileSetCurrent,
-			obs.ProfileSetStatus = observedNamespaceProfileSet(fetch.childProfileSet)
+			obs.ProfileSetStatus = observedNamespaceProfileSet(fetch.childProfileSet, obs.DesiredProfileSet, fetch.model)
 	} else if fetch.existingProfiles.OK() {
 		obs.ManagedProfiles, obs.ExistingDesiredCount = summarizeManagedProfiles(obs.DesiredProfiles, fetch.existingProfiles.Value)
 	}
@@ -606,6 +607,7 @@ func profileInventoryReadError(
 func observedProfileSet(
 	profileSet client.Object,
 	status aimv1alpha1.AIMProfileSetStatus,
+	matchesDesired bool,
 ) (
 	aimv1alpha1.ManagedProfileCounts,
 	int32,
@@ -615,7 +617,7 @@ func observedProfileSet(
 	if profileSet == nil {
 		return aimv1alpha1.ManagedProfileCounts{}, 0, false, ""
 	}
-	current := profileSetStatusCurrent(profileSet, status)
+	current := matchesDesired && profileSetStatusCurrent(profileSet, status)
 	if !current {
 		return aimv1alpha1.ManagedProfileCounts{}, 1, false, status.Status
 	}
@@ -624,6 +626,8 @@ func observedProfileSet(
 
 func observedNamespaceProfileSet(
 	result controllerutils.FetchResult[*aimv1alpha2.AIMProfileSet],
+	desired *aimv1alpha2.AIMProfileSet,
+	model *aimv1alpha2.AIMModel,
 ) (
 	aimv1alpha1.ManagedProfileCounts,
 	int32,
@@ -633,11 +637,16 @@ func observedNamespaceProfileSet(
 	if !result.OK() || result.Value == nil {
 		return aimv1alpha1.ManagedProfileCounts{}, 0, false, ""
 	}
-	return observedProfileSet(result.Value, result.Value.Status)
+	matchesDesired := desired != nil &&
+		metav1.IsControlledBy(result.Value, model) &&
+		profileSetSpecsEqual(result.Value.Spec, desired.Spec)
+	return observedProfileSet(result.Value, result.Value.Status, matchesDesired)
 }
 
 func observedClusterProfileSet(
 	result controllerutils.FetchResult[*aimv1alpha2.AIMClusterProfileSet],
+	desired *aimv1alpha2.AIMClusterProfileSet,
+	model *aimv1alpha2.AIMClusterModel,
 ) (
 	aimv1alpha1.ManagedProfileCounts,
 	int32,
@@ -647,7 +656,30 @@ func observedClusterProfileSet(
 	if !result.OK() || result.Value == nil {
 		return aimv1alpha1.ManagedProfileCounts{}, 0, false, ""
 	}
-	return observedProfileSet(result.Value, result.Value.Status)
+	matchesDesired := desired != nil &&
+		metav1.IsControlledBy(result.Value, model) &&
+		profileSetSpecsEqual(result.Value.Spec, desired.Spec)
+	return observedProfileSet(result.Value, result.Value.Status, matchesDesired)
+}
+
+func profileSetSpecsEqual(left, right aimv1alpha1.AIMProfileSetSpec) bool {
+	// A child can have current status for its own generation while still
+	// reflecting an older parent request. Compare desired specs, accounting for
+	// admission defaults without mutating the cached objects.
+	normalize := func(spec aimv1alpha1.AIMProfileSetSpec) *aimv1alpha1.AIMProfileSetSpec {
+		out := spec.DeepCopy()
+		if out.VersionPolicy == "" {
+			out.VersionPolicy = aimv1alpha1.ProfileVersionPolicyPinned
+		}
+		if out.Selector.Role == "" {
+			out.Selector.Role = aimv1alpha1.ProfileSelectorRoleDeployable
+		}
+		if out.Selector.ModelRef != nil && out.Selector.ModelRef.Scope == "" {
+			out.Selector.ModelRef.Scope = aimv1alpha1.ProfileSelectorScopeAuto
+		}
+		return out
+	}
+	return equality.Semantic.DeepEqual(normalize(left), normalize(right))
 }
 
 func profilePruneSafe(
@@ -664,6 +696,8 @@ func profilePruneSafe(
 	if !derivation {
 		return true
 	}
+	// Availability needs one ready alternative; deleting predecessor profiles
+	// still requires the complete current replacement set to be ready.
 	return profileSetCurrent &&
 		profileSetStatus == constants.AIMStatusReady &&
 		managedProfiles.Total > 0 &&
@@ -824,9 +858,9 @@ func buildModelComponentHealth(obs ModelObservation) []controllerutils.Component
 		if obs.ManagedProfiles.Ready > 0 {
 			health = append(health, controllerutils.ComponentHealth{
 				Component: componentProfileSet,
-				State:     constants.AIMStatusDegraded,
+				State:     constants.AIMStatusReady,
 				Reason:    "ManagedProfilesPartiallyReady",
-				Message:   "Some derived profiles are ready, but others are not available",
+				Message:   fmt.Sprintf("%d of %d derived profiles are ready; inspect individual profiles for remaining alternatives", obs.ManagedProfiles.Ready, obs.ManagedProfiles.Total),
 			})
 			return health
 		}

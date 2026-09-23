@@ -303,7 +303,7 @@ func (r *ClusterModelReconciler) ComposeState(
 		obs.ManagedProfiles,
 			obs.ExistingDesiredCount,
 			obs.ProfileSetCurrent,
-			obs.ProfileSetStatus = observedClusterProfileSet(fetch.childProfileSet)
+			obs.ProfileSetStatus = observedClusterProfileSet(fetch.childProfileSet, obs.DesiredProfileSet, fetch.model)
 	} else if fetch.existingClusterProfiles.OK() {
 		obs.ManagedProfiles, obs.ExistingDesiredCount = summarizeManagedProfiles(obs.DesiredProfiles, fetch.existingClusterProfiles.Value)
 	}

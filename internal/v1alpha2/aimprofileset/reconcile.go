@@ -502,7 +502,7 @@ func summarizeManagedProfiles(desired []desiredProfile, existing []managedProfil
 	for _, desired := range desired {
 		key := client.ObjectKeyFromObject(desired.Object).String()
 		profile, found := existingByKey[key]
-		if !found {
+		if !found || profile.Object.GetDeletionTimestamp() != nil {
 			continue
 		}
 		desiredSpec, _ := profileSpecCommon(desired.Object)
@@ -583,15 +583,6 @@ func buildComponentHealth(fetchErrs []error, buildErr error, managed aimv1alpha1
 			Message:   "No matching source profiles found for derivation",
 		}}
 	}
-	if existingDesiredCount < managed.Total {
-		return []controllerutils.ComponentHealth{{
-			Component:      componentDerivation,
-			State:          constants.AIMStatusProgressing,
-			Reason:         constants.ReasonCreating,
-			Message:        "Derived profiles are still being created",
-			DependencyType: controllerutils.DependencyTypeDownstream,
-		}}
-	}
 	if managed.Ready == managed.Total {
 		return []controllerutils.ComponentHealth{{
 			Component: componentDerivation,
@@ -600,11 +591,22 @@ func buildComponentHealth(fetchErrs []error, buildErr error, managed aimv1alpha1
 		}}
 	}
 	if managed.Ready > 0 {
+		// Profiles are alternatives: a current ready profile makes the set
+		// available even while other hardware targets are unavailable or pending.
 		return []controllerutils.ComponentHealth{{
 			Component: componentDerivation,
-			State:     constants.AIMStatusDegraded,
+			State:     constants.AIMStatusReady,
 			Reason:    "ManagedProfilesPartiallyReady",
-			Message:   "Some derived profiles are ready, but others are not available",
+			Message:   fmt.Sprintf("%d of %d derived profiles are ready; inspect individual profiles for remaining alternatives", managed.Ready, managed.Total),
+		}}
+	}
+	if existingDesiredCount < managed.Total {
+		return []controllerutils.ComponentHealth{{
+			Component:      componentDerivation,
+			State:          constants.AIMStatusProgressing,
+			Reason:         constants.ReasonCreating,
+			Message:        "Derived profiles are still being created",
+			DependencyType: controllerutils.DependencyTypeDownstream,
 		}}
 	}
 	return []controllerutils.ComponentHealth{{

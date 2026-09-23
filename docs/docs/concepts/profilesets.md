@@ -322,11 +322,15 @@ spec:
 
 Zero values serialise explicitly (no `omitempty`), so `kubectl` printcolumns and assertions on count fields are always present.
 
+`Ready` means that source evaluation and derivation succeeded and at least one current derived profile is ready. Profiles are alternatives: other selected profiles may be unavailable on this cluster, still reconciling, or failed without blocking a ready alternative. Their individual statuses and conditions remain unchanged, and `managedProfiles.ready` need not equal `managedProfiles.total`. A partially ready set reports `ManagedProfilesPartiallyReady` with its ready/total counts.
+
+A profile contributes to readiness only when it is not being deleted, its spec and YAML contract match the desired output, and its status observes its current generation. An unreadable source or profile inventory, or an invalid derivation, still prevents readiness even if an older output is ready. An empty selection or a fully observed set with no ready profiles remains `NotAvailable`; missing or stale outputs with no ready alternative remain `Progressing`.
+
 ### Conditions
 
 | Condition | Reasons |
 |---|---|
-| `DerivationReady` | `ManagedProfilesReady`, `NoMatchingProfiles`, `Progressing`, `Degraded` |
+| `DerivationReady` | `ManagedProfilesReady`, `ManagedProfilesPartiallyReady`, `NoMatchingProfiles`, `Progressing`, `Degraded` |
 | `Ready` | `AllComponentsReady`, `ComponentsNotReady`, `Progressing` |
 
 `DerivationReady=False / NoMatchingProfiles` means source evaluation completed and the selector matched zero candidates. Pending discovery or an unreadable source is reported separately from a confirmed empty selection.

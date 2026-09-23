@@ -593,7 +593,11 @@ func TestComposeState_DerivationPrunesOnlyAfterCurrentReplacementIsReady(t *test
 			Name:       "derived-profiles",
 			Namespace:  model.Namespace,
 			Generation: 2,
+			OwnerReferences: []metav1.OwnerReference{
+				CacheOwnerReference(aimv1alpha2.GroupVersion.String(), "AIMModel", model.Name, string(model.UID)),
+			},
 		},
+		Spec: buildDesiredProfileSet(model, nil, "derived-profiles").Spec,
 		Status: aimv1alpha1.AIMProfileSetStatus{
 			ObservedGeneration: 1,
 			Status:             constants.AIMStatusReady,
@@ -795,7 +799,11 @@ func TestComposeState_ProfileCopyUsesOnlyCurrentTerminalChildStatus(t *testing.T
 			Name:       "derived-profiles",
 			Namespace:  model.Namespace,
 			Generation: 2,
+			OwnerReferences: []metav1.OwnerReference{
+				CacheOwnerReference(aimv1alpha2.GroupVersion.String(), "AIMModel", model.Name, string(model.UID)),
+			},
 		},
+		Spec: buildDesiredProfileSet(model, nil, "derived-profiles").Spec,
 		Status: aimv1alpha1.AIMProfileSetStatus{
 			ObservedGeneration: 2,
 			ManagedProfiles:    aimv1alpha1.ManagedProfileCounts{},
