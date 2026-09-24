@@ -26,6 +26,9 @@ set -eu
 URL="${1:?Usage: $0 <hf://org/model or s3://bucket/path>}"
 export TARGET_DIR="${TARGET_DIR:-/cache}"
 
+# shellcheck source=hf-filter-lib.sh
+. "${HF_FILTER_LIB:-/hf-filter-lib.sh}"
+
 # Start progress monitor in background
 MONITOR_PID=""
 if [ -f /progress-monitor.sh ]; then
@@ -100,6 +103,10 @@ fi
 case "$URL" in
     hf://*)
         export MODEL_PATH="${URL#hf://}"
+        # Resolve once here so the download and both verification stages share
+        # one verdict; resolving per stage would let them disagree. Resolution
+        # also fails the pod when the selected files cannot fit the volume.
+        ensure_resolved_filter
         /hf-download.sh "$URL" "$TARGET_DIR"
         stop_progress_monitor
         python /verify-files.py

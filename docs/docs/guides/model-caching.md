@@ -95,12 +95,27 @@ spec:
 ## Repositories with required subdirectories
 
 When no download filter is configured, AIM Engine excludes files in
-subdirectories (equivalent to `exclude: ["*/*"]`). This is suitable for many
-flat model repositories, but repository layouts such as Diffusers commonly
-store required transformer, VAE, text-encoder, scheduler, and tokenizer files
-under nested directories.
+subdirectories (equivalent to `exclude: ["*/*"]`). This suits flat model
+repositories, where subdirectories usually hold alternate formats such as
+`onnx/` or `original/` that the runtime does not need.
 
-Set an explicitly empty filter to download all files:
+Repository layouts such as Diffusers are the opposite case: the transformer,
+VAE, text encoder, scheduler, and tokenizer each live in their own
+subdirectory, and the model cannot load without them. **These are detected and
+downloaded whole, with no configuration.** A repository is treated this way
+when its root contains `model_index.json`, the manifest a Diffusers pipeline
+uses to locate its components.
+
+This is based on repository layout, not inference engine. A Diffusers model
+served by vLLM-Omni is downloaded whole, while a flat repository served by the
+same engine still has its subdirectories skipped.
+
+### Overriding the behaviour
+
+Configuring a filter disables the detection for that artifact, because an
+explicit filter is applied exactly as written. This matters if you want to skip
+part of a multi-directory repository — for example a large alternate-precision
+variant:
 
 ```yaml
 apiVersion: aim.eai.amd.com/v1alpha1
@@ -110,7 +125,8 @@ metadata:
   namespace: ml-team
 spec:
   storage:
-    downloadFilter: {}
+    downloadFilter:
+      exclude: ["*.fp32.safetensors"]
 ```
 
 For a service-owned cache, reference that RuntimeConfig from the relevant
@@ -122,18 +138,25 @@ spec:
 ```
 
 For a profile-owned shared cache, configure the download filter on the
-namespace or cluster RuntimeConfig named `default` instead. Avoid changing the
-cluster-wide default unless every affected model needs nested files:
-downloading them can increase transfer time and storage usage for unrelated
-models.
+namespace or cluster RuntimeConfig named `default` instead.
 
-This setting is based on repository layout, not inference engine. For example,
-a Diffusers model served by vLLM-Omni needs it, while a flat repository served
-by the same engine may not.
+To force a complete download for a layout that is not detected, set an
+explicitly empty filter:
 
-`AIMArtifact.spec.downloadFilter` is immutable. If an artifact was created with
-the wrong filter, delete and recreate that artifact after changing the runtime
-configuration.
+```yaml
+spec:
+  storage:
+    downloadFilter: {}
+```
+
+### Recovering an incomplete cache
+
+Detection applies at download time only. An artifact cached before this
+behaviour existed stays `Ready` with its subdirectories missing, and the model
+keeps failing to load with a missing tokenizer or scheduler. Recreate the
+artifact to re-download it — see
+[Deletion behaviour](../concepts/caching.md#deletion-behaviour) for what each
+delete does and in what order.
 
 ## Download Verification
 

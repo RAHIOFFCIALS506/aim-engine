@@ -42,7 +42,12 @@ import (
 //
 // When no filter is configured (neither on the artifact nor in the runtime config),
 // subdirectory files are excluded by default (equivalent to exclude: ["*/*"]).
-// To download all files including subdirectories, set an empty filter: downloadFilter: {}.
+// That default is skipped for repositories that declare a multi-directory layout
+// with a root model_index.json, such as Diffusers pipelines, whose components live
+// in subdirectories; those are downloaded whole without any configuration.
+// An explicitly configured filter is always honoured as written, even for such a
+// repository. To download everything unconditionally, set an empty filter:
+// downloadFilter: {}.
 type AIMDownloadFilter struct {
 	// Include specifies glob patterns for files to download.
 	// Only files matching at least one pattern are considered.
@@ -55,6 +60,8 @@ type AIMDownloadFilter struct {
 	// Files matching any exclude pattern are removed after include filtering.
 	// Patterns use fnmatch syntax (e.g., ["*/*", "*.bin"]).
 	// Use ["*/*"] to exclude all files in subdirectories (the default when no filter is set).
+	// Setting this explicitly also suppresses multi-directory layout detection, so a
+	// Diffusers repository filtered this way will be missing its components.
 	// +optional
 	Exclude []string `json:"exclude,omitempty"`
 }

@@ -96,6 +96,12 @@ func buildRoleBinding(mc *aimv1alpha1.AIMArtifact) *rbacv1.RoleBinding {
 // This default reflects HuggingFace repo conventions (skip nested dirs like
 // original/, onnx/, ...). It is NOT applied to s3:// sources, where the natural
 // expectation is to download the whole prefix verbatim (see resolveDownloadFilter).
+//
+// It is a guess, not an instruction, so it travels to the downloader in its own
+// environment variables (see downloadFilterEnvVars). Multi-directory layouts such
+// as Diffusers store required components in subdirectories, and the downloader
+// drops this default when it sees one. A user-authored filter of the same shape
+// must not be dropped, which is why the two are kept distinguishable end to end.
 var defaultDownloadFilter = &aimv1alpha1.AIMDownloadFilter{Exclude: []string{"*/*"}}
 
 // downloadJobActiveDeadlineSeconds is a hard 24h wall-clock backstop on the
@@ -105,7 +111,8 @@ var defaultDownloadFilter = &aimv1alpha1.AIMDownloadFilter{Exclude: []string{"*/
 // the PVC; HF/S3 resume). Intentionally coarse and non-configurable for now.
 const downloadJobActiveDeadlineSeconds = int64(24 * 60 * 60)
 
-// resolveDownloadFilter returns the effective download filter.
+// resolveDownloadFilter returns the effective download filter and whether it is
+// the implicit default rather than a user-authored one.
 // Precedence: artifact spec > runtime config storage > default (hf:// only).
 // An explicit empty filter (downloadFilter: {}) on the artifact disables all filtering.
 //
@@ -113,29 +120,47 @@ const downloadJobActiveDeadlineSeconds = int64(24 * 60 * 60)
 // sources the default is no filter, so the entire prefix is downloaded. Both
 // the size-check and download jobs call this, so the file set they select stays
 // identical and the cache PVC is never undersized.
-func resolveDownloadFilter(mc *aimv1alpha1.AIMArtifact, runtimeConfig *aimv1alpha1.AIMRuntimeConfigCommon) *aimv1alpha1.AIMDownloadFilter {
+//
+// The isDefault return exists because the two cases are indistinguishable by
+// value: a user may author exactly `exclude: ["*/*"]`. Only the default may be
+// overridden by repository-layout detection in the downloader.
+func resolveDownloadFilter(
+	mc *aimv1alpha1.AIMArtifact,
+	runtimeConfig *aimv1alpha1.AIMRuntimeConfigCommon,
+) (filter *aimv1alpha1.AIMDownloadFilter, isDefault bool) {
 	if mc.Spec.DownloadFilter != nil {
-		return mc.Spec.DownloadFilter
+		return mc.Spec.DownloadFilter, false
 	}
 	if runtimeConfig != nil && runtimeConfig.Storage != nil && runtimeConfig.Storage.DownloadFilter != nil {
-		return runtimeConfig.Storage.DownloadFilter
+		return runtimeConfig.Storage.DownloadFilter, false
 	}
 	if strings.HasPrefix(mc.Spec.SourceURI, "hf://") {
-		return defaultDownloadFilter
+		return defaultDownloadFilter, true
 	}
-	return nil
+	return nil, false
 }
 
-func downloadFilterEnvVars(filter *aimv1alpha1.AIMDownloadFilter) []corev1.EnvVar {
+// downloadFilterEnvVars encodes the resolved filter for the downloader image.
+//
+// User-authored patterns go in AIM_HF_INCLUDE / AIM_HF_EXCLUDE and are applied
+// verbatim. The implicit default goes in the _DEFAULT variants, which the image
+// applies only when the repository is not a multi-directory layout. Using the
+// same variable for both would erase that distinction, since the encoded values
+// can be identical.
+func downloadFilterEnvVars(filter *aimv1alpha1.AIMDownloadFilter, isDefault bool) []corev1.EnvVar {
 	if filter == nil {
 		return nil
 	}
+	includeVar, excludeVar := "AIM_HF_INCLUDE", "AIM_HF_EXCLUDE"
+	if isDefault {
+		includeVar, excludeVar = "AIM_HF_INCLUDE_DEFAULT", "AIM_HF_EXCLUDE_DEFAULT"
+	}
 	var envs []corev1.EnvVar
 	if len(filter.Include) > 0 {
-		envs = append(envs, corev1.EnvVar{Name: "AIM_HF_INCLUDE", Value: strings.Join(filter.Include, ",")})
+		envs = append(envs, corev1.EnvVar{Name: includeVar, Value: strings.Join(filter.Include, ",")})
 	}
 	if len(filter.Exclude) > 0 {
-		envs = append(envs, corev1.EnvVar{Name: "AIM_HF_EXCLUDE", Value: strings.Join(filter.Exclude, ",")})
+		envs = append(envs, corev1.EnvVar{Name: excludeVar, Value: strings.Join(filter.Exclude, ",")})
 	}
 	return envs
 }

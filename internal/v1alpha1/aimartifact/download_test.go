@@ -131,11 +131,14 @@ func TestResolveDownloadFilter(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := resolveDownloadFilter(tt.artifact, tt.runtimeConfig)
+			got, isDefault := resolveDownloadFilter(tt.artifact, tt.runtimeConfig)
 
 			if tt.wantNil {
 				if got != nil {
 					t.Fatalf("expected nil filter, got %+v", got)
+				}
+				if isDefault {
+					t.Error("nil filter reported as the implicit default")
 				}
 				return
 			}
@@ -144,8 +147,8 @@ func TestResolveDownloadFilter(t *testing.T) {
 				t.Fatal("resolveDownloadFilter returned nil unexpectedly")
 			}
 
-			if tt.wantIsDefault && got != defaultDownloadFilter {
-				t.Error("expected default filter instance")
+			if isDefault != tt.wantIsDefault {
+				t.Errorf("isDefault = %v, want %v", isDefault, tt.wantIsDefault)
 			}
 
 			assertSliceEqual(t, "include", got.Include, tt.wantInclude)
@@ -156,9 +159,10 @@ func TestResolveDownloadFilter(t *testing.T) {
 
 func TestDownloadFilterEnvVars(t *testing.T) {
 	tests := []struct {
-		name     string
-		filter   *aimv1alpha1.AIMDownloadFilter
-		wantEnvs map[string]string
+		name      string
+		filter    *aimv1alpha1.AIMDownloadFilter
+		isDefault bool
+		wantEnvs  map[string]string
 	}{
 		{
 			name:     "nil filter → no env vars",
@@ -191,11 +195,28 @@ func TestDownloadFilterEnvVars(t *testing.T) {
 				"AIM_HF_EXCLUDE": "*/*",
 			},
 		},
+		{
+			// The image may override this one on a multi-directory layout, so it
+			// must not arrive looking like a user instruction.
+			name:      "implicit default → _DEFAULT variant only",
+			filter:    &aimv1alpha1.AIMDownloadFilter{Exclude: []string{"*/*"}},
+			isDefault: true,
+			wantEnvs:  map[string]string{"AIM_HF_EXCLUDE_DEFAULT": "*/*"},
+		},
+		{
+			name:      "implicit default with include → _DEFAULT variants",
+			filter:    &aimv1alpha1.AIMDownloadFilter{Include: []string{"*.json"}, Exclude: []string{"*/*"}},
+			isDefault: true,
+			wantEnvs: map[string]string{
+				"AIM_HF_INCLUDE_DEFAULT": "*.json",
+				"AIM_HF_EXCLUDE_DEFAULT": "*/*",
+			},
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			envs := downloadFilterEnvVars(tt.filter)
+			envs := downloadFilterEnvVars(tt.filter, tt.isDefault)
 			gotMap := make(map[string]string)
 			for _, e := range envs {
 				gotMap[e.Name] = e.Value
@@ -282,10 +303,75 @@ func TestBothJobsGetSameFilterEnvVars(t *testing.T) {
 	checkEnv := envToMap(checkJob.Spec.Template.Spec.Containers[0].Env)
 	downloadEnv := envToMap(downloadJob.Spec.Template.Spec.Containers[0].Env)
 
-	for _, key := range []string{"AIM_HF_INCLUDE", "AIM_HF_EXCLUDE"} {
+	// The size job provisions the PVC the download job has to fit in, so any
+	// divergence here means a cache sized for a different set of files.
+	for _, key := range []string{
+		"AIM_HF_INCLUDE",
+		"AIM_HF_EXCLUDE",
+		"AIM_HF_INCLUDE_DEFAULT",
+		"AIM_HF_EXCLUDE_DEFAULT",
+	} {
 		if checkEnv[key] != downloadEnv[key] {
 			t.Errorf("env %s differs: check-size=%q download=%q", key, checkEnv[key], downloadEnv[key])
 		}
+	}
+}
+
+// The image decides whether it may discard the subdirectory exclude by looking
+// at which variable carried it, so provenance has to survive the encoding.
+func TestFilterProvenanceIsVisibleInJobEnv(t *testing.T) {
+	hfArtifact := func(filter *aimv1alpha1.AIMDownloadFilter) *aimv1alpha1.AIMArtifact {
+		return &aimv1alpha1.AIMArtifact{
+			ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default"},
+			Spec: aimv1alpha1.AIMArtifactSpec{
+				SourceURI:      "hf://org/model",
+				DownloadFilter: filter,
+			},
+		}
+	}
+
+	tests := []struct {
+		name        string
+		artifact    *aimv1alpha1.AIMArtifact
+		wantPresent map[string]string
+		wantAbsent  []string
+	}{
+		{
+			name:        "unconfigured hf source carries the default separately",
+			artifact:    hfArtifact(nil),
+			wantPresent: map[string]string{"AIM_HF_EXCLUDE_DEFAULT": "*/*"},
+			wantAbsent:  []string{"AIM_HF_EXCLUDE", "AIM_HF_INCLUDE"},
+		},
+		{
+			name:        "a user authoring the same patterns is not treated as a default",
+			artifact:    hfArtifact(&aimv1alpha1.AIMDownloadFilter{Exclude: []string{"*/*"}}),
+			wantPresent: map[string]string{"AIM_HF_EXCLUDE": "*/*"},
+			wantAbsent:  []string{"AIM_HF_EXCLUDE_DEFAULT", "AIM_HF_INCLUDE_DEFAULT"},
+		},
+		{
+			name:       "explicitly cleared filter emits nothing",
+			artifact:   hfArtifact(&aimv1alpha1.AIMDownloadFilter{}),
+			wantAbsent: []string{"AIM_HF_EXCLUDE", "AIM_HF_EXCLUDE_DEFAULT"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			env := envToMap(buildDownloadJob(tt.artifact, nil, 1000, false).Spec.Template.Spec.Containers[0].Env)
+
+			for key, want := range tt.wantPresent {
+				if got, ok := env[key]; !ok {
+					t.Errorf("missing env var %s", key)
+				} else if got != want {
+					t.Errorf("env %s = %q, want %q", key, got, want)
+				}
+			}
+			for _, key := range tt.wantAbsent {
+				if got, ok := env[key]; ok {
+					t.Errorf("env %s should be absent, got %q", key, got)
+				}
+			}
+		})
 	}
 }
 

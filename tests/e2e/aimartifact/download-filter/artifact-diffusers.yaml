@@ -1,0 +1,16 @@
+apiVersion: aim.eai.amd.com/v1alpha1
+kind: AIMArtifact
+metadata:
+  name: filter-diffusers
+spec:
+  sourceUri: hf://hf-internal-testing/tiny-stable-diffusion-torch
+  env:
+    - name: HF_TOKEN
+      valueFrom:
+        secretKeyRef:
+          name: huggingface-creds
+          key: token
+  # No downloadFilter, exactly as the operator creates artifacts for a deployed
+  # model. The implicit default excludes */*, which here would discard every
+  # pipeline component and leave three unusable root files. The downloader has
+  # to see the root model_index.json and drop that default.

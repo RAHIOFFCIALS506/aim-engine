@@ -1312,6 +1312,8 @@ spec:
                           Files matching any exclude pattern are removed after include filtering.
                           Patterns use fnmatch syntax (e.g., ["*/*", "*.bin"]).
                           Use ["*/*"] to exclude all files in subdirectories (the default when no filter is set).
+                          Setting this explicitly also suppresses multi-directory layout detection, so a
+                          Diffusers repository filtered this way will be missing its components.
                         items:
                           type: string
                         type: array

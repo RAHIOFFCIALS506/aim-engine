@@ -22,36 +22,32 @@
 
 """Post-download file presence verification and fsync.
 
-Fetches the expected file list from HuggingFace (using the same library and
-filter logic as check-hf-size.py), verifies every expected file exists on disk
-with non-zero size, and fsyncs all files to ensure persistence on network
+Fetches the expected file list from HuggingFace, applies the filter resolved
+for this pod (see hf_filter), verifies every expected file exists on disk with
+non-zero size, and fsyncs all files to ensure persistence on network
 filesystems.
+
+Note this only ever verifies the post-filter set, so it cannot by itself detect
+that the filter selected too little. `hf cache verify --fail-on-missing-files`
+in hf-verify.sh is what covers an unfiltered download.
 """
 
 import os
 import sys
-from fnmatch import fnmatch
 
 from huggingface_hub import HfApi
 from huggingface_hub.utils import GatedRepoError, RepositoryNotFoundError
+
+import hf_filter
 
 MODEL_PATH = os.environ["MODEL_PATH"]
 TARGET_DIR = os.environ["TARGET_DIR"]
 
 
-def parse_patterns(env_var):
-    raw = os.environ.get(env_var, "")
-    return [p.strip() for p in raw.split(",") if p.strip()]
-
-
 def apply_filter(siblings):
-    include = parse_patterns("AIM_HF_INCLUDE")
-    exclude = parse_patterns("AIM_HF_EXCLUDE")
-    if include:
-        siblings = [f for f in siblings if any(fnmatch(f.rfilename, p) for p in include)]
-    if exclude:
-        siblings = [f for f in siblings if not any(fnmatch(f.rfilename, p) for p in exclude)]
-    return siblings
+    resolved = hf_filter.effective([f.rfilename for f in siblings])
+    print(resolved.summary())
+    return resolved.apply(siblings)
 
 
 def fsync_path(path):
@@ -98,7 +94,7 @@ def main():
         print(f"VERIFY FAILED: Could not fetch model info: {e}", file=sys.stderr)
         sys.exit(1)
 
-    siblings = apply_filter(info.siblings)
+    siblings = apply_filter(info.siblings or [])
 
     errors = []
     synced = 0

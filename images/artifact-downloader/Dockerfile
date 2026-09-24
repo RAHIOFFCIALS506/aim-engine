@@ -33,6 +33,10 @@ COPY check-size.sh /check-size.sh
 COPY combine-ca.sh /combine-ca.sh
 COPY hf-download.sh /hf-download.sh
 COPY hf-verify.sh /hf-verify.sh
+COPY hf-filter-lib.sh /hf-filter-lib.sh
+# Onto PYTHONPATH (/opt) so the scripts under /check-size can import it and the
+# shell can reach it as `python -m hf_filter`.
+COPY hf_filter.py /opt/hf_filter.py
 RUN mkdir -p /check-size /storage-initializer/scripts
 COPY check-size/check-hf-size.py /check-size/check-hf-size.py
 COPY verify-files.py /verify-files.py

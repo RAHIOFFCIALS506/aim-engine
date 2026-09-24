@@ -22,32 +22,28 @@
 
 import os
 import sys
-from fnmatch import fnmatch
 from huggingface_hub import HfApi
 from huggingface_hub.utils import RepositoryNotFoundError, GatedRepoError
 
+import hf_filter
+
 MODEL_PATH = os.environ['MODEL_PATH']
 
-def parse_patterns(env_var):
-    raw = os.environ.get(env_var, '')
-    return [p.strip() for p in raw.split(',') if p.strip()]
-
 def apply_filter(siblings):
-    include = parse_patterns('AIM_HF_INCLUDE')
-    exclude = parse_patterns('AIM_HF_EXCLUDE')
-    print(f'Download filter: include={include or "<none>"} exclude={exclude or "<none>"}', file=sys.stderr)
+    # This job runs in its own pod, so it resolves from its own listing. It must
+    # reach the same verdict as the download job or the PVC is sized for a
+    # different file set than the one that gets downloaded.
+    resolved = hf_filter.effective([f.rfilename for f in siblings])
+    print(resolved.summary(), file=sys.stderr)
     before = len(siblings)
-    if include:
-        siblings = [f for f in siblings if any(fnmatch(f.rfilename, p) for p in include)]
-    if exclude:
-        siblings = [f for f in siblings if not any(fnmatch(f.rfilename, p) for p in exclude)]
+    siblings = resolved.apply(siblings)
     if before != len(siblings):
         print(f'Filter: {before} files -> {len(siblings)} files', file=sys.stderr)
     return siblings
 
 try:
     info = HfApi().model_info(MODEL_PATH, files_metadata=True)
-    siblings = apply_filter(info.siblings)
+    siblings = apply_filter(info.siblings or [])
     print(sum(f.size or 0 for f in siblings))
 except RepositoryNotFoundError:
     print(f'Repository Not Found: {MODEL_PATH}', file=sys.stderr)

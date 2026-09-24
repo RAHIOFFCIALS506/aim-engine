@@ -1,0 +1,16 @@
+apiVersion: aim.eai.amd.com/v1alpha1
+kind: AIMArtifact
+metadata:
+  name: filter-diffusers-sized
+spec:
+  sourceUri: hf://hf-internal-testing/tiny-stable-diffusion-torch
+  # A declared size suppresses the check-size job entirely, so nothing lists the
+  # repository before the download starts. Layout detection has to work in the
+  # download job on its own, without a size-discovery pass to lean on.
+  size: 64Mi
+  env:
+    - name: HF_TOKEN
+      valueFrom:
+        secretKeyRef:
+          name: huggingface-creds
+          key: token

@@ -13,9 +13,9 @@ spec:
     requestTimeout: "1200s"
   storage:
     defaultStorageClassName: longhorn
-    # Diffusers repositories contain required nested component directories.
-    # An empty filter means "download the complete repository tree".
-    downloadFilter: {}
+    # Deliberately no downloadFilter: the downloader recognises the Diffusers
+    # layout and fetches the complete tree on its own. Setting one here would
+    # hide a regression in that detection.
     # The downloaded WAN snapshot is about 118 GiB. Keep enough headroom for
     # XET staging and filesystem overhead.
     pvcHeadroomPercent: 120

@@ -27,6 +27,11 @@ URL="$1"
 TARGET_DIR="$2"
 MODEL_PATH="${URL#hf://}"
 
+# Resolution is a no-op when entrypoint.sh already did it; it does the real work
+# when adapter-stage.sh calls this script directly.
+# shellcheck source=hf-filter-lib.sh
+. "${HF_FILTER_LIB:-/hf-filter-lib.sh}"
+
 # ── Status patching helper ──────────────────────────────────
 patch_download_status() {
     _protocol="$1" _attempt="$2" _total="$3" _message="$4"
@@ -94,15 +99,15 @@ clean_locks() {
     return 0
 }
 
-# ── Build --include/--exclude flags from env vars ────────────
+# ── Build --include/--exclude flags from the resolved filter ─
 build_filter_args() {
     _args=""
     _old_ifs="$IFS"; IFS=','
     set -f  # disable pathname expansion — patterns like */* must stay literal
-    for _p in ${AIM_HF_INCLUDE:-}; do
+    for _p in ${AIM_RESOLVED_INCLUDE:-}; do
         [ -n "$_p" ] && _args="$_args --include $_p"
     done
-    for _p in ${AIM_HF_EXCLUDE:-}; do
+    for _p in ${AIM_RESOLVED_EXCLUDE:-}; do
         [ -n "$_p" ] && _args="$_args --exclude $_p"
     done
     set +f
@@ -113,7 +118,8 @@ build_filter_args() {
 # ── Download + verify ───────────────────────────────────────
 do_hf_download() {
     echo "Environment: HF_HUB_DISABLE_XET=${HF_HUB_DISABLE_XET:-unset} HF_HUB_ENABLE_HF_TRANSFER=${HF_HUB_ENABLE_HF_TRANSFER:-unset}"
-    echo "Download filter: include=[${AIM_HF_INCLUDE:-}] exclude=[${AIM_HF_EXCLUDE:-}]"
+    ensure_resolved_filter || return 1
+    echo "Download filter (${AIM_RESOLVED_FILTER_SOURCE:-none}): include=[${AIM_RESOLVED_INCLUDE:-}] exclude=[${AIM_RESOLVED_EXCLUDE:-}]"
     FILTER_ARGS=$(build_filter_args)
 
     # Simulation mode: shadow the real `hf` CLI with a shell function so

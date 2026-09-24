@@ -234,7 +234,10 @@ type AIMArtifactSpec struct {
 
 	// DownloadFilter controls which files are included or excluded when downloading from HuggingFace.
 	// Overrides any filter set in the runtime config's storage.downloadFilter.
-	// When neither is set, subdirectory files are excluded by default (equivalent to exclude: ["*/*"]).
+	// When neither is set, subdirectory files are excluded by default (equivalent to exclude: ["*/*"]),
+	// except for repositories declaring a multi-directory layout with a root model_index.json
+	// (such as Diffusers pipelines), which are downloaded whole.
+	// Setting this field disables that detection: the patterns are applied exactly as written.
 	// To download all files including subdirectories, set this to an empty object: downloadFilter: {}.
 	// This field is immutable — to change the filter, recreate the artifact.
 	// +optional

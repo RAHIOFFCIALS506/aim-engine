@@ -35,8 +35,12 @@ if [ -n "${AIM_DEBUG_SIMULATE_HF_DOWNLOAD:-}" ]; then
 fi
 
 echo "Verifying download (this may take a while for large models)..."
+# Gate on the *resolved* filter, not the operator's raw input. The implicit
+# default always populated AIM_HF_EXCLUDE, so keying off that meant this check
+# never ran on an unconfigured hf:// download — which is how a repository that
+# lost its component directories could still report success.
 VERIFY_ARGS=""
-if [ -z "${AIM_HF_INCLUDE:-}" ] && [ -z "${AIM_HF_EXCLUDE:-}" ]; then
+if [ -z "${AIM_RESOLVED_INCLUDE:-}" ] && [ -z "${AIM_RESOLVED_EXCLUDE:-}" ]; then
     VERIFY_ARGS="--fail-on-missing-files"
 else
     echo "Download filter active — skipping missing-files check (filtered files are expected to be absent)"

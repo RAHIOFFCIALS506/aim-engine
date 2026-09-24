@@ -10,16 +10,32 @@ spec:
     Verifies that downloadFilter.exclude skips subdirectory files in both
     the size estimator and the downloader. Uses hf-internal-testing/tiny-random-CLIPModel
     which has root files (~1.4 MB) and an onnx/ subdirectory (~1.5 MB).
+
+    Also verifies that the implicit default is dropped for a multi-directory
+    layout, where excluding subdirectories would discard the model itself. Uses
+    hf-internal-testing/tiny-stable-diffusion-torch (~8.6 MB), which declares a
+    root model_index.json and keeps its components in subdirectories.
+
+    filter-no-subdirs is the guard for the other half of that behaviour: it sets
+    no filter on a flat repository and must keep excluding onnx/. If layout
+    detection ever widens too far, that case fails.
   steps:
     - use:
         template: ../../_shared/hf-token-step.yaml
 
-    - name: Create both artifacts (full and filtered)
+    - name: Create the flat-repository artifacts (full and filtered)
       try:
         - apply:
             file: artifact-full.yaml
         - apply:
             file: artifact-filtered.yaml
+
+    - name: Create the multi-directory artifacts (discovered size and declared size)
+      try:
+        - apply:
+            file: artifact-diffusers.yaml
+        - apply:
+            file: artifact-diffusers-sized.yaml
 
     - name: Assert both artifacts reach Ready via size discovery
       try:
@@ -47,6 +63,52 @@ spec:
                 (discoveredSizeBytes != null): true
                 progress:
                   percentage: 100
+
+    - name: Assert the multi-directory artifacts reach Ready
+      try:
+        - assert:
+            timeout: 5m
+            resource:
+              apiVersion: aim.eai.amd.com/v1alpha1
+              kind: AIMArtifact
+              metadata:
+                name: filter-diffusers
+              status:
+                status: Ready
+                (discoveredSizeBytes != null): true
+                progress:
+                  percentage: 100
+        # A declared size means no check-size job ran, so discovery never
+        # populated this field. That is what makes this case exercise the
+        # download job's own detection.
+        - assert:
+            timeout: 5m
+            resource:
+              apiVersion: aim.eai.amd.com/v1alpha1
+              kind: AIMArtifact
+              metadata:
+                name: filter-diffusers-sized
+              status:
+                status: Ready
+                (discoveredSizeBytes == null): true
+                progress:
+                  percentage: 100
+
+    - name: Verify the multi-directory repository was sized whole, not stripped to its root files
+      try:
+        - script:
+            timeout: 30s
+            content: |
+              set -e
+              SIZE=$(kubectl get aimartifact filter-diffusers -n $NAMESPACE -o jsonpath='{.status.discoveredSizeBytes}')
+              echo "Diffusers discovered size: $SIZE bytes"
+              # The three root files total a few KB; the components are ~8.6 MB.
+              # Anything under a megabyte means the default exclude survived.
+              if [ "$SIZE" -lt 1000000 ]; then
+                echo "FAIL: discovered size ($SIZE) implies subdirectories were excluded"
+                exit 1
+              fi
+              echo "PASS: discovered size covers the full repository"
 
     - name: Verify filtered artifact discovered less data than full
       try:
@@ -125,3 +187,71 @@ spec:
               EOF
 
               kubectl wait --for=condition=complete job/verify-filter -n $NAMESPACE --timeout=2m
+
+    - name: Verify the pipeline components landed on both multi-directory PVCs
+      try:
+        - script:
+            timeout: 2m
+            content: |
+              set -e
+              DISCOVERED_PVC=$(kubectl get aimartifact filter-diffusers -n $NAMESPACE -o jsonpath='{.status.persistentVolumeClaim}')
+              DECLARED_PVC=$(kubectl get aimartifact filter-diffusers-sized -n $NAMESPACE -o jsonpath='{.status.persistentVolumeClaim}')
+
+              cat <<EOF | kubectl apply -n $NAMESPACE -f -
+              apiVersion: batch/v1
+              kind: Job
+              metadata:
+                name: verify-diffusers
+              spec:
+                template:
+                  spec:
+                    restartPolicy: Never
+                    containers:
+                      - name: verify
+                        image: alpine:latest
+                        command: ["/bin/sh", "-c"]
+                        args:
+                          - |
+                            set -e
+                            # Both PVCs must hold a loadable pipeline: the manifest
+                            # plus every component directory it names. Checking the
+                            # directories exist is not enough, an empty directory
+                            # would pass that, so require the weights inside.
+                            for root in /discovered /declared; do
+                              echo "=== \$root ==="
+                              ls -la "\$root"
+
+                              if [ ! -f "\$root/model_index.json" ]; then
+                                echo "FAIL: \$root missing model_index.json"
+                                exit 1
+                              fi
+
+                              for component in unet vae text_encoder tokenizer scheduler; do
+                                if [ ! -d "\$root/\$component" ]; then
+                                  echo "FAIL: \$root missing component directory \$component/"
+                                  exit 1
+                                fi
+                                if [ -z "\$(ls -A "\$root/\$component")" ]; then
+                                  echo "FAIL: \$root/\$component/ is empty"
+                                  exit 1
+                                fi
+                              done
+                              echo "PASS: \$root has every pipeline component"
+                            done
+                        volumeMounts:
+                          - name: discovered
+                            mountPath: /discovered
+                            readOnly: true
+                          - name: declared
+                            mountPath: /declared
+                            readOnly: true
+                    volumes:
+                      - name: discovered
+                        persistentVolumeClaim:
+                          claimName: ${DISCOVERED_PVC}
+                      - name: declared
+                        persistentVolumeClaim:
+                          claimName: ${DECLARED_PVC}
+              EOF
+
+              kubectl wait --for=condition=complete job/verify-diffusers -n $NAMESPACE --timeout=2m

@@ -301,7 +301,7 @@ kubectl get aimart my-model -o yaml
 After each download, AIM Engine performs a two-stage verification:
 
 1. **File presence check** — the downloader independently queries HuggingFace for the expected file list (honouring any download filters), then verifies every expected file exists on disk. Each verified file is explicitly `fsync`ed so it's been written to underlying storage — particularly important on network filesystems. Missing files fail the Job and trigger a retry.
-2. **Integrity verification** — `hf cache verify` validates checksums against HuggingFace metadata. On failure, the local metadata cache is cleared by default so the retry performs a full fresh download rather than skipping files based on stale metadata.
+2. **Integrity verification** — `hf cache verify` validates checksums against HuggingFace metadata. On failure, the local metadata cache is cleared by default so the retry performs a full fresh download rather than skipping files based on stale metadata. When no filter ends up applying, this stage also fails on any file missing from the repository, which the first stage cannot detect: stage one only ever checks the files the filter selected.
 
 Set `AIM_KEEP_METADATA_ON_FAILURE` to preserve the metadata cache on failure for debugging. See [Environment Variables](../reference/environment-variables.md).
 

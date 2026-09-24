@@ -125,7 +125,8 @@ complete v1alpha2 path. It demonstrates:
 - discovering and pinning the exact 1-GPU USP1 profile;
 - preserving the embedded vLLM-Omni profile filename and projecting
   `AIM_ENGINE=vllm_omni`, `AIM_PROFILE_ID`, and a 32 GiB `/dev/shm`;
-- downloading the complete Diffusers repository with `downloadFilter: {}`;
+- downloading the complete Diffusers repository with no `downloadFilter` at
+  all, exercising the downloader's own detection of a multi-directory layout;
 - generating a three-second MP4 through `/v1/videos/sync` and validating its
   frame count and duration.
 
