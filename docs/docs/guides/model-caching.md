@@ -110,6 +110,15 @@ This is based on repository layout, not inference engine. A Diffusers model
 served by vLLM-Omni is downloaded whole, while a flat repository served by the
 same engine still has its subdirectories skipped.
 
+Detection keys off the manifest, so a repository that splits its weights across
+subdirectories without publishing one is not detected and has those
+subdirectories skipped. Model families often ship both an original-format
+repository and a converted `-Diffusers` one; only the converted repository
+carries the manifest, and the `Diffusers` tag on a model page describes the
+library that can load it, not the layout on disk. If a repository keeps
+required weights in subdirectories but has no root `model_index.json`, set an
+[explicitly empty filter](#overriding-the-behaviour).
+
 ### Overriding the behaviour
 
 Configuring a filter disables the detection for that artifact, because an
