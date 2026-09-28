@@ -1,0 +1,113 @@
+# Copyright © Advanced Micro Devices, Inc., or its affiliates.
+#
+# SPDX-License-Identifier: MIT
+
+name: Docs - Sync to public docs
+# Mirrors docs/docs into the umbrella AMDEnterpriseAISuiteDocs site under
+# docs/aim-engine/ and opens a PR. The umbrella repo holds the Sphinx build
+# (conf.py, theme) and aggregates each stack under its own subtree, so only the
+# content (Markdown + committed diagram SVGs) is synced here.
+#
+# Only runs on release branches/tags so unreleased changes on main don't reach
+# the public documentation.
+
+on:
+  push:
+    branches:
+      - "release/**"
+    tags:
+      - "v*"
+    paths:
+      - "docs/docs/**"
+      - ".github/workflows/sync-docs-to-central-repo.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  copy-docs:
+    runs-on: ubuntu-latest
+    env:
+      DOCS_REPO: silogen/AMDEnterpriseAISuiteDocs
+      CHECKOUT_PATH: AMDEnterpriseAISuiteDocs
+      BASE_BRANCH: develop
+      SYNC_BRANCH: feature/docs-from-aim-engine-repo
+    steps:
+      - name: Checkout aim-engine repo
+        uses: actions/checkout@v4
+        with:
+          # Avoid leaving a github.com credential header behind: it would collide
+          # with the token used below for the separate docs repo checkout.
+          persist-credentials: false
+
+      - name: Checkout docs repo
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.DOCS_REPO }}
+          token: ${{ secrets.DOCS_REPO_TOKEN }}
+          ref: ${{ env.BASE_BRANCH }}
+          path: ${{ env.CHECKOUT_PATH }}
+
+      - name: Push to external docs to a branch
+        id: push
+        env:
+          DOCS_REPO_TOKEN: ${{ secrets.DOCS_REPO_TOKEN }}
+        run: |
+          set -euo pipefail
+          git config --global user.name 'github-actions[bot]'
+          git config --global user.email 'github-actions[bot]@users.noreply.github.com'
+
+          if [ -z "${DOCS_REPO_TOKEN}" ]; then
+            echo "::error::DOCS_REPO_TOKEN secret is empty or not set in this repo."
+            exit 1
+          fi
+          # Sanity check that the token can actually reach the docs repo before doing work.
+          # (git's stderr is safe to print: GitHub auto-masks any registered secret.)
+          if ! ls_remote_err=$(git ls-remote "https://x-access-token:${DOCS_REPO_TOKEN}@github.com/${DOCS_REPO}.git" 2>&1 >/dev/null); then
+            echo "::error::Token cannot access ${DOCS_REPO}. Check org approval and that the secret grants Contents: write and Pull requests: write."
+            echo "::group::git ls-remote error detail"
+            echo "$ls_remote_err"
+            echo "::endgroup::"
+            exit 1
+          fi
+
+          # rsync the aim-engine content into the umbrella site's subtree.
+          # Exclude the standalone Sphinx config and build artefacts; the central
+          # repo builds with its own root conf.py.
+          rsync -av --delete \
+            --exclude 'conf.py' \
+            --exclude '_build/' \
+            --exclude '.venv/' \
+            docs/docs/ "${CHECKOUT_PATH}/docs/aim-engine/"
+
+          # Preprocess the synced content to fit the central repo's Sphinx/MyST build.
+          python3 "${CHECKOUT_PATH}/docs/_scripts/normalize-synced-docs.py" "${CHECKOUT_PATH}/docs/aim-engine"
+
+          cd "${CHECKOUT_PATH}"
+          git checkout -B "${SYNC_BRANCH}" "origin/${BASE_BRANCH}"
+          git add .
+          if git diff --staged --quiet; then
+            echo "changed=false" >> "${GITHUB_OUTPUT}"
+          else
+            git commit -m "Update documentation from aim-engine repo"
+            echo "changed=true" >> "${GITHUB_OUTPUT}"
+          fi
+
+          git push --force origin "${SYNC_BRANCH}"
+
+      - name: Create pull request
+        if: steps.push.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.DOCS_REPO_TOKEN }}
+        run: |
+          existing=$(gh pr list --repo "${DOCS_REPO}" --state open --head "${SYNC_BRANCH}" --json number --jq 'length')
+          if [ "${existing}" -gt 0 ]; then
+            echo "An open PR already exists for ${SYNC_BRANCH}, nothing to create."
+          else
+            gh pr create \
+              --repo "${DOCS_REPO}" \
+              --base "${BASE_BRANCH}" \
+              --head "${SYNC_BRANCH}" \
+              --title "Update documentation from aim-engine repo" \
+              --body "Automated documentation update synced from the aim-engine repository."
+          fi
