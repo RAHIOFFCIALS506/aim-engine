@@ -84,17 +84,19 @@ releases:
   - name: kserve-crd
     namespace: kserve-system
     chart: oci://ghcr.io/kserve/charts/kserve-crd
-    version: v0.16.0
+    version: v0.20.0
     createNamespace: true
     wait: true
     timeout: 600
     needs:
       - keda/kedify-otel
 
+  # The release keeps its pre-v0.17 name so existing clusters upgrade in place
+  # instead of hitting Helm ownership conflicts on the same objects.
   - name: kserve
     namespace: kserve-system
-    chart: oci://ghcr.io/kserve/charts/kserve
-    version: v0.16.0
+    chart: oci://ghcr.io/kserve/charts/kserve-resources
+    version: v0.20.0
     createNamespace: false
     wait: true
     waitForJobs: true
@@ -114,7 +116,7 @@ releases:
             enabled: false
           # Remove default resource limits/requests for inference services
           # Let workloads set their own resources as needed
-          # See: helm show values oci://ghcr.io/kserve/charts/kserve
+          # See: helm show values oci://ghcr.io/kserve/charts/kserve-resources
           inferenceservice:
             resources:
               limits:
@@ -123,6 +125,84 @@ releases:
               requests:
                 cpu: ""
                 memory: ""
+
+  # LLMInferenceService runs in the "kserve" namespace, separate from the
+  # InferenceService stack: the LLM CRD conversion webhook and the preset
+  # LLMInferenceServiceConfigs are hardcoded to that namespace, and the LLM
+  # controller only reads presets from its own namespace.
+  - name: kserve-llmisvc-crd
+    namespace: kserve
+    chart: oci://ghcr.io/kserve/charts/kserve-llmisvc-crd
+    version: v0.20.0
+    createNamespace: true
+    wait: true
+    timeout: 600
+    needs:
+      # Both CRD charts ship the ClusterStorageContainer CRD and skip it only
+      # when another release already owns it, so they must not run in parallel.
+      - kserve-system/kserve-crd
+
+  - name: kserve-llmisvc-resources
+    namespace: kserve
+    chart: oci://ghcr.io/kserve/charts/kserve-llmisvc-resources
+    version: v0.20.0
+    createNamespace: false
+    wait: true
+    timeout: 600
+    needs:
+      - kserve/kserve-llmisvc-crd
+      - cert-manager/cert-manager
+      # The controller only watches HTTPRoutes and Gateways if the Gateway API
+      # CRDs (installed by Envoy Gateway) exist when it starts.
+      - envoy-gateway-system/envoy-gateway
+    values:
+      - kserve:
+          # The cluster-scoped default ClusterStorageContainer belongs to the
+          # kserve release; this namespace still needs its own
+          # inferenceservice-config and webhook certificate issuer.
+          createSharedResources: false
+          inferenceServiceConfig:
+            enabled: true
+          certManager:
+            enabled: true
+          controller:
+            gateway:
+              ingressGateway:
+                kserveGateway: envoy-gateway-system/kserve-ingress-gateway
+
+  - name: kserve-runtime-configs
+    namespace: kserve
+    chart: oci://ghcr.io/kserve/charts/kserve-runtime-configs
+    version: v0.20.0
+    createNamespace: false
+    wait: true
+    timeout: 600
+    needs:
+      - kserve/kserve-llmisvc-resources
+    values:
+      - kserve:
+          llmisvcConfigs:
+            enabled: true
+    hooks:
+      # The LLMInferenceServiceConfig presets are admitted by a fail-closed
+      # webhook, which needs ready endpoints and an injected CA bundle.
+      - events: ["presync"]
+        showlogs: true
+        command: kubectl
+        args:
+          - wait
+          - --namespace=kserve
+          - --for=jsonpath={.subsets[0].addresses}
+          - endpoints/llmisvc-webhook-server-service
+          - --timeout=180s
+      - events: ["presync"]
+        showlogs: true
+        command: kubectl
+        args:
+          - wait
+          - --for=jsonpath={.webhooks[0].clientConfig.caBundle}
+          - validatingwebhookconfiguration/llminferenceserviceconfig.serving.kserve.io
+          - --timeout=180s
 
   - name: seaweedfs
     namespace: seaweedfs-system
