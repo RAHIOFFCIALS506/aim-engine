@@ -81,7 +81,14 @@ jobs:
             docs/docs/ "${CHECKOUT_PATH}/docs/aim-engine/"
 
           # Preprocess the synced content to fit the central repo's Sphinx/MyST build.
-          python3 "${CHECKOUT_PATH}/docs/_scripts/normalize-synced-docs.py" "${CHECKOUT_PATH}/docs/aim-engine"
+          # This script lives in the docs repo; fail loudly if it has moved so a
+          # rename there does not silently skip normalization.
+          normalize="${CHECKOUT_PATH}/docs/_scripts/normalize-synced-docs.py"
+          if [ ! -f "${normalize}" ]; then
+            echo "::error::Expected normalization script not found at ${normalize}. It may have been renamed or moved in ${DOCS_REPO}; update this workflow to match."
+            exit 1
+          fi
+          python3 "${normalize}" "${CHECKOUT_PATH}/docs/aim-engine"
 
           cd "${CHECKOUT_PATH}"
           git checkout -B "${SYNC_BRANCH}" "origin/${BASE_BRANCH}"
@@ -90,10 +97,11 @@ jobs:
             echo "changed=false" >> "${GITHUB_OUTPUT}"
           else
             git commit -m "Update documentation from aim-engine repo"
+            # Push only when there is a change: a no-op run would otherwise
+            # force-reset the remote sync branch to BASE_BRANCH.
+            git push --force origin "${SYNC_BRANCH}"
             echo "changed=true" >> "${GITHUB_OUTPUT}"
           fi
-
-          git push --force origin "${SYNC_BRANCH}"
 
       - name: Create pull request
         if: steps.push.outputs.changed == 'true'
@@ -104,10 +112,20 @@ jobs:
           if [ "${existing}" -gt 0 ]; then
             echo "An open PR already exists for ${SYNC_BRANCH}, nothing to create."
           else
+            body=$(cat <<'EOF'
+          Automated documentation update synced from the aim-engine repository.
+
+          > [!IMPORTANT]
+          > This branch is an automatically regenerated mirror of the upstream
+          > docs. A later sync run rebuilds it and force-pushes, so **commits
+          > added here are lost** (comments persist). Make content fixes in the
+          > upstream aim-engine repo, and do detailed line-by-line review there.
+          EOF
+            )
             gh pr create \
               --repo "${DOCS_REPO}" \
               --base "${BASE_BRANCH}" \
               --head "${SYNC_BRANCH}" \
               --title "Update documentation from aim-engine repo" \
-              --body "Automated documentation update synced from the aim-engine repository."
+              --body "${body}"
           fi
