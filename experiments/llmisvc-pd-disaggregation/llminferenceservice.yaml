@@ -1,0 +1,118 @@
+# P/D disaggregated LLMInferenceService: 1 prefill + 1 decode replica of
+# Qwen/Qwen3-8B on AMD MI300X, one GPU each. vLLM's NixlConnector moves the KV
+# cache from prefill to decode.
+#
+# Setting spec.prefill makes KServe layer its P/D presets under this spec
+# (prefill and decode templates, llm-d scheduler, InferencePool, HTTPRoute), so
+# the spec only adds what they don't cover. Commented-out settings were tested
+# and aren't needed over TCP; their comments say when to enable them. See
+# README.md.
+apiVersion: serving.kserve.io/v1alpha2
+kind: LLMInferenceService
+metadata:
+  name: qwen3-8b-pd
+spec:
+  model:
+    uri: hf://Qwen/Qwen3-8B
+    name: Qwen/Qwen3-8B
+  router:
+    route: {}
+    gateway: {}
+    scheduler: {}
+
+  # Decode pool.
+  replicas: 1
+  template:
+    initContainers:
+    - name: storage-initializer
+      # KServe's 1Gi default is OOMKilled: the Hugging Face Xet downloader
+      # peaks at 3-4 GiB for this model.
+      resources:
+        limits:
+          memory: 8Gi
+          # Not needed: at the default 1 CPU the download took ~5 s longer.
+          # cpu: "4"
+    containers:
+    - name: main
+      # The presets default to a CUDA image. Any ROCm vLLM image with NIXL works.
+      image: ghcr.io/llm-d/llm-d-rocm:v0.10.0
+      # The preset runs `vllm serve` through `eval`, which strips JSON quotes,
+      # so the KV transfer config uses vLLM's dotted-key form.
+      args:
+      - --kv-transfer-config.kv_connector=NixlConnector
+      - --kv-transfer-config.kv_role=kv_consumer
+      # Not needed with the default (pull) NixlConnector, where decode only
+      # connects out to prefill. Needed with NixlPushConnector or
+      # bidirectional_kv_xfer, where prefill connects to decode.
+      # env:
+      # - name: VLLM_NIXL_SIDE_CHANNEL_HOST
+      #   valueFrom:
+      #     fieldRef:
+      #       fieldPath: status.podIP
+      # Documentation only; nothing references it.
+      # ports:
+      # - name: nixl
+      #   containerPort: 5600
+      #   protocol: TCP
+      # Measured peaks: 14.4 GiB at startup (mostly page cache of the model
+      # files) and 6.4 cores on decode with 32k-token prompts over TCP.
+      resources:
+        requests:
+          amd.com/gpu: "1"
+          cpu: "8"
+          memory: 16Gi
+        limits:
+          amd.com/gpu: "1"
+          memory: 32Gi
+      securityContext:
+        # The preset enforces runAsNonRoot, but this image runs as root.
+        runAsNonRoot: false
+        # Not needed over TCP. Enable for RDMA: verbs memory registration is
+        # charged to the memlock limit unless the process has IPC_LOCK, and
+        # the presets drop all capabilities.
+        # capabilities:
+        #   add: ["IPC_LOCK"]
+
+  prefill:
+    replicas: 1
+    template:
+      initContainers:
+      - name: storage-initializer
+        resources:
+          limits:
+            memory: 8Gi
+            # cpu: "4"
+      containers:
+      - name: main
+        image: ghcr.io/llm-d/llm-d-rocm:v0.10.0
+        args:
+        - --kv-transfer-config.kv_connector=NixlConnector
+        - --kv-transfer-config.kv_role=kv_producer
+        env:
+        # Defaults to localhost. Prefill binds its NIXL handshake listener to
+        # it and hands it to decode as the address to connect to.
+        - name: VLLM_NIXL_SIDE_CHANNEL_HOST
+          valueFrom:
+            fieldRef:
+              fieldPath: status.podIP
+        # vLLM closes idle connections after 5 s, but the decode pod's routing
+        # sidecar reuses them for up to 90 s. A request that races the close
+        # fails with HTTP 502.
+        - name: VLLM_HTTP_TIMEOUT_KEEP_ALIVE
+          value: "120"
+        # ports:
+        # - name: nixl
+        #   containerPort: 5600
+        #   protocol: TCP
+        resources:
+          requests:
+            amd.com/gpu: "1"
+            cpu: "8"
+            memory: 16Gi
+          limits:
+            amd.com/gpu: "1"
+            memory: 32Gi
+        securityContext:
+          runAsNonRoot: false
+          # capabilities:
+          #   add: ["IPC_LOCK"]
