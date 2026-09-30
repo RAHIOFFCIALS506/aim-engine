@@ -41,8 +41,11 @@ jobs:
 
       # Runner instances share a home directory. Concurrent cache restores must
       # not overwrite the mise executable or tools another job is using.
+      # Start from an empty folder: the runner's own _temp cleanup stops at the
+      # first entry it cannot delete and can leave a partial mise tree behind.
       - name: Isolate mise state
         run: |
+          rm -rf "${RUNNER_TEMP}/mise"
           echo "MISE_DATA_DIR=${RUNNER_TEMP}/mise/data" >> "$GITHUB_ENV"
           echo "MISE_CACHE_DIR=${RUNNER_TEMP}/mise/cache" >> "$GITHUB_ENV"
           echo "MISE_CONFIG_DIR=${RUNNER_TEMP}/mise/config" >> "$GITHUB_ENV"
@@ -170,8 +173,10 @@ jobs:
 
       # Keep the matrix legs (and other workflows on this host) from restoring
       # their mise caches over the same executable and tool installations.
+      # Start from an empty folder, as in test-unit.
       - name: Isolate mise state
         run: |
+          rm -rf "${RUNNER_TEMP}/mise"
           echo "MISE_DATA_DIR=${RUNNER_TEMP}/mise/data" >> "$GITHUB_ENV"
           echo "MISE_CACHE_DIR=${RUNNER_TEMP}/mise/cache" >> "$GITHUB_ENV"
           echo "MISE_CONFIG_DIR=${RUNNER_TEMP}/mise/config" >> "$GITHUB_ENV"

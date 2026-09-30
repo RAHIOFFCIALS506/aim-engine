@@ -554,9 +554,26 @@ jobs:
           echo "Disk:"
           df -h /
 
+      # Runner instances share a home directory. Concurrent cache restores must
+      # not overwrite the mise executable or tools another job is using.
+      # Start from an empty folder: the runner's own _temp cleanup stops at the
+      # first entry it cannot delete and can leave a partial mise tree behind.
+      - name: Isolate mise state
+        run: |
+          rm -rf "${RUNNER_TEMP}/mise"
+          echo "MISE_DATA_DIR=${RUNNER_TEMP}/mise/data" >> "$GITHUB_ENV"
+          echo "MISE_CACHE_DIR=${RUNNER_TEMP}/mise/cache" >> "$GITHUB_ENV"
+          echo "MISE_CONFIG_DIR=${RUNNER_TEMP}/mise/config" >> "$GITHUB_ENV"
+
       - name: Setup mise
         uses: jdx/mise-action@v2
+        with:
+          # Separate from the test workflows' prefix: this job also installs the
+          # mise.local.toml tools, but the cache key hashes both files either way.
+          cache_key_prefix: mise-isolated-release-v1
         env:
+          # mise-action also unpacks its executable under os.tmpdir().
+          TMPDIR: ${{ runner.temp }}
           MISE_LOCAL_CONFIG_ALLOWED: "0"
 
       - name: Set per-run kubeconfig path
