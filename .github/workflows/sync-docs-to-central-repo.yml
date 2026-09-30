@@ -116,10 +116,9 @@ jobs:
           Automated documentation update synced from the aim-engine repository.
 
           > [!IMPORTANT]
-          > This branch is an automatically regenerated mirror of the upstream
-          > docs. A later sync run rebuilds it and force-pushes, so **commits
-          > added here are lost** (comments persist). Make content fixes in the
-          > upstream aim-engine repo, and do detailed line-by-line review there.
+          > A later sync force-pushes this branch, so **any commits added here
+          > will be lost**. PR comments persist, but make content fixes in the
+          > upstream aim-engine repo and do detailed line-by-line review there.
           EOF
             )
             gh pr create \
