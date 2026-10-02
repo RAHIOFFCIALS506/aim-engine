@@ -97,6 +97,19 @@ spec:
                   type: object
                   x-kubernetes-map-type: atomic
                 type: array
+              outputPolicy:
+                description: |-
+                  OutputPolicy controls whether profiles produced by this set may be used
+                  as sources for subsequent derivations.
+                properties:
+                  copyable:
+                    description: |-
+                      Copyable publishes derived profiles as eligible sources for subsequent
+                      profile derivations. It is disabled by default so each derivation boundary
+                      remains explicit. Disabling copyability, deleting the producer, or changing
+                      its selection can remove downstream derived profiles immediately.
+                    type: boolean
+                type: object
               overrides:
                 description: Overrides mutates the copied profile spec after selection
                   and version filtering.
