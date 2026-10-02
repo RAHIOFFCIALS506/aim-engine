@@ -1,6 +1,10 @@
 # Pull Request Review Guidelines
 
-This document is the canonical checklist for **reviewers** and **authors** evaluating pull requests in AIM Engine. It complements the author-facing checklist in [Coding Guidelines](coding-guidelines.md) with a deeper, production-oriented review lens.
+This document is the canonical checklist for **reviewers** and **authors** evaluating pull requests in AIM Engine. It complements the author-facing conventions in [Coding Guidelines](coding-guidelines.md) with a deeper, production-oriented review lens.
+
+Author conventions (naming, comments, docs/samples, phase discipline) live in Coding Guidelines and should be enforced here. Review-only concerns (scope, cross-layer completeness, upgrade safety, alternative designs) live only here.
+
+Agents helping with authorship or review should follow the condensed standards section in [`CLAUDE.md`](../../../CLAUDE.md) and the full docs linked from there.
 
 The goal of review is not to gatekeep style preferences. It is to ensure merged code is **correct**, **maintainable**, **observable in production**, and **safe to operate** for cluster administrators and downstream users.
 
@@ -11,6 +15,21 @@ The goal of review is not to gatekeep style preferences. It is to ensure merged 
 ### Optimize for production outcomes
 
 Ask: *What happens in a real cluster when this ships?* A change can pass unit tests and still be unsafe if it changes defaults silently, breaks upgrade paths, creates object churn, or leaves operators without documentation.
+
+### Consider simpler alternatives — without redesigning the PR
+
+Reviewers **should** look for a meaningfully simpler or more direct solution the author may have missed. That is part of catching maintainability and operability debt early.
+
+Keep it productive:
+
+| Do | Don't |
+| -- | ----- |
+| Raise a concrete alternative when it removes a layer, shrinks the API surface, reuses an existing helper, or avoids a production hazard | Redesign the PR for taste ("I'd have structured the packages differently") |
+| Frame as a **Question** or **Important** with a short sketch of the alternative and why it is better | Block solely because another approach exists |
+| Accept the author's approach when they give a reasoned trade-off (time, migration cost, consistency with nearby code) | Relitigate settled ADRs without new evidence |
+| Escalate to **Blocker** only when the chosen design is incorrect, unsafe, or creates clear future pain that a small change would avoid | Turn every review into an architecture committee |
+
+Missed simpler approaches are important; open-ended redesign is counter-productive. Prefer "could `FindReadyShared` return a typed stale error instead of failing Ready?" over "have you considered a different caching model?"
 
 ### Be specific and actionable
 
@@ -127,6 +146,7 @@ Flag when the same concept is named, defaulted, or documented differently across
 | Symptom | Example | Review action |
 | ------- | ------- | ------------- |
 | Terminology drift | "projection mode" vs "runtime mode" vs "eager mode" | Pick canonical term from ADR/docs; request alignment |
+| Overloaded bare terms | "runtime" / "profile" / "model" used for multiple concepts without qualification | Require disambiguation per [Coding Guidelines](coding-guidelines.md#disambiguate-overloaded-domain-terms) |
 | Default mismatch | Go constant `Both`, Helm value `Exhaustive`, docs say Exhaustive | Block until unified or explicitly documented |
 | Duplicate logic | Same validation in webhook, reconcile, and Helm template | Prefer single source of truth (CEL/API markers or shared Go helper) |
 | Parallel test stories | Unit test asserts X; e2e asserts Y; docs describe Z | Require one authoritative behavior statement |
@@ -136,7 +156,13 @@ Flag when the same concept is named, defaulted, or documented differently across
 
 ## Step 3: Code and architecture
 
-Follow [Coding Guidelines](coding-guidelines.md) and [Controller Patterns](controller-patterns.md). Reviewers should enforce phase discipline and naming clarity.
+Follow [Coding Guidelines](coding-guidelines.md) and [Controller Patterns](controller-patterns.md). Reviewers should enforce phase discipline, naming clarity, and comment quality.
+
+### Design fitness (including missed alternatives)
+
+- [ ] The approach matches existing controller / domain patterns unless the PR justifies a deliberate departure.
+- [ ] No new abstraction, interface, or config knob without a second real use case (see Coding Guidelines "Keep it simple").
+- [ ] If a simpler local alternative is obvious (reuse helper, typed error, smaller API), raise it — see [Consider simpler alternatives](#consider-simpler-alternatives--without-redesigning-the-pr).
 
 ### Controller and domain logic
 
@@ -146,6 +172,11 @@ Follow [Coding Guidelines](coding-guidelines.md) and [Controller Patterns](contr
 - [ ] Errors wrapped with context; permanent user errors do not infinite-requeue.
 - [ ] Conditions use stable `Reason` values and actionable `Message` text.
 - [ ] `Ready` reflects actual usability, not merely "reconcile finished".
+
+### Naming and comments
+
+- [ ] Overloaded domain terms are qualified (`KServe ServingRuntime` vs `AIMRuntimeConfig`, etc.).
+- [ ] Comments explain current behavior and non-obvious implications — not debugging history or discarded approaches ([Coding Guidelines](coding-guidelines.md#comments)).
 
 ### API design
 
@@ -216,12 +247,14 @@ There is no fixed coverage percentage, but **behavior changes without tests** re
 - [ ] Generated reference docs updated via generators, not hand-edited copies.
 - [ ] Samples and doc examples copy-paste cleanly (valid YAML, correct apiVersion).
 - [ ] Migration window / upgrading docs updated when dispatch rules, annotations, or defaults change.
+- [ ] **Docs and samples stand alone** — no references to internal registries, proprietary label namespaces, or closed-source tooling an external contributor cannot resolve ([Coding Guidelines](coding-guidelines.md#docs-and-samples-must-stand-alone)). Internal-only install notes, if any, are isolated and labeled.
 
 ### Documentation quality bar
 
 - Explains **why** an operator would choose a setting, not only what it does.
 - Callouts for breaking or behavior-changing defaults.
 - Links to canonical sections (avoid duplicating dispatch tables that live in [Upgrading](../admin/upgrading.md)).
+- Overloaded terms are qualified the same way as in code.
 
 ---
 
@@ -303,6 +336,9 @@ Post a structured summary so authors and future readers know the merge bar:
 ### Important (non-blocking if agreed)
 - …
 
+### Alternative approaches considered
+- … (or "none — approach fits existing patterns")
+
 ### Test coverage notes
 - …
 
@@ -323,6 +359,11 @@ Post a structured summary so authors and future readers know the merge bar:
 | Correctness bug or data loss risk | **Block** |
 | Missing test for new behavior | **Block** (or agree on immediate follow-up issue for tiny hotfix exceptions) |
 | Default change without upgrade note | **Block** or **Important** depending on impact |
+| Docs/samples leak internal-only registries or tooling | **Block** or **Important** |
+| Ambiguous overloaded term in user-facing docs or API comments | **Important** |
+| Comment is a process diary / discarded-alternative narrative | **Important** (or **Nit** if tiny) |
+| Clearer local alternative author may have missed | **Question** or **Important**; **Block** only if current design is unsafe/incorrect |
+| Open-ended redesign preference | Abstain or **Nit** |
 | Stale doc in unrelated file | **Nit** or **Important** if misleading for the changed feature |
 | Style preference outside guidelines | **Nit** or abstain |
 | Large PR with good code but high review risk | Request split |
@@ -342,6 +383,7 @@ Authors should:
 2. Push fix commits or rebase cleanly; avoid force-push that drops review context without notice.
 3. Update the PR description if scope or behavior changed during review.
 4. Re-request review only after CI is green and requested changes addressed.
+5. When an alternative is raised: either adopt it, or briefly record why the current approach is preferred (consistency, migration cost, ADR).
 
 Reviewers should re-review **delta** after updates, but re-check blockers and production-readiness items in full.
 
@@ -354,6 +396,7 @@ These areas have historically high coupling and deserve extra scrutiny:
 ### Runtime projection (v1alpha2)
 
 - Projection mode (`Exhaustive` / `Reduced` / `Both`) must stay consistent across: Go default, Helm value, operator flag, CI matrix, e2e smokes, and [ADR 0008](../../adr/0008-runtime-projection-from-profiles.md).
+- Qualify "runtime" carefully: projected `ServingRuntime` objects vs `AIMRuntimeConfig` vs reconcile behavior.
 - `autoSelect` semantics: all projected runtimes keep `autoSelect: false` — flag doc/table drift.
 - Lazy vs eager projection: mode-governed vs always-on paths must not be conflated in docs or tests.
 
@@ -378,9 +421,10 @@ These areas have historically high coupling and deserve extra scrutiny:
 
 ## Related documentation
 
-- [Coding Guidelines](coding-guidelines.md) — Author checklist and day-to-day conventions
+- [Coding Guidelines](coding-guidelines.md) — Author checklist and day-to-day conventions (terminology, comments, standalone docs)
 - [Controller Patterns](controller-patterns.md) — Reconciliation pipeline
 - [Testing](testing.md) — Unit and Chainsaw e2e conventions
 - [Observation Design](observation-design.md) — Fetch/observation structs
 - [Release Process](release-process.md) — Changelog and tagging
 - [Upgrading](../admin/upgrading.md) — Production upgrade and migration window
+- [`CLAUDE.md`](../../../CLAUDE.md) — Agent-facing condensed standards
