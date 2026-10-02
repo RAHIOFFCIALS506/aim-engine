@@ -24,11 +24,15 @@ package controller
 
 import (
 	"context"
+	"errors"
+	"slices"
 	"strings"
 	"testing"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -40,6 +44,8 @@ import (
 	servicepolicy "github.com/amd-enterprise-ai/aim-engine/internal/aimservice"
 	"github.com/amd-enterprise-ai/aim-engine/internal/constants"
 )
+
+const dispatchTestModelName = "model"
 
 func TestSelectPipeline(t *testing.T) {
 	const (
@@ -220,7 +226,7 @@ func TestCanonicalAIMServiceStatusWriterUsesV1Alpha2(t *testing.T) {
 }
 
 func TestAIMServiceReconcilerPersistsTransitionBeforeDispatch(t *testing.T) {
-	modelName := "model"
+	modelName := dispatchTestModelName
 	tests := []struct {
 		name               string
 		service            *aimv1alpha2.AIMService
@@ -245,7 +251,7 @@ func TestAIMServiceReconcilerPersistsTransitionBeforeDispatch(t *testing.T) {
 						{Type: "TemplateReady", Status: metav1.ConditionTrue},
 						{Type: "InferenceServiceReady", Status: metav1.ConditionTrue},
 					},
-					ResolvedModel:    &aimv1alpha1.AIMResolvedReference{Name: "model"},
+					ResolvedModel:    &aimv1alpha1.AIMResolvedReference{Name: dispatchTestModelName},
 					ResolvedTemplate: &aimv1alpha1.AIMResolvedReference{Name: "template"},
 					Cache: &aimv1alpha1.AIMServiceCacheStatus{
 						TemplateCacheRef: &aimv1alpha1.AIMResolvedReference{Name: "template-cache"},
@@ -362,8 +368,175 @@ func TestAIMServiceReconcilerPersistsTransitionBeforeDispatch(t *testing.T) {
 	}
 }
 
+type statusWriterClient struct {
+	client.Client
+	writer client.StatusWriter
+}
+
+func (c *statusWriterClient) Status() client.StatusWriter {
+	return c.writer
+}
+
+type notFoundReader struct {
+	client.Reader
+}
+
+func (r *notFoundReader) Get(
+	_ context.Context,
+	key client.ObjectKey,
+	_ client.Object,
+	_ ...client.GetOption,
+) error {
+	return apierrors.NewNotFound(
+		schema.GroupResource{Group: aimv1alpha2.GroupVersion.Group, Resource: "aimservices"},
+		key.Name,
+	)
+}
+
+type metadataRacingStatusWriter struct {
+	client.StatusWriter
+	client client.Client
+	key    client.ObjectKey
+	calls  int
+}
+
+func (w *metadataRacingStatusWriter) Update(
+	ctx context.Context,
+	obj client.Object,
+	opts ...client.SubResourceUpdateOption,
+) error {
+	w.calls++
+	if w.calls == 1 {
+		var latest aimv1alpha2.AIMService
+		if err := w.client.Get(ctx, w.key, &latest); err != nil {
+			return err
+		}
+		latest.Annotations["airm.silogen.ai/auto-discovered"] = "true"
+		latest.Finalizers = append(latest.Finalizers, "airm.silogen.ai/workloads-finalizer")
+		if err := w.client.Update(ctx, &latest); err != nil {
+			return err
+		}
+		return apierrors.NewConflict(
+			schema.GroupResource{Group: aimv1alpha2.GroupVersion.Group, Resource: "aimservices"},
+			obj.GetName(),
+			errors.New("AIWB metadata update raced pipeline status initialization"),
+		)
+	}
+	return w.StatusWriter.Update(ctx, obj, opts...)
+}
+
+func TestAIMServiceReconcilerRetriesPipelineStatusAfterMetadataRace(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := aimv1alpha2.AddToScheme(scheme); err != nil {
+		t.Fatalf("register v1alpha2: %v", err)
+	}
+	modelName := dispatchTestModelName
+	service := &aimv1alpha2.AIMService{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "metadata-race",
+			Namespace:  "default",
+			Finalizers: []string{finalizerCacheCleanup},
+			Annotations: map[string]string{
+				constants.AnnotationReconcilerPipeline: constants.ReconcilerPipelineProfile,
+			},
+		},
+		Spec: aimv1alpha1.AIMServiceSpec{
+			Model: &aimv1alpha1.AIMServiceModel{Name: &modelName},
+		},
+	}
+	baseClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&aimv1alpha2.AIMService{}).
+		WithObjects(service).
+		Build()
+	key := client.ObjectKeyFromObject(service)
+	racingWriter := &metadataRacingStatusWriter{
+		StatusWriter: baseClient.Status(),
+		client:       baseClient,
+		key:          key,
+	}
+	reconciler := &AIMServiceReconciler{
+		Client:           &statusWriterClient{Client: baseClient, writer: racingWriter},
+		templatePipeline: &recordingServicePipeline{},
+		profilePipeline:  &recordingServicePipeline{},
+	}
+
+	result, err := reconciler.Reconcile(
+		context.Background(),
+		ctrl.Request{NamespacedName: key},
+	)
+	if err != nil {
+		t.Fatalf("Reconcile() error = %v, want metadata conflict retried", err)
+	}
+	if result == (ctrl.Result{}) {
+		t.Fatal("pipeline initialization did not request follow-up reconciliation")
+	}
+	if racingWriter.calls != 2 {
+		t.Fatalf("status update calls = %d, want conflict plus successful retry", racingWriter.calls)
+	}
+
+	var updated aimv1alpha2.AIMService
+	if err := baseClient.Get(context.Background(), key, &updated); err != nil {
+		t.Fatalf("get updated service: %v", err)
+	}
+	if updated.Status.ReconcilerPipeline != constants.ReconcilerPipelineProfile {
+		t.Fatalf(
+			"ReconcilerPipeline = %q, want %q",
+			updated.Status.ReconcilerPipeline,
+			constants.ReconcilerPipelineProfile,
+		)
+	}
+	if updated.Annotations["airm.silogen.ai/auto-discovered"] != "true" ||
+		!slices.Contains(updated.Finalizers, "airm.silogen.ai/workloads-finalizer") {
+		t.Fatalf("AIWB metadata was lost: annotations=%v finalizers=%v", updated.Annotations, updated.Finalizers)
+	}
+}
+
+func TestAIMServiceReconcilerIgnoresDeletionBeforePipelineStatusInitialization(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := aimv1alpha2.AddToScheme(scheme); err != nil {
+		t.Fatalf("register v1alpha2: %v", err)
+	}
+	modelName := dispatchTestModelName
+	service := &aimv1alpha2.AIMService{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "deleted-before-status",
+			Namespace:  "default",
+			Finalizers: []string{finalizerCacheCleanup},
+			Annotations: map[string]string{
+				constants.AnnotationReconcilerPipeline: constants.ReconcilerPipelineProfile,
+			},
+		},
+		Spec: aimv1alpha1.AIMServiceSpec{
+			Model: &aimv1alpha1.AIMServiceModel{Name: &modelName},
+		},
+	}
+	baseClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&aimv1alpha2.AIMService{}).
+		WithObjects(service).
+		Build()
+	reconciler := &AIMServiceReconciler{
+		Client:           baseClient,
+		APIReader:        &notFoundReader{Reader: baseClient},
+		templatePipeline: &recordingServicePipeline{},
+		profilePipeline:  &recordingServicePipeline{},
+	}
+
+	result, err := reconciler.Reconcile(
+		context.Background(),
+		ctrl.Request{NamespacedName: client.ObjectKeyFromObject(service)},
+	)
+	if err != nil {
+		t.Fatalf("Reconcile() error = %v, want deleted service ignored", err)
+	}
+	if result != (ctrl.Result{}) {
+		t.Fatalf("Reconcile() result = %+v, want no requeue for deleted service", result)
+	}
+}
+
 func TestAIMServiceReconcilerGrandfatheredMarkersRemainOperational(t *testing.T) {
-	modelName := "model"
+	modelName := dispatchTestModelName
 	tests := []struct {
 		name         string
 		marker       string

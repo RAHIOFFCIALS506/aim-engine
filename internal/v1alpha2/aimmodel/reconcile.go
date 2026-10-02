@@ -31,6 +31,7 @@ import (
 
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -358,6 +359,7 @@ func (r *ModelReconciler) ComposeState(
 					obs.DesiredProfiles, obs.BuildErr = buildDesiredOfficialProfiles(
 						fetch.model, catalog, fetch.nodes.Value,
 						recommendedDeploymentsFrom(legacyMetadata),
+						fetch.existingProfiles.Value...,
 					)
 					desiredProfilesKnown = obs.BuildErr == nil
 				}
@@ -399,7 +401,7 @@ func (r *ModelReconciler) ComposeState(
 		obs.ManagedProfiles,
 			obs.ExistingDesiredCount,
 			obs.ProfileSetCurrent,
-			obs.ProfileSetStatus = observedNamespaceProfileSet(fetch.childProfileSet)
+			obs.ProfileSetStatus = observedNamespaceProfileSet(fetch.childProfileSet, obs.DesiredProfileSet, fetch.model)
 	} else if fetch.existingProfiles.OK() {
 		obs.ManagedProfiles, obs.ExistingDesiredCount = summarizeManagedProfiles(obs.DesiredProfiles, fetch.existingProfiles.Value)
 	}
@@ -412,6 +414,7 @@ func (r *ModelReconciler) ComposeState(
 		obs.ProfileSetStatus,
 		obs.ManagedProfiles,
 	)
+	preserveCopyability(obs.DesiredProfiles, fetch.existingProfiles.Value)
 	obs.componentHealth = buildModelComponentHealth(obs)
 	if obs.legacyObservation != nil {
 		obs.componentHealth = append(obs.componentHealth, obs.legacyObservation.GetComponentHealth()...)
@@ -494,7 +497,8 @@ func (r *ModelReconciler) PlanResources(
 			}
 		}
 	}
-	if derivation == nil && obs.childProfileSet.OK() && obs.childProfileSet.Value != nil {
+	if derivation == nil && obs.childProfileSet.OK() && obs.childProfileSet.Value != nil &&
+		metav1.IsControlledBy(obs.childProfileSet.Value, obs.model) {
 		plan.Delete(obs.childProfileSet.Value)
 	}
 	return plan
@@ -603,6 +607,7 @@ func profileInventoryReadError(
 func observedProfileSet(
 	profileSet client.Object,
 	status aimv1alpha1.AIMProfileSetStatus,
+	matchesDesired bool,
 ) (
 	aimv1alpha1.ManagedProfileCounts,
 	int32,
@@ -612,7 +617,7 @@ func observedProfileSet(
 	if profileSet == nil {
 		return aimv1alpha1.ManagedProfileCounts{}, 0, false, ""
 	}
-	current := profileSetStatusCurrent(profileSet, status)
+	current := matchesDesired && profileSetStatusCurrent(profileSet, status)
 	if !current {
 		return aimv1alpha1.ManagedProfileCounts{}, 1, false, status.Status
 	}
@@ -621,6 +626,8 @@ func observedProfileSet(
 
 func observedNamespaceProfileSet(
 	result controllerutils.FetchResult[*aimv1alpha2.AIMProfileSet],
+	desired *aimv1alpha2.AIMProfileSet,
+	model *aimv1alpha2.AIMModel,
 ) (
 	aimv1alpha1.ManagedProfileCounts,
 	int32,
@@ -630,11 +637,16 @@ func observedNamespaceProfileSet(
 	if !result.OK() || result.Value == nil {
 		return aimv1alpha1.ManagedProfileCounts{}, 0, false, ""
 	}
-	return observedProfileSet(result.Value, result.Value.Status)
+	matchesDesired := desired != nil &&
+		metav1.IsControlledBy(result.Value, model) &&
+		profileSetSpecsEqual(result.Value.Spec, desired.Spec)
+	return observedProfileSet(result.Value, result.Value.Status, matchesDesired)
 }
 
 func observedClusterProfileSet(
 	result controllerutils.FetchResult[*aimv1alpha2.AIMClusterProfileSet],
+	desired *aimv1alpha2.AIMClusterProfileSet,
+	model *aimv1alpha2.AIMClusterModel,
 ) (
 	aimv1alpha1.ManagedProfileCounts,
 	int32,
@@ -644,7 +656,30 @@ func observedClusterProfileSet(
 	if !result.OK() || result.Value == nil {
 		return aimv1alpha1.ManagedProfileCounts{}, 0, false, ""
 	}
-	return observedProfileSet(result.Value, result.Value.Status)
+	matchesDesired := desired != nil &&
+		metav1.IsControlledBy(result.Value, model) &&
+		profileSetSpecsEqual(result.Value.Spec, desired.Spec)
+	return observedProfileSet(result.Value, result.Value.Status, matchesDesired)
+}
+
+func profileSetSpecsEqual(left, right aimv1alpha1.AIMProfileSetSpec) bool {
+	// A child can have current status for its own generation while still
+	// reflecting an older parent request. Compare desired specs, accounting for
+	// admission defaults without mutating the cached objects.
+	normalize := func(spec aimv1alpha1.AIMProfileSetSpec) *aimv1alpha1.AIMProfileSetSpec {
+		out := spec.DeepCopy()
+		if out.VersionPolicy == "" {
+			out.VersionPolicy = aimv1alpha1.ProfileVersionPolicyPinned
+		}
+		if out.Selector.Role == "" {
+			out.Selector.Role = aimv1alpha1.ProfileSelectorRoleDeployable
+		}
+		if out.Selector.ModelRef != nil && out.Selector.ModelRef.Scope == "" {
+			out.Selector.ModelRef.Scope = aimv1alpha1.ProfileSelectorScopeAuto
+		}
+		return out
+	}
+	return equality.Semantic.DeepEqual(normalize(left), normalize(right))
 }
 
 func profilePruneSafe(
@@ -661,15 +696,20 @@ func profilePruneSafe(
 	if !derivation {
 		return true
 	}
+	// Availability needs one ready alternative; deleting predecessor profiles
+	// still requires the complete current replacement set to be ready.
 	return profileSetCurrent &&
 		profileSetStatus == constants.AIMStatusReady &&
 		managedProfiles.Total > 0 &&
 		managedProfiles.Ready == managedProfiles.Total
 }
 
-func classifyProfileSetTerminalStatus(status constants.AIMStatus) (reason, message string, terminal bool) {
+func classifyProfileSetTerminalStatus(status constants.AIMStatus, total int32) (reason, message string, terminal bool) {
 	switch status {
 	case constants.AIMStatusNotAvailable:
+		if total == 0 {
+			return "NoMatchingProfiles", "No source profiles match the model's profile selection", true
+		}
 		return "ManagedProfilesNotAvailable", "No ready derived profiles available for this model", true
 	case constants.AIMStatusDegraded:
 		return "ManagedProfilesDegraded", "Managed profile set is degraded", true
@@ -789,7 +829,7 @@ func buildModelComponentHealth(obs ModelObservation) []controllerutils.Component
 			})
 			return health
 		}
-		if reason, message, terminal := classifyProfileSetTerminalStatus(obs.ProfileSetStatus); terminal {
+		if reason, message, terminal := classifyProfileSetTerminalStatus(obs.ProfileSetStatus, obs.ManagedProfiles.Total); terminal {
 			health = append(health, controllerutils.ComponentHealth{
 				Component: componentProfileSet,
 				State:     obs.ProfileSetStatus,
@@ -818,9 +858,9 @@ func buildModelComponentHealth(obs ModelObservation) []controllerutils.Component
 		if obs.ManagedProfiles.Ready > 0 {
 			health = append(health, controllerutils.ComponentHealth{
 				Component: componentProfileSet,
-				State:     constants.AIMStatusDegraded,
+				State:     constants.AIMStatusReady,
 				Reason:    "ManagedProfilesPartiallyReady",
-				Message:   "Some derived profiles are ready, but others are not available",
+				Message:   fmt.Sprintf("%d of %d derived profiles are ready; inspect individual profiles for remaining alternatives", obs.ManagedProfiles.Ready, obs.ManagedProfiles.Total),
 			})
 			return health
 		}
@@ -1172,18 +1212,24 @@ func buildDesiredOfficialProfiles(
 	catalog aimprofile.DiscoveryCatalog,
 	nodes []corev1.Node,
 	recommendedDeployments []aimv1alpha1.RecommendedDeployment,
+	existing ...managedProfile,
 ) ([]desiredProfile, error) {
 	desired := make([]desiredProfile, 0, len(catalog.Profiles))
+	optedOut := ownedCopyabilityOptOuts(model, existing)
 	for _, entry := range catalog.Profiles {
-		if !isSupportedProfile(entry.Spec, nodes) {
-			continue
-		}
 		name, err := utils.GenerateDerivedName(
 			[]string{model.Name, entry.Spec.ProfileId},
 			utils.WithHashSource(model.Name, entry.Spec.ProfileId),
 		)
 		if err != nil {
 			return nil, fmt.Errorf("generate discovered profile name: %w", err)
+		}
+		// The user-owned opt-out lives on this profile. Retain that small
+		// policy-bearing object when hardware disappears, rather than
+		// publishing its catalog definition again. Removed catalog entries
+		// still disappear normally because they never enter this loop.
+		if !isSupportedProfile(entry.Spec, nodes) && !optedOut[name] {
+			continue
 		}
 		profile := &aimv1alpha2.AIMProfile{}
 		profile.Namespace = model.Namespace
@@ -1196,6 +1242,10 @@ func buildDesiredOfficialProfiles(
 			annotationBaseImage:      entry.BaseImage,
 		}, aimprofile.ProfileSourceImage), true)
 		profile.Annotations = profileyaml.Mark(profile.Annotations, entry.YAMLContract)
+		group := CatalogSourceGroup("AIMModel", model.Namespace, model.Name, string(model.UID))
+		profile.Annotations[aimprofile.AnnotationSourceGroup] = group
+		profile.Annotations[aimprofile.AnnotationSourceID] = group + "/" + entry.RelPath
+		profile.Annotations[aimprofile.AnnotationLegacyCatalogNaming] = "true"
 		// Image-discovery profiles are always `discovered`; the role label
 		// reflects structural classification of the catalog entry:
 		// deployable when the spec carries identity (aimId + modelSources),
@@ -1213,9 +1263,6 @@ func buildDesiredOfficialProfiles(
 				Namespace: model.Namespace,
 			},
 		)
-		spec := *entry.Spec.DeepCopy()
-		spec.ImagePullSecrets = copyPullSecrets(model.Spec.ImagePullSecrets)
-		spec.ServiceAccountName = model.Spec.ServiceAccountName
 		// Recommended-deployment fallback for the v1alpha2 → in-image
 		// `primary` migration. Newer images stamp `metadata.primary`
 		// directly in the per-profile YAML, in which case the catalog
@@ -1227,10 +1274,8 @@ func buildDesiredOfficialProfiles(
 		// `spec.model.name` shortcut still resolves to a sensible
 		// candidate without forcing every operator to upgrade their image
 		// inventory in lockstep with the operator.
-		if !entry.PrimaryExplicit {
-			spec.Primary = matchesRecommendedDeployment(spec, recommendedDeployments)
-		}
-		profile.Spec = aimv1alpha2.AIMProfileSpec{AIMProfileSpecCommon: spec}
+		spec := CatalogProfileSpec(entry, &model.Spec, recommendedDeployments)
+		profile.Spec = aimv1alpha2.AIMProfileSpec{AIMProfileSpecCommon: *spec.DeepCopy()}
 		desired = append(desired, desiredProfile{Object: profile})
 	}
 	return desired, nil
@@ -1401,15 +1446,6 @@ func listManagedClusterProfiles(ctx context.Context, c client.Client, modelUID s
 		})
 	}
 	return profiles, nil
-}
-
-func copyPullSecrets(in []corev1.LocalObjectReference) []corev1.LocalObjectReference {
-	if len(in) == 0 {
-		return nil
-	}
-	out := make([]corev1.LocalObjectReference, len(in))
-	copy(out, in)
-	return out
 }
 
 func firstNonEmpty(values ...string) string {
