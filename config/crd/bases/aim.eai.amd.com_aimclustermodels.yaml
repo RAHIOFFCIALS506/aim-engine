@@ -602,8 +602,7 @@ spec:
                         description: |-
                           Copyable publishes derived profiles as eligible sources for subsequent
                           profile derivations. It is disabled by default so each derivation boundary
-                          remains explicit. Disabling copyability, deleting the producer, or changing
-                          its selection can remove downstream derived profiles immediately.
+                          remains explicit.
                         type: boolean
                     type: object
                   overrides:
@@ -1880,8 +1879,7 @@ spec:
                         description: |-
                           Copyable publishes derived profiles as eligible sources for subsequent
                           profile derivations. It is disabled by default so each derivation boundary
-                          remains explicit. Disabling copyability, deleting the producer, or changing
-                          its selection can remove downstream derived profiles immediately.
+                          remains explicit.
                         type: boolean
                     type: object
                   overrides:
@@ -2707,8 +2705,7 @@ spec:
                         description: |-
                           Copyable publishes derived profiles as eligible sources for subsequent
                           profile derivations. It is disabled by default so each derivation boundary
-                          remains explicit. Disabling copyability, deleting the producer, or changing
-                          its selection can remove downstream derived profiles immediately.
+                          remains explicit.
                         type: boolean
                     type: object
                   overrides:
@@ -4600,8 +4597,7 @@ spec:
                         description: |-
                           Copyable publishes derived profiles as eligible sources for subsequent
                           profile derivations. It is disabled by default so each derivation boundary
-                          remains explicit. Disabling copyability, deleting the producer, or changing
-                          its selection can remove downstream derived profiles immediately.
+                          remains explicit.
                         type: boolean
                     type: object
                   overrides:
@@ -5878,8 +5874,7 @@ spec:
                         description: |-
                           Copyable publishes derived profiles as eligible sources for subsequent
                           profile derivations. It is disabled by default so each derivation boundary
-                          remains explicit. Disabling copyability, deleting the producer, or changing
-                          its selection can remove downstream derived profiles immediately.
+                          remains explicit.
                         type: boolean
                     type: object
                   overrides:
@@ -6705,8 +6700,7 @@ spec:
                         description: |-
                           Copyable publishes derived profiles as eligible sources for subsequent
                           profile derivations. It is disabled by default so each derivation boundary
-                          remains explicit. Disabling copyability, deleting the producer, or changing
-                          its selection can remove downstream derived profiles immediately.
+                          remains explicit.
                         type: boolean
                     type: object
                   overrides:
