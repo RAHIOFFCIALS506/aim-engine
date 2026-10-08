@@ -27,3 +27,10 @@ jobs:
 
       - name: Run linter
         run: golangci-lint run
+
+      - name: Check CRDs Helm release Secret size
+        run: |
+          # Shallow PR checkouts have no tags, so the Makefile's git-describe
+          # CHART_VERSION is empty and helm package rejects the chart.
+          make crds-package CHART_VERSION=0.0.0 APP_VERSION=0.0.0
+          bash hack/check-crds-helm-secret-size.sh dist/crds-chart
