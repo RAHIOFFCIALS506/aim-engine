@@ -123,14 +123,6 @@ func (r *imageResolver) Resolve(ctx context.Context, match TemplateMatchResult) 
 			return "", fmt.Errorf("source owner %s/%s has no baseImageRef and no semver tag to fall back to",
 				match.OwnerNamespace, match.Spec.ModelName)
 		}
-	} else {
-		// Normalise AIM_BASE_IMAGE_REF tags to MAJOR.MINOR (e.g.
-		// `aim-base:0.11-rc21` → `aim-base:0.11`). Build pipelines bake
-		// release-candidate tags into the image but the deployable
-		// aim-base image is always tagged with its MAJOR.MINOR rolling
-		// tag; without this rewrite the rebased reference points at a
-		// non-existent registry coordinate.
-		baseRef = aimimage.NormalizeBaseImageTag(baseRef)
 	}
 
 	return aimimage.RebaseRegistry(owner.specImage, baseRef), nil

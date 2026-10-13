@@ -90,84 +90,6 @@ func TestRebaseRegistry(t *testing.T) {
 	}
 }
 
-func TestNormalizeBaseImageTag(t *testing.T) {
-	cases := []struct {
-		name         string
-		baseImageRef string
-		want         string
-	}{
-		{
-			name:         "release-candidate tag truncates to major.minor",
-			baseImageRef: "ghcr.io/silogen/aim-base:0.11-rc21",
-			want:         "ghcr.io/silogen/aim-base:0.11",
-		},
-		{
-			name:         "full semver tag truncates to major.minor",
-			baseImageRef: "ghcr.io/silogen/aim-base:0.11.2",
-			want:         "ghcr.io/silogen/aim-base:0.11",
-		},
-		{
-			name:         "major.minor tag is preserved",
-			baseImageRef: "ghcr.io/silogen/aim-base:0.11",
-			want:         "ghcr.io/silogen/aim-base:0.11",
-		},
-		{
-			name:         "v-prefixed semver tolerated",
-			baseImageRef: "ghcr.io/silogen/aim-base:v0.11.2",
-			want:         "ghcr.io/silogen/aim-base:0.11",
-		},
-		{
-			name:         "prerelease with full semver truncates",
-			baseImageRef: "ghcr.io/silogen/aim-base:0.11.0-rc1",
-			want:         "ghcr.io/silogen/aim-base:0.11",
-		},
-		{
-			name:         "non-semver tag left unchanged",
-			baseImageRef: "ghcr.io/silogen/aim-base:latest",
-			want:         "ghcr.io/silogen/aim-base:latest",
-		},
-		{
-			name:         "no tag left unchanged",
-			baseImageRef: "ghcr.io/silogen/aim-base",
-			want:         "ghcr.io/silogen/aim-base",
-		},
-		{
-			name:         "trailing colon left unchanged",
-			baseImageRef: "ghcr.io/silogen/aim-base:",
-			want:         "ghcr.io/silogen/aim-base:",
-		},
-		{
-			name:         "registry port without tag left unchanged",
-			baseImageRef: "registry.local:5000/aim-base",
-			want:         "registry.local:5000/aim-base",
-		},
-		{
-			name:         "registry port with semver tag normalised",
-			baseImageRef: "registry.local:5000/aim-base:0.11-rc21",
-			want:         "registry.local:5000/aim-base:0.11",
-		},
-		{
-			name:         "untagged single-segment ref left unchanged",
-			baseImageRef: "aim-base",
-			want:         "aim-base",
-		},
-		{
-			name:         "tagged single-segment ref normalised",
-			baseImageRef: "aim-base:0.11-rc21",
-			want:         "aim-base:0.11",
-		},
-		{name: "empty ref returns empty", baseImageRef: "", want: ""},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			got := NormalizeBaseImageTag(tc.baseImageRef)
-			if got != tc.want {
-				t.Fatalf("NormalizeBaseImageTag(%q) = %q, want %q", tc.baseImageRef, got, tc.want)
-			}
-		})
-	}
-}
-
 func TestExtractTag(t *testing.T) {
 	cases := []struct {
 		name     string
@@ -183,11 +105,7 @@ func TestExtractTag(t *testing.T) {
 		{name: "empty input", imageRef: "", want: ""},
 		{name: "single-segment tagged", imageRef: "aim-base:0.11", want: "0.11"},
 		// Pre-release / build-metadata suffixes are preserved verbatim.
-		// ExtractTag is a pure slice and does NOT normalise the tag.
-		// Compare with NormalizeBaseImageTag (above) which intentionally
-		// truncates `:0.11.0-rc21` → `:0.11` for aim-base rebases — that
-		// truncation is a separate concern for base-image resolution and
-		// must NOT leak into the user-visible Version column.
+		// ExtractTag is a pure slice and does not interpret the tag.
 		{name: "rc suffix preserved", imageRef: "ghcr.io/silogen/aim-base:0.11-rc21", want: "0.11-rc21"},
 		{name: "full semver with rc preserved", imageRef: "ghcr.io/silogen/aim-base:0.11.0-rc1", want: "0.11.0-rc1"},
 		{name: "semver with build metadata preserved", imageRef: "ghcr.io/silogen/aim-base:0.11.0+build123", want: "0.11.0+build123"},

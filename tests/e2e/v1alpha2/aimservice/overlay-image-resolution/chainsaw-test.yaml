@@ -9,9 +9,9 @@
 #     discard the model optimizations and silently downgrade the deployment to
 #     the lean aim-base runtime.
 #   - Weights replaced (spec.profileOverrides.modelSources): RESOLVE back to
-#     the seed's aim-base runtime (status.baseImage, normalised to MAJOR.MINOR
-#     and rebased onto the seed image's registry+org) so the new weights are
-#     loaded onto a clean runtime.
+#     the seed's exact aim-base runtime reference (status.baseImage, rebased
+#     onto the seed image's registry+org) so the new weights are loaded onto
+#     a clean runtime.
 #
 # Frozen + node-independent: the seed status is hand-patched and only
 # spec.image of the resulting overlay is asserted, so this runs in kind

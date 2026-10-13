@@ -318,6 +318,7 @@ func buildDesiredNamespaceProfiles(set *aimv1alpha2.AIMProfileSet, candidates []
 			failures.add(source.SourceGroup, err)
 			continue
 		}
+		derivedBaseImage := aimprofile.ResolveDerivedProfileBaseImage(source.BaseImage, copiedSpec.Image, set.Spec.Image, set.Spec.Overrides)
 		profile := &aimv1alpha2.AIMProfile{}
 		profile.Namespace = set.Namespace
 		profile.Name = name
@@ -328,7 +329,7 @@ func buildDesiredNamespaceProfiles(set *aimv1alpha2.AIMProfileSet, candidates []
 			annotationProfileSetLineage:      appendProfileSetLineage(source.ProfileSetUIDs, string(set.UID)),
 			aimprofile.AnnotationSourceID:    source.SourceID,
 			aimprofile.AnnotationSourceGroup: source.SourceGroup,
-			aimprofile.AnnotationBaseImage:   source.BaseImage,
+			aimprofile.AnnotationBaseImage:   derivedBaseImage,
 		}, aimprofile.ProfileSourceCopy)
 		profile.Annotations = profileyaml.Mark(profile.Annotations, source.YAMLContract)
 		if set.Spec.OutputPolicy != nil && set.Spec.OutputPolicy.Copyable {
@@ -364,6 +365,7 @@ func buildDesiredClusterProfiles(set *aimv1alpha2.AIMClusterProfileSet, candidat
 			failures.add(source.SourceGroup, err)
 			continue
 		}
+		derivedBaseImage := aimprofile.ResolveDerivedProfileBaseImage(source.BaseImage, copiedSpec.Image, set.Spec.Image, set.Spec.Overrides)
 		profile := &aimv1alpha2.AIMClusterProfile{}
 		profile.Name = name
 		profile.Annotations = aimprofile.MarkProfileSource(map[string]string{
@@ -372,7 +374,7 @@ func buildDesiredClusterProfiles(set *aimv1alpha2.AIMClusterProfileSet, candidat
 			annotationProfileSetLineage:      appendProfileSetLineage(source.ProfileSetUIDs, string(set.UID)),
 			aimprofile.AnnotationSourceID:    source.SourceID,
 			aimprofile.AnnotationSourceGroup: source.SourceGroup,
-			aimprofile.AnnotationBaseImage:   source.BaseImage,
+			aimprofile.AnnotationBaseImage:   derivedBaseImage,
 		}, aimprofile.ProfileSourceCopy)
 		profile.Annotations = profileyaml.Mark(profile.Annotations, source.YAMLContract)
 		if set.Spec.OutputPolicy != nil && set.Spec.OutputPolicy.Copyable {

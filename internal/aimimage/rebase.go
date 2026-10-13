@@ -101,32 +101,6 @@ func LegacyBaseImageFromSource(sourceImage string) string {
 	return "aim-base:" + mm
 }
 
-// NormalizeBaseImageTag rewrites baseImageRef's tag to MAJOR.MINOR when the
-// tag parses as semver. This collapses release-candidate / patch tags
-// (e.g. `aim-base:0.11-rc21`, `aim-base:0.11.2`) onto the stable MAJOR.MINOR
-// tag aim-base actually publishes (e.g. `aim-base:0.11`).
-//
-// Applied to AIM_BASE_IMAGE_REF values extracted from the source image's OCI
-// config: build pipelines often stamp the in-progress release tag
-// (`0.11-rc21`), but the deployable aim-base image is always tagged with its
-// MAJOR.MINOR rolling tag. Truncating here makes downstream rebases produce
-// a tag that actually resolves in the registry.
-//
-// When baseImageRef has no tag, the tag isn't semver-parseable, or only the
-// registry port (`registry.local:5000/image`) looks like a tag, baseImageRef
-// is returned unchanged.
-func NormalizeBaseImageTag(baseImageRef string) string {
-	colon := tagColonIndex(baseImageRef)
-	if colon < 0 {
-		return baseImageRef
-	}
-	mm, ok := extractMajorMinor(baseImageRef[colon+1:])
-	if !ok {
-		return baseImageRef
-	}
-	return baseImageRef[:colon] + ":" + mm
-}
-
 // ExtractTag returns the tag substring of imageRef, or "" when imageRef
 // has no tag (either no `:`, the colon is the registry port separator,
 // or imageRef is a digest reference like `image@sha256:...`).
@@ -140,9 +114,7 @@ func NormalizeBaseImageTag(baseImageRef string) string {
 //	"registry.local:5000/image"       → ""  (registry port, not a tag)
 //
 // Use this as the "image version" source-of-truth for printcolumns and
-// status denormalisation. The companion `NormalizeBaseImageTag` above
-// truncates a SemVer-ish tag to MAJOR.MINOR; use that for rebase paths
-// that must match a stable rolling tag.
+// status denormalisation.
 func ExtractTag(imageRef string) string {
 	if strings.Contains(imageRef, "@sha256:") {
 		return ""

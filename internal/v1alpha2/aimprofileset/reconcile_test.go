@@ -537,6 +537,96 @@ func TestBuildDesiredProfiles_OutputPolicyMarksCopiesCopyable(t *testing.T) {
 	}
 }
 
+func TestBuildDesiredNamespaceProfiles_FineTuneOfCustomModelKeepsAIMRuntimeImage(t *testing.T) {
+	t.Parallel()
+
+	const (
+		aimRuntimeImage = "amdenterpriseai/aim-base:2026.11.0"
+		upstreamImage   = "docker.io/vllm/vllm-openai-rocm:v0.16.0"
+	)
+	baseProfile := aimprofile.ProfileCopyCandidate{
+		Name:         "mi350x-base",
+		SourceID:     "base-profile",
+		SourceGroup:  "base-model",
+		BaseImage:    upstreamImage,
+		YAMLContract: profileyaml.DefaultContract(),
+		Spec: aimv1alpha2.AIMProfileSpecCommon{
+			ProfileId:        "mi350x-tp1",
+			Image:            aimRuntimeImage,
+			Engine:           "vllm",
+			AcceleratorModel: "MI350X",
+			AcceleratorCount: 1,
+		},
+	}
+	customSet := &aimv1alpha2.AIMProfileSet{
+		ObjectMeta: metav1.ObjectMeta{Name: "custom-model-profiles", Namespace: "team-a", UID: "custom-set-uid"},
+		Spec: aimv1alpha1.AIMProfileSetSpec{
+			Selector: aimv1alpha1.ProfileSelector{
+				Engine: "vllm",
+				Role:   aimv1alpha1.ProfileSelectorRoleBase,
+			},
+			VersionPolicy: aimv1alpha1.ProfileVersionPolicyAll,
+			Overrides: &aimv1alpha1.ProfileOverrides{
+				AimId:   "acme/custom-model",
+				ModelId: "acme/custom-model",
+				ModelSources: []aimv1alpha1.AIMModelSource{{
+					ModelID:   "acme/custom-model",
+					SourceURI: "hf://acme/custom-model",
+				}},
+			},
+			OutputPolicy: &aimv1alpha1.ProfileOutputPolicy{Copyable: true},
+		},
+	}
+
+	customDesired, err := buildDesiredNamespaceProfiles(customSet, []aimprofile.ProfileCopyCandidate{baseProfile})
+	if err != nil {
+		t.Fatalf("build custom-model profile: %v", err)
+	}
+	if len(customDesired) != 1 {
+		t.Fatalf("custom-model profile count = %d, want 1", len(customDesired))
+	}
+	customProfile := customDesired[0].Object.(*aimv1alpha2.AIMProfile)
+	customCandidate := liveSourceCandidate(
+		customProfile,
+		customProfile.Spec.AIMProfileSpecCommon,
+		aimv1alpha2.AIMProfileStatus{},
+		"AIMProfile",
+	).ProfileCopyCandidate
+	customCandidate.YAMLContract = profileyaml.CanonicalContract(&customProfile.Spec.AIMProfileSpecCommon)
+
+	fineTuneSet := &aimv1alpha2.AIMProfileSet{
+		ObjectMeta: metav1.ObjectMeta{Name: "fine-tune-profiles", Namespace: "team-a", UID: "fine-tune-set-uid"},
+		Spec: aimv1alpha1.AIMProfileSetSpec{
+			Selector: aimv1alpha1.ProfileSelector{
+				AimId: "acme/custom-model",
+				Role:  aimv1alpha1.ProfileSelectorRoleDeployable,
+			},
+			VersionPolicy: aimv1alpha1.ProfileVersionPolicyAll,
+			Overrides: &aimv1alpha1.ProfileOverrides{
+				ModelSources: []aimv1alpha1.AIMModelSource{{
+					ModelID:   "acme/custom-model-fine-tune",
+					SourceURI: "s3://models/custom-model-fine-tune",
+				}},
+			},
+		},
+	}
+
+	fineTuneDesired, err := buildDesiredNamespaceProfiles(fineTuneSet, []aimprofile.ProfileCopyCandidate{customCandidate})
+	if err != nil {
+		t.Fatalf("build fine-tuned profile: %v", err)
+	}
+	if len(fineTuneDesired) != 1 {
+		t.Fatalf("fine-tuned profile count = %d, want 1", len(fineTuneDesired))
+	}
+	fineTuneProfile := fineTuneDesired[0].Object.(*aimv1alpha2.AIMProfile)
+	if got := fineTuneProfile.Spec.Image; got != aimRuntimeImage {
+		t.Fatalf("fine-tuned profile image = %q, want AIM runtime %q (must not descend to %q)", got, aimRuntimeImage, upstreamImage)
+	}
+	if got := fineTuneProfile.Annotations[aimprofile.AnnotationBaseImage]; got != aimRuntimeImage {
+		t.Fatalf("fine-tuned profile base image = %q, want reusable AIM runtime %q", got, aimRuntimeImage)
+	}
+}
+
 func TestComposeState_DistinguishesIneligibleProfilesFromNoMatch(t *testing.T) {
 	t.Parallel()
 

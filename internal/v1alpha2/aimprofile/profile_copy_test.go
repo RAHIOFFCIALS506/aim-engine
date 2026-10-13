@@ -435,11 +435,10 @@ func TestApplyProfileCopyOverrides_MergesAndReplaces(t *testing.T) {
 		t.Fatalf("ApplyProfileCopyOverrides() error = %v", err)
 	}
 
-	// Base image tag is normalised to MAJOR.MINOR (`0.9.1` → `0.9`) so the
-	// rebased reference points at the stable aim-base rolling tag that the
-	// registry actually publishes.
-	if spec.Image != "ghcr.io/amd/aim-base:0.9" {
-		t.Fatalf("Image = %q, want base image fallback normalised to MAJOR.MINOR", spec.Image)
+	// AIM_BASE_IMAGE_REF is a producer-owned reference. Rebase its
+	// registry+org while preserving the exact tag.
+	if spec.Image != "ghcr.io/amd/aim-base:0.9.1" {
+		t.Fatalf("Image = %q, want exact base image tag rebased onto the source registry", spec.Image)
 	}
 	if spec.ModelId != "custom/model" {
 		t.Fatalf("ModelId = %q, want overridden model source model ID", spec.ModelId)
@@ -696,31 +695,22 @@ func TestResolveDerivedProfileImage(t *testing.T) {
 			want:               "docker.io/amdenterpriseai/aim-base:0.11",
 		},
 		{
-			// Build pipelines stamp release-candidate tags into
-			// AIM_BASE_IMAGE_REF (`0.11-rc21`) but aim-base is published
-			// under its stable MAJOR.MINOR rolling tag. Normalisation
-			// strips the RC suffix so the rebased reference resolves in
-			// the mirrored registry.
-			name:               "deployable source + weights changed: rc-tagged sourceBaseImage truncates to major.minor",
+			name:               "deployable source + weights changed: rc-tagged sourceBaseImage is preserved",
 			sourceBaseImage:    "ghcr.io/silogen/aim-base:0.11-rc21",
 			sourceImage:        "amdenterpriseai/aim-qwen-qwen3-32b:0.11.0",
 			sourceIsDeployable: true,
 			weightsChanged:     true,
-			want:               "amdenterpriseai/aim-base:0.11",
+			want:               "amdenterpriseai/aim-base:0.11-rc21",
 		},
 		{
-			name:               "deployable source + weights changed: patch-tagged sourceBaseImage truncates to major.minor",
+			name:               "deployable source + weights changed: patch-tagged sourceBaseImage is preserved",
 			sourceBaseImage:    "ghcr.io/silogen/aim-base:0.11.2",
 			sourceImage:        "ghcr.io/silogen/qwen3:0.11.0",
 			sourceIsDeployable: true,
 			weightsChanged:     true,
-			want:               "ghcr.io/silogen/aim-base:0.11",
+			want:               "ghcr.io/silogen/aim-base:0.11.2",
 		},
 		{
-			// Non-semver tags can't be normalised; we leave them alone
-			// rather than guess. This is rare in practice (real
-			// AIM_BASE_IMAGE_REF values come out of release tags) but
-			// keeps the resolver predictable.
 			name:               "deployable source + weights changed: non-semver sourceBaseImage tag preserved",
 			sourceBaseImage:    "ghcr.io/silogen/aim-base:nightly",
 			sourceImage:        "ghcr.io/silogen/qwen3:0.11",

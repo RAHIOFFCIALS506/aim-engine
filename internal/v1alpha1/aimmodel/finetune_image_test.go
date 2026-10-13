@@ -96,8 +96,8 @@ func match(ownerName, ownerNamespace, version string) TemplateMatchResult {
 	}
 }
 
-// Resolver returns the cluster owner's baseImageRef (rebased onto the owner's
-// registry+org and normalised to MAJOR.MINOR) for a cluster-scoped match.
+// Resolver returns the cluster owner's exact baseImageRef tag, rebased onto
+// the owner's registry+org, for a cluster-scoped match.
 func TestImageResolver_ClusterOwner_BaseImageRef(t *testing.T) {
 	owner := clusterOwner("qwen3-0.9.0",
 		"ghcr.io/silogen/qwen3:0.9.0",
@@ -117,19 +117,12 @@ func TestImageResolver_ClusterOwner_BaseImageRef(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	// `0.9.0` truncates to MAJOR.MINOR `0.9`: the deployable aim-base
-	// image is always tagged with its MAJOR.MINOR rolling tag, never the
-	// patch-level tag baked into AIM_BASE_IMAGE_REF.
-	if want := "ghcr.io/silogen/aim-base:0.9"; got != want {
+	if want := "ghcr.io/silogen/aim-base:0.9.0"; got != want {
 		t.Errorf("Resolve = %q, want %q", got, want)
 	}
 }
 
-// Resolver normalises release-candidate AIM_BASE_IMAGE_REF tags
-// (e.g. `0.11-rc21`) onto the stable MAJOR.MINOR rolling tag that aim-base
-// actually publishes. Build pipelines stamp the RC tag during release prep,
-// but the deployable image is reachable only at `aim-base:0.11`.
-func TestImageResolver_NormalizesReleaseCandidateTag(t *testing.T) {
+func TestImageResolver_PreservesReleaseCandidateTag(t *testing.T) {
 	owner := clusterOwner("qwen3-32b",
 		"amdenterpriseai/aim-qwen-qwen3-32b:0.11.0",
 		"ghcr.io/silogen/aim-base:0.11-rc21",
@@ -146,8 +139,8 @@ func TestImageResolver_NormalizesReleaseCandidateTag(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if want := "amdenterpriseai/aim-base:0.11"; got != want {
-		t.Errorf("Resolve = %q, want %q (rc tag must truncate to MAJOR.MINOR and rebase onto owner registry)", got, want)
+	if want := "amdenterpriseai/aim-base:0.11-rc21"; got != want {
+		t.Errorf("Resolve = %q, want %q (rc tag must be preserved while rebasing onto owner registry)", got, want)
 	}
 }
 
@@ -274,7 +267,7 @@ func TestImageResolver_NamespaceScopedOwner(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if want := "ghcr.io/silogen/aim-base:0.9"; got != want {
+	if want := "ghcr.io/silogen/aim-base:0.9.0"; got != want {
 		t.Errorf("Resolve = %q, want %q", got, want)
 	}
 }
