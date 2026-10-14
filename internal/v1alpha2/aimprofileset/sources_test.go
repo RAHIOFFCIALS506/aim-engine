@@ -32,11 +32,13 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	kubernetesfake "k8s.io/client-go/kubernetes/fake"
 	"k8s.io/client-go/tools/record"
+	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
@@ -446,6 +448,95 @@ func TestSourceFailurePipelineDoesNotWriteProfiles(t *testing.T) {
 				t.Fatalf("source failure hidden: %+v", status)
 			}
 		}
+	}
+}
+
+func TestProfileSetPipeline_MissingBaseImageIsConfigurationError(t *testing.T) {
+	t.Parallel()
+
+	for _, namespace := range []string{"team", ""} {
+		t.Run("namespace="+namespace, func(t *testing.T) {
+			sourceSpec := aimv1alpha2.AIMProfileSpecCommon{
+				AimId: "team/base", ModelId: "team/base", ProfileId: "gpu",
+				Image:        "registry.example/optimized:1.2",
+				ModelSources: []aimv1alpha1.AIMModelSource{{ModelID: "team/base", SourceURI: "hf://team/base"}},
+			}
+			sourceMeta := metav1.ObjectMeta{
+				Name: "source", Namespace: namespace,
+				Annotations: profileyaml.Mark(map[string]string{
+					aimprofile.AnnotationProfileCopyable: "true",
+				}, profileyaml.DefaultContract()),
+			}
+			setMeta := metav1.ObjectMeta{Name: "fine-tune", Namespace: namespace, UID: "set-uid", Generation: 1}
+			setSpec := aimv1alpha1.AIMProfileSetSpec{
+				Selector:      aimv1alpha1.ProfileSelector{AimId: sourceSpec.AimId},
+				VersionPolicy: aimv1alpha1.ProfileVersionPolicyAll,
+				Overrides: &aimv1alpha1.ProfileOverrides{
+					ModelSources: []aimv1alpha1.AIMModelSource{{ModelID: "team/fine-tune", SourceURI: "hf://team/fine-tune"}},
+				},
+			}
+			outputMeta := metav1.ObjectMeta{
+				Name: "keep", Namespace: namespace,
+				Annotations: map[string]string{annotationProfileSetUID: string(setMeta.UID)},
+			}
+			var source, parent, output client.Object
+			var status *aimv1alpha1.AIMProfileSetStatus
+			var run func(client.Client) (ctrl.Result, error)
+			if namespace == "" {
+				source = &aimv1alpha2.AIMClusterProfile{ObjectMeta: sourceMeta, Spec: aimv1alpha2.AIMClusterProfileSpec{AIMProfileSpecCommon: sourceSpec}}
+				set := &aimv1alpha2.AIMClusterProfileSet{ObjectMeta: setMeta, Spec: setSpec}
+				parent, status = set, &set.Status
+				output = &aimv1alpha2.AIMClusterProfile{ObjectMeta: outputMeta}
+				run = func(c client.Client) (ctrl.Result, error) {
+					pipeline := controllerutils.Pipeline[*aimv1alpha2.AIMClusterProfileSet, *aimv1alpha1.AIMProfileSetStatus, ClusterProfileSetFetchResult, ClusterProfileSetObservation]{
+						Client: c, StatusClient: c.Status(), Scheme: c.Scheme(), Clientset: kubernetesfake.NewClientset(),
+						Recorder: record.NewFakeRecorder(100), ControllerName: "cluster-profile-set", Reconciler: &ClusterProfileSetReconciler{Scheme: c.Scheme()},
+					}
+					return pipeline.Run(context.Background(), set)
+				}
+			} else {
+				source = &aimv1alpha2.AIMProfile{ObjectMeta: sourceMeta, Spec: aimv1alpha2.AIMProfileSpec{AIMProfileSpecCommon: sourceSpec}}
+				set := &aimv1alpha2.AIMProfileSet{ObjectMeta: setMeta, Spec: setSpec}
+				parent, status = set, &set.Status
+				output = &aimv1alpha2.AIMProfile{ObjectMeta: outputMeta}
+				run = func(c client.Client) (ctrl.Result, error) {
+					pipeline := controllerutils.Pipeline[*aimv1alpha2.AIMProfileSet, *aimv1alpha1.AIMProfileSetStatus, ProfileSetFetchResult, ProfileSetObservation]{
+						Client: c, StatusClient: c.Status(), Scheme: c.Scheme(), Clientset: kubernetesfake.NewClientset(),
+						Recorder: record.NewFakeRecorder(100), ControllerName: "profile-set", Reconciler: &ProfileSetReconciler{Scheme: c.Scheme()},
+					}
+					return pipeline.Run(context.Background(), set)
+				}
+			}
+			c := sourceClient(t, source, parent, output)
+			before := output.DeepCopyObject().(client.Object)
+			if err := c.Get(context.Background(), client.ObjectKeyFromObject(output), before); err != nil {
+				t.Fatal(err)
+			}
+			for range 2 {
+				result, err := run(c)
+				if err != nil || result != (ctrl.Result{}) {
+					t.Fatalf("missing lineage must not retry: result=%+v error=%v", result, err)
+				}
+				condition := meta.FindStatusCondition(status.Conditions, controllerutils.ConditionTypeConfigValid)
+				if condition == nil || condition.Status != metav1.ConditionFalse || condition.Reason != controllerutils.ReasonInvalidSpec {
+					t.Fatalf("missing ConfigValid=False: %+v", status.Conditions)
+				}
+				if condition := meta.FindStatusCondition(status.Conditions, controllerutils.ConditionTypeDependenciesReachable); condition != nil && condition.Status == metav1.ConditionFalse {
+					t.Fatalf("missing lineage reported as unreachable infrastructure: %+v", condition)
+				}
+				derivation := meta.FindStatusCondition(status.Conditions, componentDerivation+controllerutils.ComponentConditionSuffix)
+				if derivation == nil || !strings.Contains(derivation.Message, "no AIM_BASE_IMAGE_REF") {
+					t.Fatalf("missing actionable lineage diagnostic: %+v", derivation)
+				}
+			}
+			after := output.DeepCopyObject().(client.Object)
+			if err := c.Get(context.Background(), client.ObjectKeyFromObject(output), after); err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(before, after) {
+				t.Fatal("missing lineage changed an existing managed profile")
+			}
+		})
 	}
 }
 

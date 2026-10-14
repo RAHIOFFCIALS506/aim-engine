@@ -278,12 +278,10 @@ func inheritedOverlayServiceAccount(seed aimv1alpha2.AIMProfileSpecCommon) strin
 }
 
 // seedBaseImageFromObservation reads the AIM_BASE_IMAGE_REF the AIMModel
-// inspector recorded on the seed profile. Status is the canonical surface
-// (laundered there by the AIMProfile reconciler from the producer's
-// internal annotation); the annotation fallback covers the brief window
-// between profile creation and the AIMProfile reconciler running. Unset for
-// user-authored AIMProfiles, which ApplyProfileCopyOverrides handles
-// correctly.
+// inspector recorded on the seed profile. The producer's annotation takes
+// precedence so overlays immediately see corrected lineage even while profile
+// status is stale. Status remains a fallback for profiles without the
+// annotation.
 func seedBaseImageFromObservation(obs ServiceObservation) string {
 	if obs.profile.Value != nil {
 		return aimprofile.BaseImageFromProfile(obs.profile.Value, obs.profile.Value.Status.BaseImage)

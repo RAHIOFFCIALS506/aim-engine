@@ -40,6 +40,7 @@ import (
 	"github.com/amd-enterprise-ai/aim-engine/internal/constants"
 	controllerutils "github.com/amd-enterprise-ai/aim-engine/internal/controller/utils"
 	"github.com/amd-enterprise-ai/aim-engine/internal/trust"
+	"github.com/amd-enterprise-ai/aim-engine/internal/v1alpha2/aimprofile"
 	"github.com/amd-enterprise-ai/aim-engine/internal/v1alpha2/profileyaml"
 )
 
@@ -371,11 +372,16 @@ func TestComposeState_WeightsReplacementAppliesRuntimeConfigImageMapping(t *test
 		{ModelID: "base/model", SourceURI: "hf://base/model"},
 	}
 	seedProfile := &aimv1alpha2.AIMProfile{
-		ObjectMeta: metav1.ObjectMeta{Name: testProfileA, Namespace: "ns"},
-		Spec:       aimv1alpha2.AIMProfileSpec{AIMProfileSpecCommon: *seedSpec},
+		ObjectMeta: metav1.ObjectMeta{
+			Name: testProfileA, Namespace: "ns",
+			Annotations: map[string]string{aimprofile.AnnotationBaseImage: "docker.io/amdenterpriseai/aim-base:0.11.2"},
+		},
+		Spec: aimv1alpha2.AIMProfileSpec{AIMProfileSpecCommon: *seedSpec},
 		Status: aimv1alpha2.AIMProfileStatus{
+			// The producer has corrected lineage, but profile status has
+			// not caught up. The overlay must use the new annotation now.
 			Status:    "Ready",
-			BaseImage: "docker.io/amdenterpriseai/aim-base:0.11.2",
+			BaseImage: "docker.io/vllm/vllm-openai-rocm:v0.16.0",
 		},
 	}
 	service := &aimv1alpha1.AIMService{

@@ -655,13 +655,6 @@ func TestBuildDesiredNamespaceProfiles_FineTuneOfCustomModelKeepsAIMRuntimeImage
 		t.Fatalf("custom-model profile count = %d, want 1", len(customDesired))
 	}
 	customProfile := customDesired[0].Object.(*aimv1alpha2.AIMProfile)
-	customCandidate := liveSourceCandidate(
-		customProfile,
-		customProfile.Spec.AIMProfileSpecCommon,
-		aimv1alpha2.AIMProfileStatus{},
-		"AIMProfile",
-	).ProfileCopyCandidate
-	customCandidate.YAMLContract = profileyaml.CanonicalContract(&customProfile.Spec.AIMProfileSpecCommon)
 
 	fineTuneSet := &aimv1alpha2.AIMProfileSet{
 		ObjectMeta: metav1.ObjectMeta{Name: "fine-tune-profiles", Namespace: "team-a", UID: "fine-tune-set-uid"},
@@ -680,19 +673,34 @@ func TestBuildDesiredNamespaceProfiles_FineTuneOfCustomModelKeepsAIMRuntimeImage
 		},
 	}
 
-	fineTuneDesired, err := buildDesiredNamespaceProfiles(fineTuneSet, []aimprofile.ProfileCopyCandidate{customCandidate}, nil)
-	if err != nil {
-		t.Fatalf("build fine-tuned profile: %v", err)
-	}
-	if len(fineTuneDesired) != 1 {
-		t.Fatalf("fine-tuned profile count = %d, want 1", len(fineTuneDesired))
-	}
-	fineTuneProfile := fineTuneDesired[0].Object.(*aimv1alpha2.AIMProfile)
-	if got := fineTuneProfile.Spec.Image; got != aimRuntimeImage {
-		t.Fatalf("fine-tuned profile image = %q, want AIM runtime %q (must not descend to %q)", got, aimRuntimeImage, upstreamImage)
-	}
-	if got := fineTuneProfile.Annotations[aimprofile.AnnotationBaseImage]; got != aimRuntimeImage {
-		t.Fatalf("fine-tuned profile base image = %q, want reusable AIM runtime %q", got, aimRuntimeImage)
+	for _, statusBase := range []string{"", upstreamImage} {
+		t.Run("previous base="+statusBase, func(t *testing.T) {
+			// An upgraded custom profile still has the old status when its
+			// producer first applies the corrected annotation.
+			customProfile.Status.BaseImage = statusBase
+			customCandidate := liveSourceCandidate(
+				customProfile,
+				customProfile.Spec.AIMProfileSpecCommon,
+				customProfile.Status,
+				"AIMProfile",
+			).ProfileCopyCandidate
+			customCandidate.YAMLContract = profileyaml.CanonicalContract(&customProfile.Spec.AIMProfileSpecCommon)
+
+			fineTuneDesired, err := buildDesiredNamespaceProfiles(fineTuneSet, []aimprofile.ProfileCopyCandidate{customCandidate}, nil)
+			if err != nil {
+				t.Fatalf("build fine-tuned profile: %v", err)
+			}
+			if len(fineTuneDesired) != 1 {
+				t.Fatalf("fine-tuned profile count = %d, want 1", len(fineTuneDesired))
+			}
+			fineTuneProfile := fineTuneDesired[0].Object.(*aimv1alpha2.AIMProfile)
+			if got := fineTuneProfile.Spec.Image; got != aimRuntimeImage {
+				t.Fatalf("fine-tuned profile image = %q, want AIM runtime %q (must not descend to %q)", got, aimRuntimeImage, upstreamImage)
+			}
+			if got := fineTuneProfile.Annotations[aimprofile.AnnotationBaseImage]; got != aimRuntimeImage {
+				t.Fatalf("fine-tuned profile base image = %q, want reusable AIM runtime %q", got, aimRuntimeImage)
+			}
+		})
 	}
 }
 

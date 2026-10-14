@@ -333,7 +333,9 @@ func buildDesiredNamespaceProfiles(
 		}
 		copiedSpec, err := aimprofile.ApplyProfileCopyOverrides(source.Spec, set.Spec.Overrides, set.Spec.Image, source.BaseImage, registryMappings)
 		if err != nil {
-			failures.add(source.SourceGroup, err)
+			failures.add(source.SourceGroup, controllerutils.NewInvalidSpecError(
+				"InvalidProfileOverrides", err.Error(), err,
+			))
 			continue
 		}
 		derivedBaseImage := aimprofile.ResolveDerivedProfileBaseImage(
@@ -390,7 +392,9 @@ func buildDesiredClusterProfiles(
 		}
 		copiedSpec, err := aimprofile.ApplyProfileCopyOverrides(source.Spec, set.Spec.Overrides, set.Spec.Image, source.BaseImage, registryMappings)
 		if err != nil {
-			failures.add(source.SourceGroup, err)
+			failures.add(source.SourceGroup, controllerutils.NewInvalidSpecError(
+				"InvalidProfileOverrides", err.Error(), err,
+			))
 			continue
 		}
 		derivedBaseImage := aimprofile.ResolveDerivedProfileBaseImage(
