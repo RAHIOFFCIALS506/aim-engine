@@ -32,6 +32,7 @@ import (
 	aimv1alpha2 "github.com/amd-enterprise-ai/aim-engine/api/v1alpha2"
 	"github.com/amd-enterprise-ai/aim-engine/internal/constants"
 	"github.com/amd-enterprise-ai/aim-engine/internal/utils"
+	"github.com/amd-enterprise-ai/aim-engine/internal/v1alpha1/aimruntimeconfig"
 	"github.com/amd-enterprise-ai/aim-engine/internal/v1alpha2/aimprofile"
 	"github.com/amd-enterprise-ai/aim-engine/internal/v1alpha2/profileyaml"
 )
@@ -140,16 +141,14 @@ func buildServiceOverlayProfile(
 
 	overrides := asProfileOverrides(service.Spec.ProfileOverrides)
 
-	// Pull baseImage from the seed profile's annotations (set by
-	// AIMModel discovery when it materialised the seed). aimprofile uses
-	// it to resolve the deployment image back to the seed's
-	// aim-base registry+org — but ONLY when this overlay replaces the
-	// weights (spec.profileOverrides.modelSources). A partitioning-only or
-	// env-only overlay leaves the weights untouched, so it keeps the
-	// optimized seed image instead of falling back to aim-base. Annotation
-	// absent on user-authored AIMProfiles is fine: ApplyProfileCopyOverrides
-	// treats empty as "leave the seed image alone" which is the right
-	// semantic.
+	// Pull baseImage from the seed profile's annotations (set by AIMModel
+	// discovery when it materialised the seed). aimprofile uses it exactly,
+	// subject only to explicit mappings from the service's merged
+	// RuntimeConfig, when this overlay replaces the weights
+	// (spec.profileOverrides.modelSources). A partitioning-only or env-only
+	// overlay leaves the weights untouched, so it keeps the optimized seed
+	// image. If a deployable seed has no base image, resolution fails
+	// cleanly rather than guessing from the source image.
 	seedBaseImage := seedBaseImageFromObservation(obs)
 
 	overlaySpec, err := aimprofile.ApplyProfileCopyOverrides(
@@ -157,6 +156,7 @@ func buildServiceOverlayProfile(
 		overrides,
 		"", // no image override at the service level today
 		seedBaseImage,
+		aimruntimeconfig.ImageRegistryMappings(obs.mergedRuntimeConfig.Value),
 	)
 	if err != nil {
 		return nil, aimv1alpha2.AIMProfileSpecCommon{}, err
